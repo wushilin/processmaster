@@ -1,0 +1,31 @@
+application: logger
+
+logs:
+  stdout: ./stdout.log
+  stderr: ./stderr.log
+  rotation_mode: time
+  rotation_frequency: minutely
+  rotation_max_age_ms: 600000
+
+process:
+  working_directory: /tmp/processmaster/logger
+  start_command:
+    - /bin/sh
+    - "-lc"
+    - "i=0; while true; do echo \"logger tick $i\"; i=$((i+1)); sleep 2; done"
+  stop_signal: SIGTERM
+
+resources:
+  max_cpu: 50m
+  max_memory: 64MiB
+  max_swap: 0
+
+global:
+  enabled: true
+
+restart_policy:
+  policy: always      # never | always
+  restart_backoff_ms: 1000
+  tolerance:
+    max_restarts: 3
+    duration: 10m         # supports ms / s / m / h (e.g. 600000, 10m, 1h)

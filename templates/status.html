@@ -1,0 +1,1050 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row g-3">
+  <div class="col-12">
+    <div class="d-flex align-items-center justify-content-between">
+      <h3 class="mb-0">Status</h3>
+      <div class="d-flex gap-2">
+        <div class="form-check form-switch align-self-center me-2">
+          <input class="form-check-input" type="checkbox" role="switch" id="autoRefreshToggle" checked>
+          <label class="form-check-label" for="autoRefreshToggle">Auto refresh</label>
+        </div>
+        <button id="btn-refresh" class="btn btn-outline-secondary btn-sm">Refresh</button>
+        <button id="btn-update" class="btn btn-primary btn-sm">Update defs</button>
+        <button id="btn-stop-all" class="btn btn-outline-danger btn-sm">Stop all</button>
+        <button id="btn-start-all" class="btn btn-outline-success btn-sm">Start all</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-12">
+    <div id="alert" class="alert d-none" role="alert"></div>
+  </div>
+
+  <div class="col-12">
+    <div class="card shadow-sm">
+      <div class="card-body">
+        <div class="table-responsive">
+          <style>
+            /* Keep column widths stable even when filtering hides rows */
+            table.pm-status-table { table-layout: fixed; width: 100%; }
+            table.pm-status-table th, table.pm-status-table td { vertical-align: top; }
+            .pm-truncate { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+            th[data-sort] .sort-indicator { display: inline-block; width: 1.2em; text-align: center; }
+            .pm-badge-user { background: #fd7e14; color: #1a1a1a; }
+            .pm-icon { display: inline-block; vertical-align: -0.125em; }
+            .pm-enabled svg { filter: drop-shadow(0 1px 0 rgba(0,0,0,0.15)); }
+
+            /* ANSI (SGR) colors for log rendering (dark background) */
+            .ansi-bold { font-weight: 600; }
+            .ansi-dim { opacity: 0.75; }
+            .ansi-underline { text-decoration: underline; }
+            .ansi-fg-30 { color: #000000; }
+            .ansi-fg-31 { color: #dc3545; } /* red */
+            .ansi-fg-32 { color: #198754; } /* green */
+            .ansi-fg-33 { color: #ffc107; } /* yellow */
+            .ansi-fg-34 { color: #0d6efd; } /* blue */
+            .ansi-fg-35 { color: #d63384; } /* magenta */
+            .ansi-fg-36 { color: #20c997; } /* cyan */
+            .ansi-fg-37 { color: #f8f9fa; } /* white */
+            .ansi-fg-90 { color: #6c757d; } /* bright black / gray */
+            .ansi-fg-91 { color: #ff6b6b; }
+            .ansi-fg-92 { color: #51cf66; }
+            .ansi-fg-93 { color: #ffe066; }
+            .ansi-fg-94 { color: #74c0fc; }
+            .ansi-fg-95 { color: #f783ac; }
+            .ansi-fg-96 { color: #63e6be; }
+            .ansi-fg-97 { color: #ffffff; }
+          </style>
+
+          <table class="table table-sm table-striped table-hover align-middle mb-0 pm-status-table">
+            <colgroup>
+              <col style="width: 14%;">  <!-- Application -->
+              <col style="width: 7%;">   <!-- Desired -->
+              <col style="width: 7%;">   <!-- Actual -->
+              <col style="width: 8%;">   <!-- Status -->
+              <col style="width: 6%;">   <!-- Crashes (10m) -->
+              <col style="width: 7%;">   <!-- PID -->
+              <col style="width: 8%;">   <!-- Uptime -->
+              <col style="width: 22%;">  <!-- Flags -->
+              <col style="width: 5%;">   <!-- Enabled -->
+              <col style="width: 16%;">  <!-- Last Run -->
+            </colgroup>
+            <thead>
+              <tr>
+                <th role="button" class="user-select-none" data-sort="app">
+                  <span class="d-inline-flex align-items-center gap-1">
+                    <span>Application</span><span class="sort-indicator text-muted" data-sort-indicator="app">↕</span>
+                  </span>
+                </th>
+                <th role="button" class="user-select-none" data-sort="desired">
+                  <span class="d-inline-flex align-items-center gap-1">
+                    <span>Desired</span><span class="sort-indicator text-muted" data-sort-indicator="desired">↕</span>
+                  </span>
+                </th>
+                <th role="button" class="user-select-none" data-sort="actual">
+                  <span class="d-inline-flex align-items-center gap-1">
+                    <span>Actual</span><span class="sort-indicator text-muted" data-sort-indicator="actual">↕</span>
+                  </span>
+                </th>
+                <th role="button" class="user-select-none" data-sort="status">
+                  <span class="d-inline-flex align-items-center gap-1">
+                    <span>Status</span><span class="sort-indicator text-muted" data-sort-indicator="status">↕</span>
+                  </span>
+                </th>
+                <th role="button" class="user-select-none" data-sort="crashes_10m">
+                  <span class="d-inline-flex align-items-center gap-1">
+                    <span>Crashes (10m)</span><span class="sort-indicator text-muted" data-sort-indicator="crashes_10m">↕</span>
+                  </span>
+                </th>
+                <th>PID</th>
+                <th>Uptime</th>
+                <th role="button" class="user-select-none" data-sort="flags">
+                  <span class="d-inline-flex align-items-center gap-1">
+                    <span>Flags</span><span class="sort-indicator text-muted" data-sort-indicator="flags">↕</span>
+                  </span>
+                </th>
+                <th role="button" class="user-select-none" data-sort="enabled">
+                  <span class="d-inline-flex align-items-center gap-1">
+                    <span>Enabled</span><span class="sort-indicator text-muted" data-sort-indicator="enabled">↕</span>
+                  </span>
+                </th>
+                <th role="button" class="user-select-none" data-sort="last_run">
+                  <span class="d-inline-flex align-items-center gap-1">
+                    <span>Last Run</span><span class="sort-indicator text-muted" data-sort-indicator="last_run">↕</span>
+                  </span>
+                </th>
+              </tr>
+              <tr>
+                <th><input id="f-app" class="form-control form-control-sm" placeholder="filter"></th>
+                <th><input id="f-desired" class="form-control form-control-sm" placeholder="filter"></th>
+                <th><input id="f-actual" class="form-control form-control-sm" placeholder="filter"></th>
+                <th><input id="f-status" class="form-control form-control-sm" placeholder="filter"></th>
+                <th></th>
+                <th></th>
+                <th></th>
+                <th><input id="f-flags" class="form-control form-control-sm" placeholder="filter"></th>
+                <th>
+                  <select id="f-enabled" class="form-select form-select-sm">
+                    <option value="" selected>all</option>
+                    <option value="enabled">enabled</option>
+                    <option value="disabled">disabled</option>
+                  </select>
+                </th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="status-body">
+              <tr><td colspan="10" class="text-muted">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Confirm action modal -->
+<div class="modal fade" id="confirmModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="confirmTitle">Confirm</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body" id="confirmBody">Are you sure?</div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-danger" id="confirmOk">Confirm</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Logs modal -->
+<div class="modal fade" id="logsModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Logs: <span id="logsApp" class="text-muted"></span></h5>
+        <div class="form-check form-switch ms-3">
+          <input class="form-check-input" type="checkbox" role="switch" id="logsTail">
+          <label class="form-check-label" for="logsTail">Tail</label>
+        </div>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="d-flex gap-2 mb-2">
+          <button class="btn btn-outline-secondary btn-sm" id="logsRefresh">Refresh</button>
+          <select class="form-select form-select-sm" id="logsLines" style="max-width: 160px;">
+            <option value="50">50 lines</option>
+            <option value="200" selected>200 lines</option>
+            <option value="500">500 lines</option>
+          </select>
+        </div>
+        <pre id="logsPre" class="bg-dark text-light p-3 rounded" style="white-space: pre-wrap; word-break: break-word; min-height: 40vh;"></pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Add user flag modal -->
+<div class="modal fade" id="flagModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Flags: <span id="flagApp" class="text-muted"></span></h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-2">
+          <label class="form-label">Flags</label>
+          <input id="flagValue" class="form-control" placeholder="e.g. maintenance,debug" autocomplete="off">
+          <div class="form-text">Allowed: <code>[0-9a-zA-Z_-]{1,20}</code> (comma-separated)</div>
+        </div>
+        <div class="mb-2">
+          <label class="form-label">Expiry (optional)</label>
+          <input id="flagTtl" class="form-control" placeholder="e.g. 300s or 1500ms" autocomplete="off">
+          <div class="form-text">Format: <code>Nms</code>/<code>Ns</code>/<code>Nm</code>/<code>Nh</code>/<code>Nd</code> (unit required)</div>
+        </div>
+        <div id="flagErr" class="alert alert-danger d-none" role="alert"></div>
+
+        <hr>
+        <div class="d-flex align-items-baseline justify-content-between">
+          <div class="fw-semibold">Active user flags</div>
+          <button class="btn btn-outline-secondary btn-sm" id="flagRefresh">Refresh</button>
+        </div>
+        <div id="flagActive" class="mt-2"></div>
+        <div class="form-text mt-1">Click a badge’s × to remove that flag.</div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-warning" id="flagOk">Add flag</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Service actions modal -->
+<div class="modal fade" id="actionsModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Service: <span id="actionsApp" class="text-muted"></span></h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="d-grid gap-2">
+          <button class="btn btn-outline-secondary" id="actionsLogs">Logs</button>
+          <button class="btn btn-outline-warning" id="actionsFlags">Flags</button>
+          <button class="btn btn-outline-success" id="actionsStart">Start</button>
+          <button class="btn btn-outline-danger" id="actionsStop">Stop</button>
+        </div>
+        <div class="form-text mt-2">Start/Stop will ask for confirmation.</div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  function csrfToken() {
+    const meta = document.querySelector('meta[name="csrf-token"]');
+    return meta ? meta.getAttribute('content') : '';
+  }
+
+  let rpcId = 1;
+  async function rpc(method, params) {
+    const body = { jsonrpc: "2.0", id: rpcId++, method, params: params ?? {} };
+    // Use a relative URL so this works under the /processmaster mount path (and any reverse proxy base path).
+    const resp = await fetch("rpc", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRF-Token": csrfToken(),
+      },
+      body: JSON.stringify(body),
+    });
+    const j = await resp.json();
+    if (j.error) {
+      throw new Error(j.error.message || "RPC error");
+    }
+    return j.result;
+  }
+
+  function showAlert(kind, msg) {
+    const el = document.getElementById("alert");
+    el.className = "alert alert-" + kind;
+    el.textContent = msg;
+    el.classList.remove("d-none");
+    window.setTimeout(() => el.classList.add("d-none"), 5000);
+  }
+
+  function esc(s) {
+    const div = document.createElement("div");
+    div.textContent = s;
+    return div.innerHTML;
+  }
+
+  function fmtUptimeMs(ms) {
+    if (ms === null || ms === undefined || ms < 0) return "-";
+    let s = Math.floor((ms + 500) / 1000);
+    const days = Math.floor(s / 86400); s = s % 86400;
+    const hours = Math.floor(s / 3600); s = s % 3600;
+    const mins = Math.floor(s / 60); s = s % 60;
+    const secs = s;
+    if (days > 0) return `${days}d${hours}h${mins}m${secs}s`;
+    if (hours > 0) return `${hours}h${mins}m${secs}s`;
+    if (mins > 0) return `${mins}m${secs}s`;
+    return `${secs}s`;
+  }
+
+  function fmtLastRun(ms) {
+    if (!ms) return "-";
+    const d = new Date(ms);
+    const pad = (n, w=2) => n.toString().padStart(w, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+  }
+
+  let lastStatuses = [];
+  let sortKey = "app";
+  let sortDir = "asc"; // asc|desc
+
+  function currentFilters() {
+    return {
+      app: (document.getElementById("f-app").value || "").trim().toLowerCase(),
+      desired: (document.getElementById("f-desired").value || "").trim().toLowerCase(),
+      actual: (document.getElementById("f-actual").value || "").trim().toLowerCase(),
+      status: (document.getElementById("f-status").value || "").trim().toLowerCase(),
+      flags: (document.getElementById("f-flags").value || "").trim().toLowerCase(),
+      enabled: (document.getElementById("f-enabled").value || "").trim().toLowerCase(),
+    };
+  }
+
+  function passesFilters(s, f) {
+    const desired = (s.desired || "-").toLowerCase();
+    const actual = (s.actual || (s.running ? "RUNNING" : "STOPPED")).toLowerCase();
+    const phase = (s.phase || (s.running ? "RUNNING" : "STOPPED")).toLowerCase();
+    const sys = ((s.system_flags || []).join(",") || "-").toLowerCase();
+    const usr = ((s.user_flags || []).join(",") || "-").toLowerCase();
+    const flags = (sys + "," + usr);
+    const en = (s.enabled ? "enabled" : "disabled").toLowerCase();
+    const app = (s.application || "").toLowerCase();
+
+    if (f.app && !app.includes(f.app)) return false;
+    if (f.desired && !desired.includes(f.desired)) return false;
+    if (f.actual && !actual.includes(f.actual)) return false;
+    if (f.status && !phase.includes(f.status)) return false;
+    if (f.flags && !flags.includes(f.flags)) return false;
+    if (f.enabled && en !== f.enabled) return false;
+    return true;
+  }
+
+  function sortValue(s, key) {
+    switch (key) {
+      case "app": return (s.application || "");
+      case "desired": return (s.desired || "");
+      case "actual": return (s.actual || (s.running ? "RUNNING" : "STOPPED"));
+      case "status": return (s.phase || (s.running ? "RUNNING" : "STOPPED"));
+      case "crashes_10m": return (s.restarts_10m ?? 0);
+      case "flags": return ((s.system_flags || []).join(",") + "|" + (s.user_flags || []).join(","));
+      case "enabled": return s.enabled ? 1 : 0;
+      case "last_run": return (s.last_run_at_ms ?? -1);
+      default: return "";
+    }
+  }
+
+  function applyFilterSortAndRender() {
+    const body = document.getElementById("status-body");
+    const f = currentFilters();
+    let rows = lastStatuses.filter(s => passesFilters(s, f));
+
+    rows.sort((a, b) => {
+      const va = sortValue(a, sortKey);
+      const vb = sortValue(b, sortKey);
+      let cmp = 0;
+      if (typeof va === "number" && typeof vb === "number") cmp = va - vb;
+      else cmp = ("" + va).localeCompare("" + vb);
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="10" class="text-muted">(no services)</td></tr>';
+      return;
+    }
+
+    function badgeForState(s) {
+      const phase = (s.phase || (s.running ? "RUNNING" : "STOPPED")).toUpperCase();
+      if (phase.includes("RUN")) return 'badge bg-success';
+      if (phase.includes("FAIL") || phase.includes("CRASH")) return 'badge bg-danger';
+      if (phase.includes("BACKOFF")) return 'badge bg-warning text-dark';
+      return 'badge bg-secondary';
+    }
+    function badgeForDesired(s) {
+      const d = (s.desired || "-").toUpperCase();
+      if (d.includes("RUN")) return 'badge bg-primary';
+      if (d.includes("STOP")) return 'badge bg-secondary';
+      if (d.includes("SCHED")) return 'badge bg-info text-dark';
+      return 'badge bg-secondary';
+    }
+
+    body.innerHTML = rows.map(s => {
+      const sysFlags = (s.system_flags || []);
+      const userFlags = (s.user_flags || []);
+      const enabled = s.enabled ? "enabled" : "disabled";
+      const desired = s.desired || "-";
+      const actual = s.actual || (s.running ? "RUNNING" : "STOPPED");
+      const phase = s.phase || (s.running ? "RUNNING" : "STOPPED");
+      const crashes = (s.restarts_10m ?? 0).toString();
+      const last_run = fmtLastRun(s.last_run_at_ms);
+      const app = s.application;
+
+      const pids = (s.pids || []);
+      const ups = (s.pid_uptimes_ms || []);
+      const pidLines = pids.length ? pids.map((pid) => `<div><code>${esc(pid.toString())}</code></div>`).join("") : `<div class="text-muted">-</div>`;
+      const upLines = pids.length ? pids.map((_, i) => `<div>${esc(fmtUptimeMs(ups[i] ?? -1))}</div>`).join("") : `<div class="text-muted">-</div>`;
+
+      const sysBadges = sysFlags.map(f => `<span class="badge rounded-pill bg-danger me-1 mb-1">${esc(f)}</span>`).join("");
+      const userBadges = userFlags.map(f => `<span class="badge rounded-pill pm-badge-user me-1 mb-1">${esc(f)}</span>`).join("");
+      const flagsCell = (sysBadges || userBadges) ? (sysBadges + userBadges) : `<span class="text-muted">-</span>`;
+      const enabledIcon = s.enabled
+        ? `<span class="pm-enabled" title="enabled" aria-label="enabled">
+             <svg class="pm-icon" xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 16 16" fill="#198754" aria-hidden="true">
+               <path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0z"/>
+               <path d="M12.03 5.47a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06 0L3.97 8.03a.75.75 0 1 1 1.06-1.06l2.22 2.22 3.72-3.72a.75.75 0 0 1 1.06 0z" fill="#fff"/>
+             </svg>
+           </span>`
+        : `<span class="pm-enabled" title="disabled" aria-label="disabled">
+             <svg class="pm-icon" xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 16 16" fill="#dc3545" aria-hidden="true">
+               <path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0z"/>
+               <path d="M5.354 5.354a.75.75 0 0 1 1.06 0L8 6.94l1.586-1.586a.75.75 0 0 1 1.06 1.06L9.06 8l1.586 1.586a.75.75 0 0 1-1.06 1.06L8 9.06l-1.586 1.586a.75.75 0 0 1-1.06-1.06L6.94 8 5.354 6.414a.75.75 0 0 1 0-1.06z" fill="#fff"/>
+             </svg>
+           </span>`;
+
+      return `<tr>
+        <td class="pm-truncate" title="${esc(app)}">
+          <a href="#" class="link-primary link-underline-opacity-0 link-underline-opacity-100-hover" data-action="actions" data-app="${esc(app)}">
+            <code>${esc(app)}</code>
+          </a>
+        </td>
+        <td><span class="${badgeForDesired(s)}">${esc(desired)}</span></td>
+        <td><span class="badge bg-light text-dark">${esc(actual)}</span></td>
+        <td><span class="${badgeForState(s)}">${esc(phase)}</span></td>
+        <td>${esc(crashes)}</td>
+        <td class="text-nowrap">${pidLines}</td>
+        <td class="text-nowrap">${upLines}</td>
+        <td>${flagsCell}</td>
+        <td class="text-center">${enabledIcon}</td>
+        <td class="pm-truncate" title="${esc(last_run)}"><small class="text-muted">${esc(last_run)}</small></td>
+      </tr>`;
+    }).join("");
+  }
+
+  function renderStatus(resp) {
+    const body = document.getElementById("status-body");
+    lastStatuses = (resp.statuses || []);
+    if (!lastStatuses.length) {
+      body.innerHTML = '<tr><td colspan="10" class="text-muted">(no services)</td></tr>';
+      return;
+    }
+    applyFilterSortAndRender();
+  }
+
+  // -------- status refresh (auto every 2s) --------
+  let refreshInFlight = false;
+  async function refresh() {
+    if (refreshInFlight) return;
+    refreshInFlight = true;
+    try {
+      const resp = await rpc("status", {});
+      renderStatus(resp);
+    } finally {
+      refreshInFlight = false;
+    }
+  }
+
+  const AUTO_REFRESH_KEY = "pm:autoRefresh";
+  const autoRefreshToggle = document.getElementById("autoRefreshToggle");
+  let refreshTimer = null;
+
+  function startAutoRefresh() {
+    if (refreshTimer) return;
+    refreshTimer = window.setInterval(() => {
+      refresh().catch(() => {});
+    }, 2000);
+  }
+
+  function stopAutoRefresh() {
+    if (!refreshTimer) return;
+    window.clearInterval(refreshTimer);
+    refreshTimer = null;
+  }
+
+  function setAutoRefreshEnabled(enabled) {
+    autoRefreshToggle.checked = !!enabled;
+    window.localStorage.setItem(AUTO_REFRESH_KEY, enabled ? "1" : "0");
+    if (enabled) startAutoRefresh();
+    else stopAutoRefresh();
+  }
+
+  // init toggle from localStorage (default: on)
+  const saved = window.localStorage.getItem(AUTO_REFRESH_KEY);
+  setAutoRefreshEnabled(saved !== "0");
+
+  autoRefreshToggle.addEventListener("change", () => {
+    setAutoRefreshEnabled(autoRefreshToggle.checked);
+  });
+
+  document.getElementById("btn-refresh").addEventListener("click", async () => {
+    try { await refresh(); } catch (e) { showAlert("danger", e.toString()); }
+  });
+
+  document.getElementById("btn-update").addEventListener("click", async () => {
+    try {
+      const resp = await rpc("update", {});
+      if (resp.message || (resp.restarted && resp.restarted.length)) {
+        let msg = (resp.message || "").trim();
+        const restarted = (resp.restarted || []);
+        if (restarted.length) {
+          const cap = 20;
+          const shown = restarted.slice(0, cap);
+          const more = restarted.length > cap ? ` …(+${restarted.length - cap})` : "";
+          msg = (msg ? (msg + "\n") : "") + `restarted: ${shown.join(",")}${more}`;
+        }
+        showAlert(resp.ok ? "success" : "danger", msg);
+      }
+      await refresh();
+    } catch (e) { showAlert("danger", e.toString()); }
+  });
+
+  // -------- bulk start/stop --------
+  const btnStopAll = document.getElementById("btn-stop-all");
+  const btnStartAll = document.getElementById("btn-start-all");
+  let bulkInFlight = false;
+
+  function setBulkDisabled(disabled) {
+    bulkInFlight = !!disabled;
+    btnStopAll.disabled = bulkInFlight;
+    btnStartAll.disabled = bulkInFlight;
+    document.getElementById("btn-update").disabled = bulkInFlight;
+    document.getElementById("btn-refresh").disabled = bulkInFlight;
+  }
+
+  function unique(arr) {
+    return Array.from(new Set((arr || []).filter(Boolean)));
+  }
+
+  function appsRunningNow() {
+    return unique((lastStatuses || [])
+      .filter(s => ((s.pids || []).length > 0))
+      .map(s => s.application));
+  }
+
+  function appsEnabledNow() {
+    return unique((lastStatuses || [])
+      .filter(s => !!s.enabled)
+      .map(s => s.application));
+  }
+
+  async function stopAllRunning() {
+    if (bulkInFlight) return;
+    setBulkDisabled(true);
+    const prevAuto = autoRefreshToggle.checked;
+    stopAutoRefresh();
+    try {
+      const apps = appsRunningNow();
+      if (!apps.length) { showAlert("info", "No running services to stop."); return; }
+      let ok = 0, fail = 0;
+      for (let i = 0; i < apps.length; i++) {
+        const name = apps[i];
+        showAlert("info", `Stopping ${name} (${i+1}/${apps.length})…`);
+        try {
+          const resp = await rpc("stop", { name });
+          if (resp.ok) ok++; else fail++;
+        } catch (_) {
+          fail++;
+        }
+      }
+      showAlert(fail ? "warning" : "success", `Stop all done: ${ok} ok, ${fail} failed.`);
+    } finally {
+      if (prevAuto) startAutoRefresh();
+      setBulkDisabled(false);
+    }
+  }
+
+  async function startAllEnabled() {
+    if (bulkInFlight) return;
+    setBulkDisabled(true);
+    const prevAuto = autoRefreshToggle.checked;
+    stopAutoRefresh();
+    try {
+      const apps = appsEnabledNow();
+      if (!apps.length) { showAlert("info", "No enabled services to start."); return; }
+      let ok = 0, fail = 0;
+      for (let i = 0; i < apps.length; i++) {
+        const name = apps[i];
+        showAlert("info", `Starting ${name} (${i+1}/${apps.length})…`);
+        try {
+          const resp = await rpc("start", { name, force: false });
+          if (resp.ok) ok++; else fail++;
+        } catch (_) {
+          fail++;
+        }
+      }
+      showAlert(fail ? "warning" : "success", `Start all done: ${ok} ok, ${fail} failed.`);
+    } finally {
+      if (prevAuto) startAutoRefresh();
+      setBulkDisabled(false);
+    }
+  }
+
+  btnStopAll.addEventListener("click", () => askConfirm("stop_all", null));
+  btnStartAll.addEventListener("click", () => askConfirm("start_all", null));
+
+  // filters: re-render on change (client-side)
+  for (const id of ["f-app","f-desired","f-actual","f-status","f-flags"]) {
+    document.getElementById(id).addEventListener("input", () => applyFilterSortAndRender());
+  }
+  document.getElementById("f-enabled").addEventListener("change", () => applyFilterSortAndRender());
+
+  // sorting: click header cells with data-sort
+  document.querySelectorAll("th[data-sort]").forEach(th => {
+    th.addEventListener("click", () => {
+      const k = th.getAttribute("data-sort");
+      if (sortKey === k) sortDir = (sortDir === "asc") ? "desc" : "asc";
+      else { sortKey = k; sortDir = "asc"; }
+      applyFilterSortAndRender();
+      updateSortIndicators();
+    });
+  });
+
+  function updateSortIndicators() {
+    document.querySelectorAll("[data-sort-indicator]").forEach(el => {
+      const k = el.getAttribute("data-sort-indicator");
+      if (k === sortKey) {
+        el.textContent = (sortDir === "asc") ? "▲" : "▼";
+        el.classList.remove("text-muted");
+      } else {
+        el.textContent = "↕";
+        el.classList.add("text-muted");
+      }
+    });
+  }
+
+  // initial indicators
+  updateSortIndicators();
+
+  // -------- confirm modal for start/stop --------
+  const confirmModalEl = document.getElementById("confirmModal");
+  const confirmModal = new bootstrap.Modal(confirmModalEl, { backdrop: "static" });
+  let pendingAction = null; // { action, app }
+
+  function askConfirm(action, app) {
+    pendingAction = { action, app };
+    const title = document.getElementById("confirmTitle");
+    const body = document.getElementById("confirmBody");
+    const ok = document.getElementById("confirmOk");
+
+    if (action === "start") {
+      title.textContent = "Confirm start";
+      body.textContent = `Start ${app}?`;
+      ok.className = "btn btn-success";
+      ok.textContent = "Start";
+    } else if (action === "stop") {
+      title.textContent = "Confirm stop";
+      body.textContent = `Stop ${app}?`;
+      ok.className = "btn btn-danger";
+      ok.textContent = "Stop";
+    } else if (action === "start_all") {
+      title.textContent = "Confirm start all";
+      body.textContent = "Start all enabled services?";
+      ok.className = "btn btn-success";
+      ok.textContent = "Start all";
+    } else if (action === "stop_all") {
+      title.textContent = "Confirm stop all";
+      body.textContent = "Stop all running services?";
+      ok.className = "btn btn-danger";
+      ok.textContent = "Stop all";
+    } else {
+      title.textContent = "Confirm";
+      body.textContent = `Proceed with ${action} ${app}?`;
+      ok.className = "btn btn-primary";
+      ok.textContent = "Confirm";
+    }
+    confirmModal.show();
+  }
+
+  document.getElementById("confirmOk").addEventListener("click", async () => {
+    if (!pendingAction) return;
+    const { action, app } = pendingAction;
+    pendingAction = null;
+    confirmModal.hide();
+    try {
+      if (action === "start") {
+        const resp = await rpc("start", { name: app, force: false });
+        if (resp.message) showAlert(resp.ok ? "success" : "danger", resp.message);
+      } else if (action === "stop") {
+        const resp = await rpc("stop", { name: app });
+        if (resp.message) showAlert(resp.ok ? "success" : "danger", resp.message);
+      } else if (action === "start_all") {
+        await startAllEnabled();
+      } else if (action === "stop_all") {
+        await stopAllRunning();
+      }
+      await refresh();
+    } catch (e) {
+      showAlert("danger", e.toString());
+    }
+  });
+
+  // -------- logs viewer + tail (polling) --------
+  const logsModalEl = document.getElementById("logsModal");
+  const logsModal = new bootstrap.Modal(logsModalEl);
+  const logsAppEl = document.getElementById("logsApp");
+  const logsPre = document.getElementById("logsPre");
+  const logsTail = document.getElementById("logsTail");
+  const logsLines = document.getElementById("logsLines");
+  let logsApp = null;
+  let logsTimer = null;
+  const LOGS_MAX_CHARS = 1_000_000; // hard cap to keep UI responsive
+
+  function trimLogsForUi(text, nLines) {
+    let t = text || "";
+    if (t.length > LOGS_MAX_CHARS) {
+      t = t.slice(t.length - LOGS_MAX_CHARS);
+      t = "[trimmed: showing last " + LOGS_MAX_CHARS + " chars]\n" + t;
+    }
+    const maxLines = Math.max(100, (nLines || 200) * 100);
+    const lines = t.split("\n");
+    if (lines.length > maxLines) {
+      const tail = lines.slice(lines.length - maxLines).join("\n");
+      return "[trimmed: showing last " + maxLines + " lines]\n" + tail;
+    }
+    return t;
+  }
+
+  function escapeHtmlFast(s) {
+    const t = (s || "");
+    return t.replace(/[&<>"']/g, (c) => {
+      switch (c) {
+        case "&": return "&amp;";
+        case "<": return "&lt;";
+        case ">": return "&gt;";
+        case "\"": return "&quot;";
+        case "'": return "&#39;";
+        default: return c;
+      }
+    });
+  }
+
+  // Best-effort ANSI (SGR) -> HTML converter. Handles common `\x1b[...m` color sequences.
+  // Any non-SGR escape sequences are stripped.
+  function ansiToHtml(input) {
+    let s = (input || "");
+    // Strip OSC sequences: ESC ] ... BEL or ESC \
+    s = s.replace(/\x1b\][^\x07]*(\x07|\x1b\\)/g, "");
+
+    let out = "";
+    let i = 0;
+    let open = false;
+    const st = { bold: false, dim: false, underline: false, fg: null, bg: null };
+
+    function closeSpan() {
+      if (open) { out += "</span>"; open = false; }
+    }
+    function openSpanIfNeeded() {
+      const classes = [];
+      if (st.bold) classes.push("ansi-bold");
+      if (st.dim) classes.push("ansi-dim");
+      if (st.underline) classes.push("ansi-underline");
+      if (st.fg !== null) classes.push("ansi-fg-" + st.fg);
+      // (bg not currently styled; reserved)
+      if (!classes.length) return;
+      out += `<span class="${classes.join(" ")}">`;
+      open = true;
+    }
+
+    function applySgr(params) {
+      if (!params.length) params = [0];
+      for (const p of params) {
+        const n = parseInt(p, 10);
+        if (!isFinite(n)) continue;
+        if (n === 0) { st.bold = false; st.dim = false; st.underline = false; st.fg = null; st.bg = null; continue; }
+        if (n === 1) { st.bold = true; continue; }
+        if (n === 2) { st.dim = true; continue; }
+        if (n === 4) { st.underline = true; continue; }
+        if (n === 22) { st.bold = false; st.dim = false; continue; }
+        if (n === 24) { st.underline = false; continue; }
+        if (n === 39) { st.fg = null; continue; }
+        if (n === 49) { st.bg = null; continue; }
+        if ((n >= 30 && n <= 37) || (n >= 90 && n <= 97)) { st.fg = n; continue; }
+        if ((n >= 40 && n <= 47) || (n >= 100 && n <= 107)) { st.bg = n; continue; }
+      }
+    }
+
+    while (i < s.length) {
+      const ch = s.charCodeAt(i);
+      if (ch === 0x1b /* ESC */) {
+        // SGR: ESC [ ... m
+        if (s[i + 1] === "[" ) {
+          const m = s.slice(i).match(/^\x1b\[([0-9;]*)m/);
+          if (m) {
+            // Flush up to this point: (we handle in streaming, so just update state)
+            closeSpan();
+            applySgr((m[1] || "").split(";").filter(Boolean));
+            openSpanIfNeeded();
+            i += m[0].length;
+            continue;
+          }
+          // Other CSI sequences: strip (cursor movement etc)
+          const m2 = s.slice(i).match(/^\x1b\[[0-9;?]*[A-Za-z]/);
+          if (m2) { i += m2[0].length; continue; }
+        }
+        // Unknown escape: drop ESC and following char if any.
+        i += (i + 1 < s.length) ? 2 : 1;
+        continue;
+      }
+
+      // Regular char
+      const nextEsc = s.indexOf("\x1b", i);
+      const chunk = nextEsc === -1 ? s.slice(i) : s.slice(i, nextEsc);
+      out += escapeHtmlFast(chunk);
+      i = nextEsc === -1 ? s.length : nextEsc;
+    }
+    closeSpan();
+    return out;
+  }
+
+  async function loadLogs() {
+    if (!logsApp) return;
+    const n = parseInt(logsLines.value || "200", 10);
+    const resp = await rpc("logs", { name: logsApp, n });
+    // daemon returns logs in resp.message (pmctl format); keep as-is.
+    const trimmed = trimLogsForUi(resp.message || "", n);
+    logsPre.innerHTML = ansiToHtml(trimmed);
+    // When tailing, keep scrolled to bottom.
+    if (logsTail.checked) {
+      logsPre.scrollTop = logsPre.scrollHeight;
+    }
+  }
+
+  function stopLogsTail() {
+    if (logsTimer) {
+      window.clearInterval(logsTimer);
+      logsTimer = null;
+    }
+  }
+
+  function startLogsTail() {
+    stopLogsTail();
+    logsTimer = window.setInterval(() => {
+      loadLogs().catch(() => {});
+    }, 1000);
+  }
+
+  document.getElementById("logsRefresh").addEventListener("click", async () => {
+    try { await loadLogs(); } catch (e) { showAlert("danger", e.toString()); }
+  });
+  logsLines.addEventListener("change", async () => {
+    try { await loadLogs(); } catch (e) { showAlert("danger", e.toString()); }
+  });
+  logsTail.addEventListener("change", () => {
+    if (logsTail.checked) startLogsTail();
+    else stopLogsTail();
+  });
+
+  logsModalEl.addEventListener("hidden.bs.modal", () => {
+    stopLogsTail();
+    logsTail.checked = false;
+    logsApp = null;
+    logsAppEl.textContent = "";
+    logsPre.textContent = "";
+  });
+
+  // -------- add user flag --------
+  const flagModalEl = document.getElementById("flagModal");
+  const flagModal = new bootstrap.Modal(flagModalEl, { backdrop: "static" });
+  const flagAppEl = document.getElementById("flagApp");
+  const flagValueEl = document.getElementById("flagValue");
+  const flagTtlEl = document.getElementById("flagTtl");
+  const flagErrEl = document.getElementById("flagErr");
+  let flagApp = null;
+
+  function showFlagErr(msg) {
+    flagErrEl.textContent = msg;
+    flagErrEl.classList.remove("d-none");
+  }
+  function clearFlagErr() {
+    flagErrEl.textContent = "";
+    flagErrEl.classList.add("d-none");
+  }
+
+  function parseFlagsInput(raw) {
+    const parts = (raw || "")
+      .split(",")
+      .map(s => s.trim())
+      .filter(s => s.length > 0);
+    const re = /^[0-9A-Za-z_-]{1,20}$/;
+    for (const f of parts) {
+      if (!re.test(f)) throw new Error(`invalid flag: ${f} (allowed [0-9a-zA-Z_-]{1,20})`);
+    }
+    return parts;
+  }
+
+  function normalizeTtlInput(raw) {
+    const t = (raw || "").trim();
+    if (!t) return null;
+    const m = t.match(/^([0-9]+)\s*(ms|s|m|h|d)$/i);
+    if (!m) throw new Error("invalid expiry format (use Nms, Ns, Nm, Nh, or Nd; unit required)");
+    const n = m[1];
+    const unit = (m[2] || "").toLowerCase();
+    return `${n}${unit}`;
+  }
+
+  document.getElementById("flagOk").addEventListener("click", async () => {
+    if (!flagApp) return;
+    clearFlagErr();
+    try {
+      const flags = parseFlagsInput(flagValueEl.value);
+      if (!flags.length) throw new Error("please enter at least one flag");
+      const ttl = normalizeTtlInput(flagTtlEl.value);
+      const resp = await rpc("flag", { name: flagApp, flags, ttl });
+      if (resp.message) showAlert(resp.ok ? "success" : "danger", resp.message);
+      flagModal.hide();
+      await refresh();
+    } catch (e) {
+      showFlagErr(e.toString());
+    }
+  });
+
+  function renderActiveFlagsFor(app) {
+    const container = document.getElementById("flagActive");
+    const entry = (lastStatuses || []).find(s => s.application === app);
+    const flags = (entry && entry.user_flags) ? entry.user_flags : [];
+    if (!flags.length) {
+      container.innerHTML = '<span class="text-muted">-</span>';
+      return;
+    }
+    container.innerHTML = flags.map(f => {
+      const safe = esc(f);
+      return `<span class="badge rounded-pill pm-badge-user me-1 mb-1" title="${safe}">
+        ${safe}
+        <button type="button" class="btn btn-sm btn-link p-0 ms-2 text-dark" style="text-decoration:none;" data-flag-remove="${safe}" aria-label="remove">×</button>
+      </span>`;
+    }).join("");
+  }
+
+  flagModalEl.addEventListener("hidden.bs.modal", () => {
+    flagApp = null;
+    flagAppEl.textContent = "";
+    flagValueEl.value = "";
+    flagTtlEl.value = "";
+    clearFlagErr();
+    document.getElementById("flagActive").innerHTML = "";
+  });
+
+  document.getElementById("flagRefresh").addEventListener("click", async () => {
+    if (!flagApp) return;
+    try {
+      await refresh();
+      renderActiveFlagsFor(flagApp);
+    } catch (e) {
+      showFlagErr(e.toString());
+    }
+  });
+
+  document.getElementById("flagActive").addEventListener("click", async (ev) => {
+    const btn = ev.target.closest("[data-flag-remove]");
+    if (!btn || !flagApp) return;
+    const flag = btn.getAttribute("data-flag-remove");
+    clearFlagErr();
+    try {
+      const resp = await rpc("unflag", { name: flagApp, flags: [flag] });
+      if (resp.message) showAlert(resp.ok ? "success" : "danger", resp.message);
+      await refresh();
+      renderActiveFlagsFor(flagApp);
+    } catch (e) {
+      showFlagErr(e.toString());
+    }
+  });
+
+  // -------- service actions modal --------
+  const actionsModalEl = document.getElementById("actionsModal");
+  const actionsModal = new bootstrap.Modal(actionsModalEl);
+  const actionsAppEl = document.getElementById("actionsApp");
+  const actionsLogsBtn = document.getElementById("actionsLogs");
+  const actionsFlagsBtn = document.getElementById("actionsFlags");
+  const actionsStartBtn = document.getElementById("actionsStart");
+  const actionsStopBtn = document.getElementById("actionsStop");
+  let actionsApp = null;
+
+  function openLogsFor(app) {
+    logsApp = app;
+    logsAppEl.textContent = app;
+    logsPre.textContent = "Loading…";
+    logsModal.show();
+    loadLogs().catch(e => showAlert("danger", e.toString()));
+  }
+
+  function openFlagsFor(app) {
+    flagApp = app;
+    flagAppEl.textContent = app;
+    clearFlagErr();
+    flagModal.show();
+    window.setTimeout(() => flagValueEl.focus(), 50);
+    // Render current flags (best effort using last refresh snapshot).
+    renderActiveFlagsFor(app);
+  }
+
+  actionsModalEl.addEventListener("hidden.bs.modal", () => {
+    actionsApp = null;
+    actionsAppEl.textContent = "";
+  });
+
+  actionsLogsBtn.addEventListener("click", () => {
+    if (!actionsApp) return;
+    actionsModal.hide();
+    openLogsFor(actionsApp);
+  });
+  actionsFlagsBtn.addEventListener("click", () => {
+    if (!actionsApp) return;
+    actionsModal.hide();
+    openFlagsFor(actionsApp);
+  });
+  actionsStartBtn.addEventListener("click", () => {
+    if (!actionsApp) return;
+    actionsModal.hide();
+    askConfirm("start", actionsApp);
+  });
+  actionsStopBtn.addEventListener("click", () => {
+    if (!actionsApp) return;
+    actionsModal.hide();
+    askConfirm("stop", actionsApp);
+  });
+
+  document.getElementById("status-body").addEventListener("click", async (ev) => {
+    const el = ev.target.closest("[data-action]");
+    if (!el) return;
+    const action = el.getAttribute("data-action");
+    const app = el.getAttribute("data-app");
+    if (action === "actions") {
+      ev.preventDefault();
+      actionsApp = app;
+      actionsAppEl.textContent = app;
+      actionsModal.show();
+      return;
+    }
+    try {
+      // no-op: table no longer has direct actions; everything goes through the actions modal.
+    } catch (e) {
+      showAlert("danger", e.toString());
+    }
+  });
+
+  refresh().catch(e => showAlert("danger", e.toString()));
+</script>
+{% endblock %}
+
+

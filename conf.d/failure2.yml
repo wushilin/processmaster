@@ -1,0 +1,29 @@
+application: failure2
+
+logs:
+  stdout: ./stdout.log
+  stderr: ./stderr.log
+  rotation_mode: size
+  rotation_size: 10
+  rotation_backups: 10
+
+process:
+  working_directory: /tmp/processmaster/failure2
+  start_command:
+    - /bin/sh
+    - /home/code/workspace/processmaster/conf.d/failure.sh
+  # stop_signal: SIGTERM
+resources:
+  max_cpu: 50m
+  max_memory: 64MiB
+  max_swap: 0
+
+global:
+  enabled: true
+
+restart_policy:
+  policy: always
+  restart_backoff_ms: 10000
+  tolerance:
+    max_restarts: 100
+    duration: 1m         # supports ms / s / m / h (e.g. 600000, 10m, 1h)

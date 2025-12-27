@@ -1,0 +1,27 @@
+application: sleeper
+
+logs:
+  stdout: ./stdout.log
+  stderr: ./stderr.log
+  rotation_mode: time
+  rotation_frequency: hourly
+  rotation_max_age_ms: 3600000000
+  # Extra log files written outside stdout/stderr. These can be absolute paths.
+  hints:
+    - /var/log/syslog
+
+process:
+  working_directory: /tmp/processmaster/sleeper
+  start_command:
+    - /bin/sleep
+    - "1000000"
+  stop_signal: SIGTERM
+  stop_grace_period_ms: 30000
+
+resources:
+  max_cpu: 100m
+  max_memory: 64MiB
+  max_swap: 0
+
+global:
+  enabled: true

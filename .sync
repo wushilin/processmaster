@@ -1,0 +1,2 @@
+copy target/x86_64-unknown-linux-musl/release/processmaster oss://fleetman/prod/staging/processmaster/processmaster
+copy target/x86_64-unknown-linux-musl/release/pmctl oss://fleetman/prod/staging/processmaster/pmctl

@@ -1,0 +1,16 @@
+application: sleeper
+
+process:
+  working_directory: /tmp/processmaster/examples/sleeper
+  start_command:
+    - /bin/sleep
+    - "1000000"
+  stop_signal: SIGTERM
+
+resources:
+  max_cpu: 100m
+  max_memory: 64MiB
+  max_swap: 0
+
+global:
+  enabled: true

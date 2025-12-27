@@ -1,0 +1,162 @@
+cgroup path /sys/fs/cgroup/xyz.slice/processmaster.service/processmaster is missing (or not a directory). To use cgroups as a non-root user, run the following as root:
+
+mkdir -p /sys/fs/cgroup/xyz.slice/processmaster.service/processmaster
+chown code:code /sys/fs/cgroup/xyz.slice/processmaster.service/processmaster
+chmod 0775 /sys/fs/cgroup/xyz.slice/processmaster.service/processmaster
+
+Error: cgroup not set up for non-root usage: /sys/fs/cgroup/xyz.slice/processmaster.service/processmaster
+2025-12-26_20:08:43.898 [cgroup] master_cgroup_resolve configured_root=/sys/fs/cgroup configured_name=processmaster effective_path=/sys/fs/cgroup/processmaster self_cgroup=/system.slice/processmaster.service euid=0
+2025-12-26_20:08:43.908 [cgroup] master_cgroup_effective configured_root=/sys/fs/cgroup configured_name=processmaster effective_path=/sys/fs/cgroup/processmaster
+2025-12-26_20:08:43.910 [supervisor] app=failure2 spawn
+2025-12-26_20:08:43.914 [supervisor] app=cron spawn
+2025-12-26_20:08:43.914 [supervisor] app=daemon spawn
+2025-12-26_20:08:43.914 [supervisor] app=logger spawn
+2025-12-26_20:08:43.915 [supervisor] app=sleeper spawn
+2025-12-26_20:08:43.915 [supervisor] app=failure spawn
+2025-12-26_20:08:43.916 [supervisor] app=failure1 spawn
+2025-12-26_20:08:43.916 [supervisor] app=sleeper2 spawn
+2025-12-26_20:08:43.917 [reconcile] app=cron pass=boot observed running=false pids=0 enabled=true restart=false schedule=true
+2025-12-26_20:08:43.917 [reconcile] app=daemon pass=boot observed running=false pids=0 enabled=true restart=true schedule=false
+2025-12-26_20:08:43.917 [reconcile] app=failure pass=boot observed running=false pids=0 enabled=true restart=true schedule=false
+2025-12-26_20:08:43.917 [reconcile] app=failure1 pass=boot observed running=false pids=0 enabled=true restart=true schedule=false
+2025-12-26_20:08:43.917 [reconcile] app=failure2 pass=boot observed running=false pids=0 enabled=true restart=true schedule=false
+2025-12-26_20:08:43.917 [reconcile] app=logger pass=boot observed running=false pids=0 enabled=true restart=true schedule=false
+2025-12-26_20:08:43.918 [reconcile] app=sleeper pass=boot observed running=false pids=0 enabled=true restart=false schedule=false
+2025-12-26_20:08:43.918 [reconcile] app=sleeper2 pass=boot observed running=false pids=0 enabled=false restart=false schedule=false
+2025-12-26_20:08:43.920 [taskstats] code=TASK_STATS active_async=13 total_async=13 active_blocking=0 total_blocking=0
+2025-12-26_20:08:43.923 [autostart] app=failure2 attempt=set_desired enabled
+2025-12-26_20:08:43.923 [autostart] app=failure attempt=set_desired enabled
+2025-12-26_20:08:43.923 [autostart] app=sleeper attempt=set_desired enabled
+2025-12-26_20:08:43.923 [autostart] app=daemon attempt=set_desired enabled
+2025-12-26_20:08:43.923 [autostart] app=failure1 attempt=set_desired enabled
+2025-12-26_20:08:43.923 [autostart] app=logger attempt=set_desired enabled
+2025-12-26_20:08:43.923 [autostart] app=failure2 outcome=accepted desired=RUNNING
+2025-12-26_20:08:43.923 [autostart] app=failure outcome=accepted desired=RUNNING
+2025-12-26_20:08:43.923 [state] app=failure2 transition UNKNOWN -> STARTING reason=reconcile_start
+2025-12-26_20:08:43.923 [autostart] app=sleeper outcome=accepted desired=RUNNING
+2025-12-26_20:08:43.923 [state] app=failure transition UNKNOWN -> STARTING reason=reconcile_start
+2025-12-26_20:08:43.923 [autostart] app=daemon outcome=accepted desired=RUNNING
+2025-12-26_20:08:43.923 [state] app=sleeper transition UNKNOWN -> STARTING reason=reconcile_start
+2025-12-26_20:08:43.923 [autostart] app=failure1 outcome=accepted desired=RUNNING
+2025-12-26_20:08:43.923 [state] app=daemon transition UNKNOWN -> STARTING reason=reconcile_start
+2025-12-26_20:08:43.923 [autostart] app=logger outcome=accepted desired=RUNNING
+2025-12-26_20:08:43.923 [state] app=failure1 transition UNKNOWN -> STARTING reason=reconcile_start
+2025-12-26_20:08:43.923 [state] app=logger transition UNKNOWN -> STARTING reason=reconcile_start
+2025-12-26_20:08:43.924 [rpc] listening sock=/tmp/processmaster.sock
+2025-12-26_20:08:43.943 [restart] app=failure outcome=start_spawned
+2025-12-26_20:08:43.944 [restart] app=failure2 outcome=start_spawned
+2025-12-26_20:08:43.944 [restart] app=daemon outcome=start_spawned
+2025-12-26_20:08:43.944 [restart] app=failure1 outcome=start_spawned
+2025-12-26_20:08:43.944 [restart] app=logger outcome=start_spawned
+2025-12-26_20:08:43.944 [restart] app=sleeper outcome=start_spawned
+2025-12-26_20:08:43.944 [restart] app=failure waiter=attached
+2025-12-26_20:08:43.944 [restart] app=failure2 waiter=attached
+2025-12-26_20:08:43.944 [restart] app=daemon waiter=attached
+2025-12-26_20:08:43.945 [restart] app=sleeper waiter=attached
+2025-12-26_20:08:43.945 [restart] app=failure1 waiter=attached
+2025-12-26_20:08:43.945 [restart] app=logger waiter=attached
+2025-12-26_20:08:44.915 [state] app=cron transition UNKNOWN -> STOPPED reason=reconcile_desired_stopped
+2025-12-26_20:08:44.918 [state] app=sleeper2 transition UNKNOWN -> STOPPED reason=reconcile_desired_stopped
+2025-12-26_20:08:58.945 [restart] app=failure2 event=exit_observed code=-
+2025-12-26_20:08:58.946 [state] app=failure2 transition STARTING -> BACKOFF reason=restart_backoff
+2025-12-26_20:08:58.946 [restart] app=failure2 decision=backoff backoff_ms=10000 recent_restarts_in_window=1
+2025-12-26_20:08:58.945 [restart] app=failure event=exit_observed code=-
+2025-12-26_20:08:58.946 [state] app=failure transition STARTING -> BACKOFF reason=restart_backoff
+2025-12-26_20:08:58.946 [restart] app=failure decision=backoff backoff_ms=10000 recent_restarts_in_window=1
+2025-12-26_20:08:59.035 [restart] app=failure1 event=exit_observed code=-
+2025-12-26_20:08:59.035 [state] app=failure1 transition STARTING -> FAILED reason=exit_observed_policy_never
+2025-12-26_20:09:00.003 [schedule] app=cron due schedule="* * * * *" attempt=run_once
+2025-12-26_20:09:00.003 [schedule] app=cron outcome=accepted
+2025-12-26_20:09:00.003 [state] app=cron transition STOPPED -> STARTING reason=reconcile_start
+2025-12-26_20:09:00.016 [restart] app=cron outcome=start_spawned
+2025-12-26_20:09:00.018 [restart] app=cron waiter=attached
+2025-12-26_20:09:08.947 [state] app=failure2 transition BACKOFF -> STARTING reason=reconcile_start
+2025-12-26_20:09:08.947 [state] app=failure transition BACKOFF -> STARTING reason=reconcile_start
+2025-12-26_20:09:08.962 [restart] app=failure outcome=start_spawned
+2025-12-26_20:09:08.962 [restart] app=failure2 outcome=start_spawned
+2025-12-26_20:09:08.963 [restart] app=failure waiter=attached
+2025-12-26_20:09:08.964 [restart] app=failure2 waiter=attached
+2025-12-26_20:09:13.920 [taskstats] code=TASK_STATS active_async=26 total_async=32 active_blocking=0 total_blocking=9
+2025-12-26_20:09:23.967 [restart] app=failure2 event=exit_observed code=-
+2025-12-26_20:09:23.967 [state] app=failure2 transition STARTING -> BACKOFF reason=restart_backoff
+2025-12-26_20:09:23.967 [restart] app=failure2 decision=backoff backoff_ms=10000 recent_restarts_in_window=2
+2025-12-26_20:09:23.996 [restart] app=failure event=exit_observed code=-
+2025-12-26_20:09:23.997 [state] app=failure transition STARTING -> BACKOFF reason=restart_backoff
+2025-12-26_20:09:23.997 [restart] app=failure decision=backoff backoff_ms=10000 recent_restarts_in_window=2
+2025-12-26_20:09:30.020 [restart] app=cron event=exit_observed code=-
+2025-12-26_20:09:30.021 [state] app=cron transition STARTING -> STOPPED reason=run_once_completed
+2025-12-26_20:09:33.969 [state] app=failure2 transition BACKOFF -> STARTING reason=reconcile_start
+2025-12-26_20:09:33.980 [restart] app=failure2 outcome=start_spawned
+2025-12-26_20:09:33.982 [restart] app=failure2 waiter=attached
+2025-12-26_20:09:33.998 [state] app=failure transition BACKOFF -> STARTING reason=reconcile_start
+2025-12-26_20:09:34.009 [restart] app=failure outcome=start_spawned
+2025-12-26_20:09:34.011 [restart] app=failure waiter=attached
+2025-12-26_20:09:43.921 [taskstats] code=TASK_STATS active_async=24 total_async=37 active_blocking=0 total_blocking=12
+2025-12-26_20:09:49.011 [restart] app=failure2 event=exit_observed code=-
+2025-12-26_20:09:49.011 [state] app=failure2 transition STARTING -> BACKOFF reason=restart_backoff
+2025-12-26_20:09:49.012 [restart] app=failure2 decision=backoff backoff_ms=10000 recent_restarts_in_window=3
+2025-12-26_20:09:49.096 [restart] app=failure event=exit_observed code=-
+2025-12-26_20:09:49.097 [state] app=failure transition STARTING -> BACKOFF reason=restart_backoff
+2025-12-26_20:09:49.097 [restart] app=failure decision=backoff backoff_ms=10000 recent_restarts_in_window=3
+2025-12-26_20:09:59.013 [state] app=failure2 transition BACKOFF -> STARTING reason=reconcile_start
+2025-12-26_20:09:59.028 [restart] app=failure2 outcome=start_spawned
+2025-12-26_20:09:59.029 [restart] app=failure2 waiter=attached
+2025-12-26_20:09:59.099 [state] app=failure transition BACKOFF -> STARTING reason=reconcile_start
+2025-12-26_20:09:59.110 [restart] app=failure outcome=start_spawned
+2025-12-26_20:09:59.112 [restart] app=failure waiter=attached
+2025-12-26_20:10:00.001 [schedule] app=cron due schedule="* * * * *" attempt=run_once
+2025-12-26_20:10:00.001 [schedule] app=cron outcome=accepted
+2025-12-26_20:10:00.001 [state] app=cron transition STOPPED -> STARTING reason=reconcile_start
+2025-12-26_20:10:00.014 [restart] app=cron outcome=start_spawned
+2025-12-26_20:10:00.016 [restart] app=cron waiter=attached
+2025-12-26_20:10:13.921 [taskstats] code=TASK_STATS active_async=26 total_async=43 active_blocking=0 total_blocking=15
+2025-12-26_20:10:14.110 [restart] app=failure2 event=exit_observed code=-
+2025-12-26_20:10:14.110 [state] app=failure2 transition STARTING -> BACKOFF reason=restart_backoff
+2025-12-26_20:10:14.110 [restart] app=failure2 decision=backoff backoff_ms=10000 recent_restarts_in_window=3
+2025-12-26_20:10:14.196 [restart] app=failure event=exit_observed code=-
+2025-12-26_20:10:14.197 [restart] app=failure decision=suppress reason=tolerance_exceeded max_restarts=3 window_ms=600000
+2025-12-26_20:10:14.197 [state] app=failure transition STARTING -> FAILED reason=tolerance_exceeded
+2025-12-26_20:10:24.111 [state] app=failure2 transition BACKOFF -> STARTING reason=reconcile_start
+2025-12-26_20:10:24.124 [restart] app=failure2 outcome=start_spawned
+2025-12-26_20:10:24.126 [restart] app=failure2 waiter=attached
+2025-12-26_20:10:30.016 [restart] app=cron event=exit_observed code=-
+2025-12-26_20:10:30.016 [state] app=cron transition STARTING -> STOPPED reason=run_once_completed
+2025-12-26_20:10:39.211 [restart] app=failure2 event=exit_observed code=-
+2025-12-26_20:10:39.211 [state] app=failure2 transition STARTING -> BACKOFF reason=restart_backoff
+2025-12-26_20:10:39.211 [restart] app=failure2 decision=backoff backoff_ms=10000 recent_restarts_in_window=3
+2025-12-26_20:10:41.446 [shutdown] signal received; shutting down (best-effort stop all services)
+2025-12-26_20:10:41.452 [state] app=failure transition FAILED -> STOPPED reason=stop_noop_already_stopped
+2025-12-26_20:10:41.452 [state] app=daemon transition STARTING -> STOPPING reason=stop_requested
+2025-12-26_20:10:41.452 [state] app=logger transition STARTING -> STOPPING reason=stop_requested
+2025-12-26_20:10:41.452 [state] app=failure2 transition BACKOFF -> STOPPED reason=stop_noop_already_stopped
+2025-12-26_20:10:41.452 [state] app=sleeper transition STARTING -> STOPPING reason=stop_requested
+2025-12-26_20:10:41.452 [state] app=failure1 transition FAILED -> STOPPED reason=stop_noop_already_stopped
+2025-12-26_20:10:41.452 [stop] app=daemon attempt=stop_command argv=["/bin/sh", "/home/code/workspace/processmaster/conf.d/exit.sh"]
+2025-12-26_20:10:41.452 [stop] app=logger attempt=signal sig=SIGTERM sig_num=15
+2025-12-26_20:10:41.453 [stop] app=sleeper attempt=signal sig=SIGTERM sig_num=15
+2025-12-26_20:10:41.453 [stop] app=logger outcome=signal_sent
+2025-12-26_20:10:41.453 [stop] app=logger attempt=grace_wait stop_grace_period_ms=30000
+2025-12-26_20:10:41.453 [shutdown] app=sleeper ignore_exit reason=shutting_down
+2025-12-26_20:10:41.453 [shutdown] app=logger ignore_exit reason=shutting_down
+2025-12-26_20:10:41.453 [stop] app=sleeper outcome=signal_sent
+2025-12-26_20:10:41.454 [stop] app=sleeper attempt=grace_wait stop_grace_period_ms=30000
+2025-12-26_20:10:41.454 [stop] app=sleeper outcome=grace_exit elapsed_ms=0
+2025-12-26_20:10:41.454 [state] app=sleeper transition STOPPING -> STOPPED reason=stop_completed
+2025-12-26_20:10:42.033 [shutdown] app=cron controller=idle reason=shutting_down
+2025-12-26_20:10:42.033 [shutdown] app=cron supervisor=exit reason=shutting_down
+2025-12-26_20:10:42.090 [shutdown] app=sleeper2 controller=idle reason=shutting_down
+2025-12-26_20:10:42.090 [shutdown] app=sleeper2 supervisor=exit reason=shutting_down
+2025-12-26_20:10:42.110 [shutdown] app=daemon controller=idle reason=shutting_down
+2025-12-26_20:10:42.110 [shutdown] app=daemon supervisor=exit reason=shutting_down
+2025-12-26_20:10:42.183 [shutdown] app=failure1 controller=idle reason=shutting_down
+2025-12-26_20:10:42.183 [shutdown] app=failure1 supervisor=exit reason=shutting_down
+2025-12-26_20:10:42.238 [shutdown] app=failure controller=idle reason=shutting_down
+2025-12-26_20:10:42.238 [shutdown] app=failure supervisor=exit reason=shutting_down
+2025-12-26_20:10:42.454 [stop] app=logger outcome=grace_exit elapsed_ms=1000
+2025-12-26_20:10:42.454 [state] app=logger transition STOPPING -> STOPPED reason=stop_completed
+2025-12-26_20:10:46.491 [stop] app=daemon outcome=stop_command_timeout stop_deadline_ms=5000 decision=kill-all err=stop_command_timeout
+2025-12-26_20:10:46.516 [stop] app=daemon outcome=stopped
+2025-12-26_20:10:46.517 [state] app=daemon transition STOPPING -> STOPPED reason=stop_completed
+2025-12-26_20:10:46.517 [shutdown] drain_cgroups_begin count=8
+2025-12-26_20:10:46.518 [shutdown] drain_cgroups_done
+2025-12-26_20:10:46.518 [shutdown] done; closing sock=/tmp/processmaster.sock

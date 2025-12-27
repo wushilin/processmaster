@@ -1,0 +1,63 @@
+cgroup:
+  root: /sys/fs/cgroup
+  # root: /sys/fs/cgroup/xyz.slice/processmaster.service
+  name: processmaster
+  memory_max: MAX
+  memory_swap_max: MAX
+  cpu_max: MAX
+
+unix_socket:
+  path: /tmp/processmaster.sock
+  owner: root
+  group: root
+  mode: 0600
+
+global:
+  # App definition directory (relative to this config file)
+  config_directory: ./conf.d
+
+  # Optional: auto-discover services from subdirectories.
+  # Each direct child directory becomes an implicit service using defaults:
+  # - application: directory name
+  # - working_directory: that directory
+  # - start_command: ./run.sh
+  #
+  # This also serves as the default base directory for app configs that omit
+  # `process.working_directory`: `${auto_service_directory}/${application}`.
+  auto_service_directory: ./services
+
+  # If you start processmaster as root and want it to drop privileges after binding the socket:
+  # user: someuser
+  # group: somegroup
+
+web_console:
+  enabled: false
+  bind: 0.0.0.0
+  port: 9001
+  # client_host is added to the auto-generated TLS certificate SANs (DNS or IP).
+  client_host: localhost
+  # client_port is parsed/stored for future use; defaults to `port`.
+  client_port: 9001
+  # cookie_secure controls whether the CSRF cookie has the `Secure` attribute.
+  # - null: auto (Secure when tls.enabled=true)
+  # - true: always Secure (useful behind HTTPS reverse proxy even if processmaster serves HTTP)
+  # - false: never Secure
+  cookie_secure: null
+  tls:
+    enabled: true
+    cookie_secure: false
+    # Defaults (relative to this config file):
+    # - ca_pem: ./ca.pem
+    # - server_cert_pem: ./server.pem
+    # - server_key_pem: ./server.key
+    #
+    # If tls.enabled=true and all three files are missing, processmaster will auto-generate
+    # a self-signed setup (CA + server cert) valid for 20 years (CN=test, SAN=localhost,127.0.0.1).
+    ca_pem: ./ca.pem
+    server_cert_pem: ./server.pem
+    server_key_pem: ./server.key
+    mtls: false
+  auth:
+    basic:
+      users:
+        - "admin:$2a$10$jqNWtAzhWEVlPnvJwyI6g.Nwb8YPU5ypCED9lBEhahUSs13ac1MPe"
