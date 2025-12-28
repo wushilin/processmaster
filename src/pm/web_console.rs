@@ -1,8 +1,11 @@
 use crate::pm::config::WebConsoleConfig;
 use crate::pm::daemon::{dispatch_async, DaemonState};
+use crate::pm::cgroup;
 use crate::pm::rpc::Request;
 use askama::Template;
 use axum::extract::State;
+use axum::extract::Path as AxumPath;
+use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response as AxumResponse};
 use axum::routing::{get, post};
@@ -15,6 +18,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -103,6 +107,11 @@ fn build_router(state: WebState) -> Router {
     let inner = Router::new()
         .route("/", get(|| async { Redirect::temporary("status") }))
         .route("/status", get(status_page))
+        .route("/favicon.ico", get(favicon_ico))
+        // Common typo/alias
+        .route("/favico.ico", get(favicon_ico))
+        .route("/static/logo.png", get(static_logo_png))
+        .route("/icons/:name", get(icon_asset))
         .route("/rpc", post(jsonrpc))
         .with_state(state)
         .layer(middleware::from_fn_with_state(auth_state, basic_auth_middleware))
@@ -113,7 +122,56 @@ fn build_router(state: WebState) -> Router {
         .route("/", get(|| async { Redirect::temporary("/processmaster/status") }))
         .route("/index.html", get(|| async { Redirect::temporary("/processmaster/status") }))
         .route("/index.htm", get(|| async { Redirect::temporary("/processmaster/status") }))
+        // Also serve icons at the root path, so browsers that request `/favicon.ico` work.
+        .route("/favicon.ico", get(favicon_ico))
+        .route("/favico.ico", get(favicon_ico))
+        .route("/icons/:name", get(icon_asset))
+        // Compatibility alias (common misspelling): /procressmaster/static/logo.png
+        .route("/procressmaster/static/logo.png", get(static_logo_png))
         .nest("/processmaster", inner)
+}
+
+// ---------------- Embedded static assets (icons) ----------------
+
+const ICON_FAVICON_ICO: &[u8] = include_bytes!("../../templates/icons/favicon.ico");
+const ICON_ANDROID_192: &[u8] = include_bytes!("../../templates/icons/android-chrome-192x192.png");
+const ICON_ANDROID_512: &[u8] = include_bytes!("../../templates/icons/android-chrome-512x512.png");
+const ICON_FAVICON_16: &[u8] = include_bytes!("../../templates/icons/favicon-16x16.png");
+const ICON_FAVICON_32: &[u8] = include_bytes!("../../templates/icons/favicon-32x32.png");
+const ICON_APPLE_TOUCH: &[u8] = include_bytes!("../../templates/icons/apple-touch-icon.png");
+
+fn bytes_response(content_type: &'static str, bytes: &'static [u8]) -> AxumResponse {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        Body::from(bytes),
+    )
+        .into_response()
+}
+
+async fn favicon_ico() -> AxumResponse {
+    bytes_response("image/x-icon", ICON_FAVICON_ICO)
+}
+
+async fn static_logo_png() -> AxumResponse {
+    // Serve the logo from embedded bytes; currently reusing the 192x192 icon.
+    bytes_response("image/png", ICON_ANDROID_192)
+}
+
+async fn icon_asset(AxumPath(name): AxumPath<String>) -> AxumResponse {
+    match name.as_str() {
+        "android-chrome-192x192.png" => bytes_response("image/png", ICON_ANDROID_192),
+        "android-chrome-512x512.png" => bytes_response("image/png", ICON_ANDROID_512),
+        "favicon-16x16.png" => bytes_response("image/png", ICON_FAVICON_16),
+        "favicon-32x32.png" => bytes_response("image/png", ICON_FAVICON_32),
+        "apple-touch-icon.png" => bytes_response("image/png", ICON_APPLE_TOUCH),
+        // Also allow `/icons/favicon.ico` for completeness
+        "favicon.ico" => bytes_response("image/x-icon", ICON_FAVICON_ICO),
+        _ => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
 }
 
 async fn basic_auth_middleware(
@@ -234,13 +292,38 @@ fn cookie_get(headers: &HeaderMap, name: &str) -> Option<String> {
 struct StatusTemplate<'a> {
     title: &'a str,
     csrf_token: &'a str,
+    admin_actions: Vec<AdminActionButton>,
+    build_banner: String,
+}
+
+#[derive(Clone)]
+struct AdminActionButton {
+    name: String,
+    label: String,
 }
 
 async fn status_page(State(_st): State<WebState>, headers: HeaderMap) -> AxumResponse {
     let token = cookie_get(&headers, CSRF_COOKIE).unwrap_or_else(|| "".to_string());
+    // Build banner is computed from build-time env vars (see build.rs).
+    let admin_actions = {
+        let st = _st.daemon.lock().unwrap_or_else(|p| p.into_inner());
+        st.cfg
+            .admin_actions
+            .iter()
+            .map(|(name, a)| AdminActionButton {
+                name: name.clone(),
+                label: a
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| name.clone()),
+            })
+            .collect::<Vec<_>>()
+    };
     let t = StatusTemplate {
         title: "processmaster",
         csrf_token: &token,
+        admin_actions,
+        build_banner: crate::pm::build_info::banner(),
     };
     match t.render() {
         Ok(s) => Html(s).into_response(),
@@ -291,6 +374,105 @@ async fn jsonrpc(State(st): State<WebState>, Json(req): Json<JsonRpcRequest>) ->
         );
     }
 
+    // Web-console specific methods (not routed through daemon::dispatch_async), used for UX features.
+    // These return lightweight objects (ok/message/...) and can directly inspect daemon config/state.
+    match req.method.as_str() {
+        "admin_actions_pids" => {
+            let cfg = {
+                let st = st.daemon.lock().unwrap_or_else(|p| p.into_inner());
+                st.cfg.clone()
+            };
+            let admin_cg = match admin_actions_cgroup_dir(&cfg) {
+                Ok(p) => p,
+                Err(e) => {
+                    let v = serde_json::json!({ "ok": false, "message": e.to_string(), "pids": [] });
+                    return (
+                        StatusCode::OK,
+                        Json(JsonRpcResponse::<serde_json::Value> {
+                            jsonrpc: "2.0",
+                            id: req.id,
+                            result: Some(v),
+                            error: None,
+                        }),
+                    );
+                }
+            };
+            let pids = match cgroup::list_pids(&admin_cg) {
+                Ok(v) => v,
+                Err(e) => {
+                    let v = serde_json::json!({ "ok": false, "message": e.to_string(), "pids": [] });
+                    return (
+                        StatusCode::OK,
+                        Json(JsonRpcResponse::<serde_json::Value> {
+                            jsonrpc: "2.0",
+                            id: req.id,
+                            result: Some(v),
+                            error: None,
+                        }),
+                    );
+                }
+            };
+            let v = serde_json::json!({ "ok": true, "message": "", "pids": pids });
+            return (
+                StatusCode::OK,
+                Json(JsonRpcResponse::<serde_json::Value> {
+                    jsonrpc: "2.0",
+                    id: req.id,
+                    result: Some(v),
+                    error: None,
+                }),
+            );
+        }
+        "admin_actions_kill" => {
+            let cfg = {
+                let st = st.daemon.lock().unwrap_or_else(|p| p.into_inner());
+                st.cfg.clone()
+            };
+            let admin_cg = match admin_actions_cgroup_dir(&cfg) {
+                Ok(p) => p,
+                Err(e) => {
+                    let v = serde_json::json!({ "ok": false, "message": e.to_string() });
+                    return (
+                        StatusCode::OK,
+                        Json(JsonRpcResponse::<serde_json::Value> {
+                            jsonrpc: "2.0",
+                            id: req.id,
+                            result: Some(v),
+                            error: None,
+                        }),
+                    );
+                }
+            };
+            let before = cgroup::list_pids(&admin_cg).unwrap_or_default();
+            if let Err(e) = cgroup::kill_all_pids(&admin_cg) {
+                let v = serde_json::json!({ "ok": false, "message": e.to_string() });
+                return (
+                    StatusCode::OK,
+                    Json(JsonRpcResponse::<serde_json::Value> {
+                        jsonrpc: "2.0",
+                        id: req.id,
+                        result: Some(v),
+                        error: None,
+                    }),
+                );
+            }
+            let v = serde_json::json!({
+                "ok": true,
+                "message": format!("sent cgroup.kill to {} (pids_before={})", admin_cg.display(), before.len()),
+            });
+            return (
+                StatusCode::OK,
+                Json(JsonRpcResponse::<serde_json::Value> {
+                    jsonrpc: "2.0",
+                    id: req.id,
+                    result: Some(v),
+                    error: None,
+                }),
+            );
+        }
+        _ => {}
+    }
+
     let r = match map_method_to_request(&req.method, &req.params) {
         Ok(r) => r,
         Err(e) => {
@@ -339,6 +521,17 @@ async fn jsonrpc(State(st): State<WebState>, Json(req): Json<JsonRpcRequest>) ->
     }
 }
 
+fn admin_actions_cgroup_dir(cfg: &crate::pm::config::MasterConfig) -> anyhow::Result<PathBuf> {
+    let name = cfg.cgroup_name.trim();
+    anyhow::ensure!(!name.is_empty(), "cgroup.name is empty");
+    anyhow::ensure!(
+        !name.split('/').any(|seg| seg == ".."),
+        "cgroup.name must not contain '..'"
+    );
+    let master = PathBuf::from(&cfg.cgroup_root).join(name.trim_start_matches('/'));
+    Ok(master.join("admin_actions"))
+}
+
 fn map_method_to_request(method: &str, params: &serde_json::Value) -> Result<Request, String> {
     let obj = params.as_object().cloned().unwrap_or_default();
     let get_s = |k: &str| obj.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -359,6 +552,17 @@ fn map_method_to_request(method: &str, params: &serde_json::Value) -> Result<Req
             })
         }
         "update" => Ok(Request::Update),
+        "admin_action" => {
+            let name = get_s("name").ok_or_else(|| "missing param: name".to_string())?;
+            Ok(Request::AdminAction { name })
+        }
+        "start_all" => Ok(Request::StartAll {
+            force: get_b("force").unwrap_or(false),
+        }),
+        "stop_all" => Ok(Request::StopAll),
+        "restart_all" => Ok(Request::RestartAll {
+            force: get_b("force").unwrap_or(false),
+        }),
         "start" => {
             let name = get_s("name").ok_or_else(|| "missing param: name".to_string())?;
             Ok(Request::Start {

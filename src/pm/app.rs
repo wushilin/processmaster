@@ -23,7 +23,17 @@ fn default_restart_backoff_ms() -> u64 {
     1000
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+impl Default for RestartConfig {
+    fn default() -> Self {
+        Self {
+            policy: RestartPolicy::default(),
+            restart_backoff_ms: default_restart_backoff_ms(),
+            tolerance: RestartTolerance::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestartTolerance {
     #[serde(default = "default_tolerance_max_restarts")]
@@ -38,6 +48,15 @@ fn default_tolerance_max_restarts() -> usize {
 }
 fn default_tolerance_duration_ms() -> u64 {
     3 * 60_000
+}
+
+impl Default for RestartTolerance {
+    fn default() -> Self {
+        Self {
+            max_restarts: default_tolerance_max_restarts(),
+            duration: default_tolerance_duration_ms(),
+        }
+    }
 }
 
 fn deserialize_duration_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
@@ -283,6 +302,10 @@ pub struct AppDefinition {
     #[serde(default)]
     pub schedule_max_time_per_run_ms: Option<u64>,
 
+    /// Optional: provisioning actions applied once per working_directory, guarded by `.pm_provisioned`.
+    #[serde(default)]
+    pub provisioning: Vec<ProvisioningEntry>,
+
     #[serde(skip)]
     pub source_file: Option<PathBuf>,
 
@@ -290,6 +313,62 @@ pub struct AppDefinition {
     /// Used for "update defs then restart modified services" semantics.
     #[serde(skip)]
     pub source_mtime_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisioningEntry {
+    /// Target path (absolute or relative to `working_directory`).
+    pub path: PathBuf,
+    #[serde(default)]
+    pub ownership: Option<ProvisioningOwnership>,
+    /// File mode (octal), e.g. 0700. Applies to this path only (not recursive).
+    #[serde(default, deserialize_with = "deserialize_mode_octal_opt")]
+    pub mode: Option<u32>,
+    /// Apply `cap_net_bind_service` file capability to this path (requires root / CAP_SETFCAP).
+    #[serde(default)]
+    pub add_net_bind_capability: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisioningOwnership {
+    /// Owner username (or numeric id as string). Default: none.
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// Group name (or numeric id as string). Default: none.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// If true, apply ownership recursively under `path` (best-effort; symlinks are not followed).
+    #[serde(default)]
+    pub recursive: bool,
+}
+
+fn deserialize_mode_octal_opt<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let v = Option::<serde_yaml::Value>::deserialize(deserializer)?;
+    let Some(v) = v else { return Ok(None) };
+    match v {
+        serde_yaml::Value::Number(n) => {
+            let u = n
+                .as_u64()
+                .ok_or_else(|| D::Error::custom("mode must be a non-negative integer or octal string like \"0700\""))?;
+            Ok(Some(u as u32))
+        }
+        serde_yaml::Value::String(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                return Ok(None);
+            }
+            let t = t.strip_prefix("0o").unwrap_or(t);
+            let parsed = u32::from_str_radix(t, 8).map_err(|e| D::Error::custom(format!("invalid mode {s:?}: {e}")))?;
+            Ok(Some(parsed))
+        }
+        _ => Err(D::Error::custom("mode must be an integer or octal string like \"0700\"")),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -425,6 +504,8 @@ struct AppConfigFile {
     resources: Option<ResourcesSection>,
     #[serde(default)]
     restart_policy: Option<RestartPolicySection>,
+    #[serde(default)]
+    provisioning: Vec<ProvisioningEntry>,
 }
 
 impl AppConfigFile {
@@ -691,6 +772,7 @@ impl AppConfigFile {
             schedule_not_before_ms,
             schedule_not_after_ms,
             schedule_max_time_per_run_ms,
+            provisioning: self.provisioning,
             source_file,
             source_mtime_ms: None,
         })

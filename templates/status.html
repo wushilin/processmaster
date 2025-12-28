@@ -11,9 +11,12 @@
           <label class="form-check-label" for="autoRefreshToggle">Auto refresh</label>
         </div>
         <button id="btn-refresh" class="btn btn-outline-secondary btn-sm">Refresh</button>
-        <button id="btn-update" class="btn btn-primary btn-sm">Update defs</button>
+        <button id="btn-update" class="btn btn-primary btn-sm">Reload Service Definition</button>
+        <button id="btn-admin-actions" class="btn btn-warning btn-sm">Admin actions</button>
         <button id="btn-stop-all" class="btn btn-outline-danger btn-sm">Stop all</button>
         <button id="btn-start-all" class="btn btn-outline-success btn-sm">Start all</button>
+        <button id="btn-restart-all" class="btn btn-outline-primary btn-sm">Restart all</button>
+        <button id="btn-cols" class="btn btn-outline-secondary btn-sm" title="Columns">⚙</button>
       </div>
     </div>
   </div>
@@ -25,16 +28,110 @@
   <div class="col-12">
     <div class="card shadow-sm">
       <div class="card-body">
+        <!-- Tabs: Services vs Cron -->
+        <ul class="nav nav-tabs mb-3" id="svcTabs" role="tablist">
+          <li class="nav-item" role="presentation">
+            <button class="nav-link active" id="tab-services" data-bs-toggle="tab" data-bs-target="#pane-services" type="button" role="tab">
+              Services
+            </button>
+          </li>
+          <li class="nav-item" role="presentation">
+            <button class="nav-link" id="tab-cron" data-bs-toggle="tab" data-bs-target="#pane-cron" type="button" role="tab">
+              Cron
+            </button>
+          </li>
+        </ul>
+
         <div class="table-responsive">
           <style>
             /* Keep column widths stable even when filtering hides rows */
             table.pm-status-table { table-layout: fixed; width: 100%; }
-            table.pm-status-table th, table.pm-status-table td { vertical-align: top; }
+            /* Align row contents vertically (better with icon buttons) */
+            table.pm-status-table th { vertical-align: middle; }
+            table.pm-status-table td { vertical-align: middle; }
             .pm-truncate { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
             th[data-sort] .sort-indicator { display: inline-block; width: 1.2em; text-align: center; }
             .pm-badge-user { background: #fd7e14; color: #1a1a1a; }
             .pm-icon { display: inline-block; vertical-align: -0.125em; }
             .pm-enabled svg { filter: drop-shadow(0 1px 0 rgba(0,0,0,0.15)); }
+            /* Fixed column widths (in "characters") for a predictable layout.
+               Flags intentionally gets the remaining width. */
+            /* Shrunk defaults: ~30% narrower across the board; Last Run ~50% narrower. */
+            th.col-app, td.col-app { width: 21ch; max-width: 21ch; }
+            th.col-status, td.col-status { width: 10ch; max-width: 10ch; }
+            th.col-crashes_10m, td.col-crashes_10m { width: 15ch; max-width: 15ch; }
+            th.col-crashes_10m { white-space: nowrap; }
+            th.col-pid, td.col-pid { width: 8ch; max-width: 8ch; }
+            th.col-uptime, td.col-uptime { width: 7ch; max-width: 7ch; }
+            th.col-enabled, td.col-enabled { width: 8ch; max-width: 8ch; }
+            th.col-last_run, td.col-last_run { width: 20ch; max-width: 20ch; }
+            th.col-actions, td.col-actions { width: 20ch; max-width: 20ch; }
+            /* Cron-only schedule column */
+            th.col-schedule, td.col-schedule { width: 21ch; max-width: 21ch; }
+            td.col-schedule .btn { max-width: 100%; }
+            td.col-schedule code { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
+            /* Flags takes the remaining width */
+            th.col-flags, td.col-flags { width: auto; }
+
+            .pm-flag-badge { font-size: .74rem; padding: .18em .42em; }
+            .pm-flags-cell { display: flex; flex-wrap: wrap; gap: .25rem; }
+            /* Action icon buttons: consistent sizing and nicer hover/press states */
+            .pm-action-btn {
+              width: 36px;
+              height: 36px;
+              padding: 0;
+              display: inline-flex;
+              align-items: center;
+              justify-content: center;
+              border-radius: .5rem;
+              line-height: 1;
+              transition: box-shadow .12s ease, transform .06s ease;
+            }
+            .pm-action-btn .pm-icon { width: 19px; height: 19px; }
+            /* Make play/stop glyphs a bit larger without increasing button size */
+            .pm-action-btn.pm-kind-play .pm-icon,
+            .pm-action-btn.pm-kind-stop .pm-icon { width: 23px; height: 23px; }
+            .pm-action-btn:hover { transform: translateY(-1px); box-shadow: 0 .125rem .25rem rgba(0,0,0,.10); }
+            .pm-action-btn:active { transform: translateY(0); box-shadow: none; }
+            .pm-actions { white-space: nowrap; }
+            /* Actions: allow horizontal scroll when the reserved width is narrower than the buttons */
+            td.col-actions { overflow-x: auto; overflow-y: hidden; }
+            td.col-actions::-webkit-scrollbar { height: 6px; }
+            td.col-actions::-webkit-scrollbar-thumb { background: rgba(108,117,125,.35); border-radius: 999px; }
+            td.col-actions::-webkit-scrollbar-track { background: rgba(108,117,125,.10); border-radius: 999px; }
+            /* Make the button-group look unified: same border color for all buttons */
+            .pm-actions .btn { border-color: rgba(108, 117, 125, 0.55) !important; }
+            .pm-actions .btn:hover { border-color: rgba(108, 117, 125, 0.85) !important; }
+
+            /* Global busy overlay */
+            .pm-busy-overlay {
+              position: fixed;
+              inset: 0;
+              z-index: 2000;
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              background: rgba(255, 255, 255, 0.55);
+              backdrop-filter: blur(3px);
+              -webkit-backdrop-filter: blur(3px);
+            }
+            .pm-busy-card {
+              width: 72px;
+              height: 72px;
+              border-radius: 16px;
+              background: rgba(255, 255, 255, 0.95);
+              box-shadow: 0 0.75rem 1.5rem rgba(0,0,0,0.18);
+              display: flex;
+              align-items: center;
+              justify-content: center;
+            }
+            @keyframes pm-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+            .pm-busy-spinner {
+              width: 34px;
+              height: 34px;
+              color: #6c757d;
+              animation: pm-spin 0.9s linear infinite;
+            }
 
             /* ANSI (SGR) colors for log rendering (dark background) */
             .ansi-bold { font-weight: 600; }
@@ -56,90 +153,133 @@
             .ansi-fg-95 { color: #f783ac; }
             .ansi-fg-96 { color: #63e6be; }
             .ansi-fg-97 { color: #ffffff; }
+
+            /* Column visibility */
+            .pm-col-hidden { display: none !important; }
           </style>
 
-          <table class="table table-sm table-striped table-hover align-middle mb-0 pm-status-table">
-            <colgroup>
-              <col style="width: 14%;">  <!-- Application -->
-              <col style="width: 7%;">   <!-- Desired -->
-              <col style="width: 7%;">   <!-- Actual -->
-              <col style="width: 8%;">   <!-- Status -->
-              <col style="width: 6%;">   <!-- Crashes (10m) -->
-              <col style="width: 7%;">   <!-- PID -->
-              <col style="width: 8%;">   <!-- Uptime -->
-              <col style="width: 22%;">  <!-- Flags -->
-              <col style="width: 5%;">   <!-- Enabled -->
-              <col style="width: 16%;">  <!-- Last Run -->
-            </colgroup>
+          <div class="tab-content" id="svcTabsContent">
+            <div class="tab-pane fade show active" id="pane-services" role="tabpanel">
+              <table class="table table-sm table-striped table-hover align-middle mb-0 pm-status-table">
             <thead>
               <tr>
-                <th role="button" class="user-select-none" data-sort="app">
+                <th role="button" class="user-select-none col-app" data-sort="app">
                   <span class="d-inline-flex align-items-center gap-1">
                     <span>Application</span><span class="sort-indicator text-muted" data-sort-indicator="app">↕</span>
                   </span>
                 </th>
-                <th role="button" class="user-select-none" data-sort="desired">
-                  <span class="d-inline-flex align-items-center gap-1">
-                    <span>Desired</span><span class="sort-indicator text-muted" data-sort-indicator="desired">↕</span>
-                  </span>
-                </th>
-                <th role="button" class="user-select-none" data-sort="actual">
-                  <span class="d-inline-flex align-items-center gap-1">
-                    <span>Actual</span><span class="sort-indicator text-muted" data-sort-indicator="actual">↕</span>
-                  </span>
-                </th>
-                <th role="button" class="user-select-none" data-sort="status">
+                <th role="button" class="user-select-none col-status" data-sort="status">
                   <span class="d-inline-flex align-items-center gap-1">
                     <span>Status</span><span class="sort-indicator text-muted" data-sort-indicator="status">↕</span>
                   </span>
                 </th>
-                <th role="button" class="user-select-none" data-sort="crashes_10m">
+                <th role="button" class="user-select-none col-crashes_10m" data-sort="crashes_10m">
                   <span class="d-inline-flex align-items-center gap-1">
                     <span>Crashes (10m)</span><span class="sort-indicator text-muted" data-sort-indicator="crashes_10m">↕</span>
                   </span>
                 </th>
-                <th>PID</th>
-                <th>Uptime</th>
-                <th role="button" class="user-select-none" data-sort="flags">
+                <th class="col-pid">PID</th>
+                <th class="col-uptime">Uptime</th>
+                <th role="button" class="user-select-none col-flags" data-sort="flags">
                   <span class="d-inline-flex align-items-center gap-1">
                     <span>Flags</span><span class="sort-indicator text-muted" data-sort-indicator="flags">↕</span>
                   </span>
                 </th>
-                <th role="button" class="user-select-none" data-sort="enabled">
+                <th role="button" class="user-select-none col-enabled" data-sort="enabled">
                   <span class="d-inline-flex align-items-center gap-1">
                     <span>Enabled</span><span class="sort-indicator text-muted" data-sort-indicator="enabled">↕</span>
                   </span>
                 </th>
-                <th role="button" class="user-select-none" data-sort="last_run">
+                <th role="button" class="user-select-none col-last_run" data-sort="last_run">
                   <span class="d-inline-flex align-items-center gap-1">
                     <span>Last Run</span><span class="sort-indicator text-muted" data-sort-indicator="last_run">↕</span>
                   </span>
                 </th>
-              </tr>
-              <tr>
-                <th><input id="f-app" class="form-control form-control-sm" placeholder="filter"></th>
-                <th><input id="f-desired" class="form-control form-control-sm" placeholder="filter"></th>
-                <th><input id="f-actual" class="form-control form-control-sm" placeholder="filter"></th>
-                <th><input id="f-status" class="form-control form-control-sm" placeholder="filter"></th>
-                <th></th>
-                <th></th>
-                <th></th>
-                <th><input id="f-flags" class="form-control form-control-sm" placeholder="filter"></th>
-                <th>
-                  <select id="f-enabled" class="form-select form-select-sm">
-                    <option value="" selected>all</option>
-                    <option value="enabled">enabled</option>
-                    <option value="disabled">disabled</option>
-                  </select>
-                </th>
-                <th></th>
+                <th class="col-actions text-end">Actions</th>
               </tr>
             </thead>
-            <tbody id="status-body">
-              <tr><td colspan="10" class="text-muted">Loading…</td></tr>
+            <tbody id="status-body-services">
+              <tr><td colspan="9" class="text-muted">Loading…</td></tr>
             </tbody>
           </table>
+            </div>
+
+            <div class="tab-pane fade" id="pane-cron" role="tabpanel">
+              <table class="table table-sm table-striped table-hover align-middle mb-0 pm-status-table">
+                <thead>
+                  <tr>
+                    <th class="col-app">Application</th>
+                    <th class="col-schedule">Schedules</th>
+                    <th class="col-status">Status</th>
+                    <th class="col-pid">PID</th>
+                    <th class="col-uptime">Uptime</th>
+                    <th class="col-flags">Flags</th>
+                    <th class="col-enabled">Enabled</th>
+                    <th class="col-last_run">Last Run</th>
+                    <th class="col-actions text-end">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="status-body-cron">
+                  <tr><td colspan="9" class="text-muted">Loading…</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
         </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Global "busy" overlay (shown during longer AJAX operations) -->
+<div id="pmBusyOverlay" class="pm-busy-overlay d-none" aria-hidden="true">
+  <div class="pm-busy-card">
+    <svg class="pm-busy-spinner" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+      <path d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.418A6 6 0 1 1 8 2v1z"/>
+      <path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966a.25.25 0 0 1 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"/>
+    </svg>
+  </div>
+</div>
+
+<!-- Admin actions modal -->
+<div class="modal fade" id="adminActionsModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Admin actions</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <div class="fw-semibold">Running admin-action PIDs (cgroup)</div>
+          <div class="d-flex gap-2">
+            <button id="btn-admin-actions-refresh" class="btn btn-outline-secondary btn-sm">Refresh PIDs</button>
+            <button id="btn-admin-actions-kill" class="btn btn-danger btn-sm">Kill all (no mercy)</button>
+          </div>
+        </div>
+        <pre id="admin-actions-pids" class="bg-light border rounded p-2" style="min-height: 4em;"></pre>
+
+        <hr />
+
+        <div class="fw-semibold mb-2">Available actions</div>
+        {% if admin_actions.len() == 0 %}
+          <div class="text-muted">No admin actions configured.</div>
+        {% else %}
+          <div class="list-group">
+            {% for a in admin_actions %}
+            <div class="list-group-item d-flex justify-content-between align-items-center">
+              <div>
+                <div class="fw-semibold">{{ a.label }}</div>
+                <div class="text-muted small">{{ a.name }}</div>
+              </div>
+              <button class="btn btn-warning btn-sm pm-admin-action-run" data-action="{{ a.name }}">Run</button>
+            </div>
+            {% endfor %}
+          </div>
+        {% endif %}
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
       </div>
     </div>
   </div>
@@ -189,6 +329,26 @@
   </div>
 </div>
 
+<!-- Schedule details modal (cron) -->
+<div class="modal fade" id="scheduleModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Schedule: <span id="scheduleApp" class="text-muted"></span></h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <dl class="row mb-0">
+          <dt class="col-5">cron</dt><dd class="col-7"><code id="scheduleExpr">-</code></dd>
+          <dt class="col-5">not_before</dt><dd class="col-7"><span id="scheduleNotBefore">-</span></dd>
+          <dt class="col-5">not_after</dt><dd class="col-7"><span id="scheduleNotAfter">-</span></dd>
+          <dt class="col-5">max_time_per_run</dt><dd class="col-7"><span id="scheduleMaxRun">-</span></dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Add user flag modal -->
 <div class="modal fade" id="flagModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog">
@@ -226,22 +386,17 @@
   </div>
 </div>
 
-<!-- Service actions modal -->
-<div class="modal fade" id="actionsModal" tabindex="-1" aria-hidden="true">
+<!-- Column visibility modal -->
+<div class="modal fade" id="colsModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog">
     <div class="modal-content">
       <div class="modal-header">
-        <h5 class="modal-title">Service: <span id="actionsApp" class="text-muted"></span></h5>
+        <h5 class="modal-title">Columns</h5>
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
-      <div class="modal-body">
-        <div class="d-grid gap-2">
-          <button class="btn btn-outline-secondary" id="actionsLogs">Logs</button>
-          <button class="btn btn-outline-warning" id="actionsFlags">Flags</button>
-          <button class="btn btn-outline-success" id="actionsStart">Start</button>
-          <button class="btn btn-outline-danger" id="actionsStop">Stop</button>
-        </div>
-        <div class="form-text mt-2">Start/Stop will ask for confirmation.</div>
+      <div class="modal-body" id="colsBody"></div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
       </div>
     </div>
   </div>
@@ -250,28 +405,46 @@
 
 {% block scripts %}
 <script>
+  // -------- global busy overlay --------
+  const pmBusyOverlay = document.getElementById("pmBusyOverlay");
+  let pmBusyCount = 0;
+  function busyOn() {
+    pmBusyCount++;
+    if (pmBusyOverlay) pmBusyOverlay.classList.remove("d-none");
+  }
+  function busyOff() {
+    pmBusyCount = Math.max(0, pmBusyCount - 1);
+    if (pmBusyOverlay && pmBusyCount === 0) pmBusyOverlay.classList.add("d-none");
+  }
+
   function csrfToken() {
     const meta = document.querySelector('meta[name="csrf-token"]');
     return meta ? meta.getAttribute('content') : '';
   }
 
   let rpcId = 1;
-  async function rpc(method, params) {
+  async function rpc(method, params, opts) {
+    const showBusy = !(opts && opts.busy === false);
+    if (showBusy) busyOn();
     const body = { jsonrpc: "2.0", id: rpcId++, method, params: params ?? {} };
     // Use a relative URL so this works under the /processmaster mount path (and any reverse proxy base path).
-    const resp = await fetch("rpc", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-CSRF-Token": csrfToken(),
-      },
-      body: JSON.stringify(body),
-    });
-    const j = await resp.json();
-    if (j.error) {
-      throw new Error(j.error.message || "RPC error");
+    try {
+      const resp = await fetch("rpc", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": csrfToken(),
+        },
+        body: JSON.stringify(body),
+      });
+      const j = await resp.json();
+      if (j.error) {
+        throw new Error(j.error.message || "RPC error");
+      }
+      return j.result;
+    } finally {
+      if (showBusy) busyOff();
     }
-    return j.result;
   }
 
   function showAlert(kind, msg) {
@@ -307,25 +480,33 @@
     const pad = (n, w=2) => n.toString().padStart(w, "0");
     return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
   }
+  function fmtLastRunShort(ms) {
+    if (!ms) return "-";
+    const d = new Date(ms);
+    const pad = (n, w=2) => n.toString().padStart(w, "0");
+    // Shorter display: no milliseconds.
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
 
   let lastStatuses = [];
   let sortKey = "app";
   let sortDir = "asc"; // asc|desc
 
   function currentFilters() {
+    // Filters are optional; missing inputs => no filter.
+    const v = (id) => {
+      const el = document.getElementById(id);
+      return (el && el.value ? el.value : "");
+    };
     return {
-      app: (document.getElementById("f-app").value || "").trim().toLowerCase(),
-      desired: (document.getElementById("f-desired").value || "").trim().toLowerCase(),
-      actual: (document.getElementById("f-actual").value || "").trim().toLowerCase(),
-      status: (document.getElementById("f-status").value || "").trim().toLowerCase(),
-      flags: (document.getElementById("f-flags").value || "").trim().toLowerCase(),
-      enabled: (document.getElementById("f-enabled").value || "").trim().toLowerCase(),
+      app: (v("f-app") || "").trim().toLowerCase(),
+      status: (v("f-status") || "").trim().toLowerCase(),
+      flags: (v("f-flags") || "").trim().toLowerCase(),
+      enabled: (v("f-enabled") || "").trim().toLowerCase(),
     };
   }
 
   function passesFilters(s, f) {
-    const desired = (s.desired || "-").toLowerCase();
-    const actual = (s.actual || (s.running ? "RUNNING" : "STOPPED")).toLowerCase();
     const phase = (s.phase || (s.running ? "RUNNING" : "STOPPED")).toLowerCase();
     const sys = ((s.system_flags || []).join(",") || "-").toLowerCase();
     const usr = ((s.user_flags || []).join(",") || "-").toLowerCase();
@@ -334,8 +515,6 @@
     const app = (s.application || "").toLowerCase();
 
     if (f.app && !app.includes(f.app)) return false;
-    if (f.desired && !desired.includes(f.desired)) return false;
-    if (f.actual && !actual.includes(f.actual)) return false;
     if (f.status && !phase.includes(f.status)) return false;
     if (f.flags && !flags.includes(f.flags)) return false;
     if (f.enabled && en !== f.enabled) return false;
@@ -345,8 +524,6 @@
   function sortValue(s, key) {
     switch (key) {
       case "app": return (s.application || "");
-      case "desired": return (s.desired || "");
-      case "actual": return (s.actual || (s.running ? "RUNNING" : "STOPPED"));
       case "status": return (s.phase || (s.running ? "RUNNING" : "STOPPED"));
       case "crashes_10m": return (s.restarts_10m ?? 0);
       case "flags": return ((s.system_flags || []).join(",") + "|" + (s.user_flags || []).join(","));
@@ -356,12 +533,84 @@
     }
   }
 
+  function iconButton(kind, title, action, app) {
+    const base = "btn btn-sm pm-action-btn btn-outline-secondary";
+    const tone = {
+      play: "text-success",
+      stop: "text-danger",
+      restart: "text-primary",
+      flags: "text-warning",
+      logs: "text-secondary",
+    }[kind] || "text-secondary";
+    const cls = `${base} ${tone} pm-kind-${kind}`;
+
+    const svg = {
+      // Simple glyph icons (inline SVG) — cleaner inside buttons than circle icons.
+      play: '<svg class="pm-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M5.2 3.3a.8.8 0 0 0-1.2.7v8a.8.8 0 0 0 1.2.7l7-4a.8.8 0 0 0 0-1.4l-7-4z"/></svg>',
+      stop: '<svg class="pm-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><rect x="4" y="4" width="8" height="8" rx="1.2"/></svg>',
+      restart: '<svg class="pm-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.418A6 6 0 1 1 8 2v1z"/><path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966a.25.25 0 0 1 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"/></svg>',
+      flags: '<svg class="pm-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M14.778 2.3A.5.5 0 0 1 15 2.744V9.5a.5.5 0 0 1-.8.4c-.97-.728-2.26-.706-3.447-.684-1.112.021-2.165.041-2.953-.502-.78-.536-1.884-.62-3.123-.298V14.5a.5.5 0 0 1-1 0V1.5a.5.5 0 0 1 .39-.489c1.39-.298 3.07-.29 4.122.433.78.536 1.884.62 3.123.298 1.39-.298 3.07-.29 4.122.433z"/></svg>',
+      logs: '<svg class="pm-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M5 10.5a.5.5 0 0 1 .5-.5h2a.5.5 0 0 1 0 1h-2a.5.5 0 0 1-.5-.5zm0-2a.5.5 0 0 1 .5-.5h5a.5.5 0 0 1 0 1h-5a.5.5 0 0 1-.5-.5zm0-2a.5.5 0 0 1 .5-.5h5a.5.5 0 0 1 0 1h-5a.5.5 0 0 1-.5-.5z"/><path d="M3 0h10a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V2a2 2 0 0 1 2-2zm0 1a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1H3z"/></svg>',
+    }[kind] || "";
+
+    return `<button type="button" class="${cls}" title="${esc(title)}" aria-label="${esc(title)}" data-action="${esc(action)}" data-app="${esc(app)}">${svg}</button>`;
+  }
+
+  function enabledIconFor(s) {
+    return s.enabled
+      ? `<span class="pm-enabled" title="enabled" aria-label="enabled">
+           <svg class="pm-icon" xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 16 16" fill="#198754" aria-hidden="true">
+             <path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0z"/>
+             <path d="M12.03 5.47a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06 0L3.97 8.03a.75.75 0 1 1 1.06-1.06l2.22 2.22 3.72-3.72a.75.75 0 0 1 1.06 0z" fill="#fff"/>
+           </svg>
+         </span>`
+      : `<span class="pm-enabled" title="disabled" aria-label="disabled">
+           <svg class="pm-icon" xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 16 16" fill="#dc3545" aria-hidden="true">
+             <path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0z"/>
+             <path d="M5.354 5.354a.75.75 0 0 1 1.06 0L8 6.94l1.586-1.586a.75.75 0 0 1 1.06 1.06L9.06 8l1.586 1.586a.75.75 0 0 1-1.06 1.06L8 9.06l-1.586 1.586a.75.75 0 0 1-1.06-1.06L6.94 8 5.354 6.414a.75.75 0 0 1 0-1.06z" fill="#fff"/>
+           </svg>
+         </span>`;
+  }
+
+  function flagsCellFor(s) {
+    const sysFlags = (s.system_flags || []);
+    const userFlags = (s.user_flags || []);
+    const all = sysFlags.concat(userFlags);
+    const title = all.length ? `title="${esc(all.join(", "))}"` : "";
+
+    if (!all.length) return `<span class="text-muted">-</span>`;
+
+    // Compact mode: render all flags as tiny chips in a single horizontal strip.
+    // System flags are red; user flags are orange.
+    const sysBadges = sysFlags
+      .map(f => `<span class="badge rounded-pill bg-danger pm-flag-badge">${esc(f)}</span>`)
+      .join("");
+    const userBadges = userFlags
+      .map(f => `<span class="badge rounded-pill pm-badge-user pm-flag-badge">${esc(f)}</span>`)
+      .join("");
+    return `<div class="pm-flags-cell" ${title}>${sysBadges}${userBadges}</div>`;
+  }
+
+  function badgeForState(s) {
+    const phase = (s.phase || (s.running ? "RUNNING" : "STOPPED")).toUpperCase();
+    if (phase.includes("RUN")) return 'badge bg-success';
+    if (phase.includes("FAIL") || phase.includes("CRASH")) return 'badge bg-danger';
+    if (phase.includes("BACKOFF")) return 'badge bg-warning text-dark';
+    return 'badge bg-secondary';
+  }
+  // Desired state was removed (daemon is synchronous-command driven).
+
   function applyFilterSortAndRender() {
-    const body = document.getElementById("status-body");
+    const bodyServices = document.getElementById("status-body-services");
+    const bodyCron = document.getElementById("status-body-cron");
     const f = currentFilters();
     let rows = lastStatuses.filter(s => passesFilters(s, f));
 
-    rows.sort((a, b) => {
+    const isCron = (s) => !!(s.schedule);
+    let rowsServices = rows.filter(s => !isCron(s));
+    let rowsCron = rows.filter(s => isCron(s));
+
+    rowsServices.sort((a, b) => {
       const va = sortValue(a, sortKey);
       const vb = sortValue(b, sortKey);
       let cmp = 0;
@@ -369,86 +618,88 @@
       else cmp = ("" + va).localeCompare("" + vb);
       return sortDir === "asc" ? cmp : -cmp;
     });
+    rowsCron.sort((a, b) => ("" + (a.application || "")).localeCompare("" + (b.application || "")));
 
-    if (!rows.length) {
-      body.innerHTML = '<tr><td colspan="10" class="text-muted">(no services)</td></tr>';
-      return;
-    }
-
-    function badgeForState(s) {
-      const phase = (s.phase || (s.running ? "RUNNING" : "STOPPED")).toUpperCase();
-      if (phase.includes("RUN")) return 'badge bg-success';
-      if (phase.includes("FAIL") || phase.includes("CRASH")) return 'badge bg-danger';
-      if (phase.includes("BACKOFF")) return 'badge bg-warning text-dark';
-      return 'badge bg-secondary';
-    }
-    function badgeForDesired(s) {
-      const d = (s.desired || "-").toUpperCase();
-      if (d.includes("RUN")) return 'badge bg-primary';
-      if (d.includes("STOP")) return 'badge bg-secondary';
-      if (d.includes("SCHED")) return 'badge bg-info text-dark';
-      return 'badge bg-secondary';
-    }
-
-    body.innerHTML = rows.map(s => {
-      const sysFlags = (s.system_flags || []);
-      const userFlags = (s.user_flags || []);
-      const enabled = s.enabled ? "enabled" : "disabled";
-      const desired = s.desired || "-";
-      const actual = s.actual || (s.running ? "RUNNING" : "STOPPED");
+    function renderServiceRow(s) {
       const phase = s.phase || (s.running ? "RUNNING" : "STOPPED");
       const crashes = (s.restarts_10m ?? 0).toString();
-      const last_run = fmtLastRun(s.last_run_at_ms);
+      const last_run_full = fmtLastRun(s.last_run_at_ms);
+      const last_run = fmtLastRunShort(s.last_run_at_ms);
       const app = s.application;
-
       const pids = (s.pids || []);
       const ups = (s.pid_uptimes_ms || []);
       const pidLines = pids.length ? pids.map((pid) => `<div><code>${esc(pid.toString())}</code></div>`).join("") : `<div class="text-muted">-</div>`;
       const upLines = pids.length ? pids.map((_, i) => `<div>${esc(fmtUptimeMs(ups[i] ?? -1))}</div>`).join("") : `<div class="text-muted">-</div>`;
-
-      const sysBadges = sysFlags.map(f => `<span class="badge rounded-pill bg-danger me-1 mb-1">${esc(f)}</span>`).join("");
-      const userBadges = userFlags.map(f => `<span class="badge rounded-pill pm-badge-user me-1 mb-1">${esc(f)}</span>`).join("");
-      const flagsCell = (sysBadges || userBadges) ? (sysBadges + userBadges) : `<span class="text-muted">-</span>`;
-      const enabledIcon = s.enabled
-        ? `<span class="pm-enabled" title="enabled" aria-label="enabled">
-             <svg class="pm-icon" xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 16 16" fill="#198754" aria-hidden="true">
-               <path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0z"/>
-               <path d="M12.03 5.47a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06 0L3.97 8.03a.75.75 0 1 1 1.06-1.06l2.22 2.22 3.72-3.72a.75.75 0 0 1 1.06 0z" fill="#fff"/>
-             </svg>
-           </span>`
-        : `<span class="pm-enabled" title="disabled" aria-label="disabled">
-             <svg class="pm-icon" xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 16 16" fill="#dc3545" aria-hidden="true">
-               <path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0z"/>
-               <path d="M5.354 5.354a.75.75 0 0 1 1.06 0L8 6.94l1.586-1.586a.75.75 0 0 1 1.06 1.06L9.06 8l1.586 1.586a.75.75 0 0 1-1.06 1.06L8 9.06l-1.586 1.586a.75.75 0 0 1-1.06-1.06L6.94 8 5.354 6.414a.75.75 0 0 1 0-1.06z" fill="#fff"/>
-             </svg>
-           </span>`;
-
+      const actions = [
+        iconButton("play", "Start", "start", app),
+        iconButton("stop", "Stop", "stop", app),
+        iconButton("restart", "Restart", "restart", app),
+        iconButton("flags", "Flags", "flags", app),
+        iconButton("logs", "Logs", "logs", app),
+      ].join("");
+      const actionsGroup = `<div class="btn-group btn-group-sm pm-actions" role="group" aria-label="Actions">${actions}</div>`;
       return `<tr>
-        <td class="pm-truncate" title="${esc(app)}">
-          <a href="#" class="link-primary link-underline-opacity-0 link-underline-opacity-100-hover" data-action="actions" data-app="${esc(app)}">
-            <code>${esc(app)}</code>
-          </a>
-        </td>
-        <td><span class="${badgeForDesired(s)}">${esc(desired)}</span></td>
-        <td><span class="badge bg-light text-dark">${esc(actual)}</span></td>
-        <td><span class="${badgeForState(s)}">${esc(phase)}</span></td>
-        <td>${esc(crashes)}</td>
-        <td class="text-nowrap">${pidLines}</td>
-        <td class="text-nowrap">${upLines}</td>
-        <td>${flagsCell}</td>
-        <td class="text-center">${enabledIcon}</td>
-        <td class="pm-truncate" title="${esc(last_run)}"><small class="text-muted">${esc(last_run)}</small></td>
+        <td class="pm-truncate col-app" title="${esc(app)}"><code>${esc(app)}</code></td>
+        <td class="col-status"><span class="${badgeForState(s)}">${esc(phase)}</span></td>
+        <td class="col-crashes_10m">${esc(crashes)}</td>
+        <td class="text-nowrap col-pid">${pidLines}</td>
+        <td class="text-nowrap col-uptime">${upLines}</td>
+        <td class="col-flags">${flagsCellFor(s)}</td>
+        <td class="text-center col-enabled">${enabledIconFor(s)}</td>
+        <td class="pm-truncate col-last_run" title="${esc(last_run_full)}"><small class="text-muted">${esc(last_run)}</small></td>
+        <td class="text-end col-actions">${actionsGroup}</td>
       </tr>`;
-    }).join("");
+    }
+
+    function renderCronRow(s) {
+      const phase = s.phase || (s.running ? "RUNNING" : "STOPPED");
+      const last_run_full = fmtLastRun(s.last_run_at_ms);
+      const last_run = fmtLastRunShort(s.last_run_at_ms);
+      const app = s.application;
+      const expr = s.schedule || "-";
+      const pids = (s.pids || []);
+      const ups = (s.pid_uptimes_ms || []);
+      const pidLines = pids.length ? pids.map((pid) => `<div><code>${esc(pid.toString())}</code></div>`).join("") : `<div class="text-muted">-</div>`;
+      const upLines = pids.length ? pids.map((_, i) => `<div>${esc(fmtUptimeMs(ups[i] ?? -1))}</div>`).join("") : `<div class="text-muted">-</div>`;
+      const scheduleBtn = `<button type="button" class="btn btn-sm btn-outline-info" data-action="schedule" data-app="${esc(app)}"><code>${esc(expr)}</code></button>`;
+      const actions = [
+        iconButton("play", "Run now", "start", app),
+        iconButton("stop", "Stop", "stop", app),
+        iconButton("restart", "Restart", "restart", app),
+        iconButton("flags", "Flags", "flags", app),
+        iconButton("logs", "Logs", "logs", app),
+      ].join("");
+      const actionsGroup = `<div class="btn-group btn-group-sm pm-actions" role="group" aria-label="Actions">${actions}</div>`;
+      return `<tr>
+        <td class="pm-truncate col-app" title="${esc(app)}"><code>${esc(app)}</code></td>
+        <td class="pm-truncate col-schedule">${scheduleBtn}</td>
+        <td class="col-status"><span class="${badgeForState(s)}">${esc(phase)}</span></td>
+        <td class="text-nowrap col-pid">${pidLines}</td>
+        <td class="text-nowrap col-uptime">${upLines}</td>
+        <td class="col-flags">${flagsCellFor(s)}</td>
+        <td class="text-center col-enabled">${enabledIconFor(s)}</td>
+        <td class="pm-truncate col-last_run" title="${esc(last_run_full)}"><small class="text-muted">${esc(last_run)}</small></td>
+        <td class="text-end col-actions">${actionsGroup}</td>
+      </tr>`;
+    }
+
+    if (bodyServices) {
+      bodyServices.innerHTML = rowsServices.length
+        ? rowsServices.map(renderServiceRow).join("")
+        : '<tr><td colspan="9" class="text-muted">(no services)</td></tr>';
+    }
+    if (bodyCron) {
+      bodyCron.innerHTML = rowsCron.length
+        ? rowsCron.map(renderCronRow).join("")
+        : '<tr><td colspan="9" class="text-muted">(no cron jobs)</td></tr>';
+    }
+
+    // Re-apply column visibility after each render (rows are replaced via innerHTML).
+    applyHiddenColsAll();
   }
 
   function renderStatus(resp) {
-    const body = document.getElementById("status-body");
     lastStatuses = (resp.statuses || []);
-    if (!lastStatuses.length) {
-      body.innerHTML = '<tr><td colspan="10" class="text-muted">(no services)</td></tr>';
-      return;
-    }
     applyFilterSortAndRender();
   }
 
@@ -458,8 +709,11 @@
     if (refreshInFlight) return;
     refreshInFlight = true;
     try {
-      const resp = await rpc("status", {});
+      // Polling refresh should not blur the entire page.
+      const resp = await rpc("status", {}, { busy: false });
       renderStatus(resp);
+    } catch (e) {
+      showAlert("danger", e.toString());
     } finally {
       refreshInFlight = false;
     }
@@ -519,33 +773,85 @@
     } catch (e) { showAlert("danger", e.toString()); }
   });
 
+  const btnAdminActions = document.getElementById("btn-admin-actions");
+  const adminActionsModalEl = document.getElementById("adminActionsModal");
+  const adminPidsEl = document.getElementById("admin-actions-pids");
+  const btnAdminActionsRefresh = document.getElementById("btn-admin-actions-refresh");
+  const btnAdminActionsKill = document.getElementById("btn-admin-actions-kill");
+  const adminActionsModal = adminActionsModalEl ? new bootstrap.Modal(adminActionsModalEl) : null;
+
+  async function loadAdminActionPids() {
+    if (!adminPidsEl) return;
+    adminPidsEl.textContent = "Loading…";
+    try {
+      const resp = await rpc("admin_actions_pids", {}, { busy: false });
+      if (!resp.ok) {
+        adminPidsEl.textContent = (resp.message || "Error");
+        return;
+      }
+      const pids = resp.pids || [];
+      adminPidsEl.textContent = pids.length ? pids.join("\n") : "(none)";
+    } catch (e) {
+      adminPidsEl.textContent = e.toString();
+    }
+  }
+
+  if (btnAdminActions && adminActionsModal) {
+    btnAdminActions.addEventListener("click", async () => {
+      adminActionsModal.show();
+      await loadAdminActionPids();
+    });
+  }
+  if (btnAdminActionsRefresh) {
+    btnAdminActionsRefresh.addEventListener("click", async () => {
+      await loadAdminActionPids();
+    });
+  }
+  if (btnAdminActionsKill) {
+    btnAdminActionsKill.addEventListener("click", async () => {
+      if (!confirm("Kill ALL admin actions via cgroup.kill? This is immediate and not graceful.")) return;
+      try {
+        const resp = await rpc("admin_actions_kill", {});
+        if (resp.message) showAlert(resp.ok ? "success" : "danger", resp.message);
+      } catch (e) {
+        showAlert("danger", e.toString());
+      } finally {
+        await loadAdminActionPids();
+      }
+    });
+  }
+
+  for (const btn of document.querySelectorAll(".pm-admin-action-run")) {
+    btn.addEventListener("click", async () => {
+      const name = btn.getAttribute("data-action");
+      if (!name) return;
+      if (!confirm(`Run admin action "${name}"? This may restart/stop services.`)) return;
+      try {
+        const resp = await rpc("admin_action", { name });
+        if (resp.message) showAlert(resp.ok ? "success" : "danger", resp.message);
+      } catch (e) {
+        showAlert("danger", e.toString());
+      } finally {
+        await loadAdminActionPids();
+      }
+    });
+  }
+
   // -------- bulk start/stop --------
   const btnStopAll = document.getElementById("btn-stop-all");
   const btnStartAll = document.getElementById("btn-start-all");
+  const btnRestartAll = document.getElementById("btn-restart-all");
   let bulkInFlight = false;
 
   function setBulkDisabled(disabled) {
     bulkInFlight = !!disabled;
     btnStopAll.disabled = bulkInFlight;
     btnStartAll.disabled = bulkInFlight;
+    btnRestartAll.disabled = bulkInFlight;
     document.getElementById("btn-update").disabled = bulkInFlight;
     document.getElementById("btn-refresh").disabled = bulkInFlight;
-  }
-
-  function unique(arr) {
-    return Array.from(new Set((arr || []).filter(Boolean)));
-  }
-
-  function appsRunningNow() {
-    return unique((lastStatuses || [])
-      .filter(s => ((s.pids || []).length > 0))
-      .map(s => s.application));
-  }
-
-  function appsEnabledNow() {
-    return unique((lastStatuses || [])
-      .filter(s => !!s.enabled)
-      .map(s => s.application));
+    const b = document.getElementById("btn-admin-actions");
+    if (b) b.disabled = bulkInFlight;
   }
 
   async function stopAllRunning() {
@@ -554,20 +860,8 @@
     const prevAuto = autoRefreshToggle.checked;
     stopAutoRefresh();
     try {
-      const apps = appsRunningNow();
-      if (!apps.length) { showAlert("info", "No running services to stop."); return; }
-      let ok = 0, fail = 0;
-      for (let i = 0; i < apps.length; i++) {
-        const name = apps[i];
-        showAlert("info", `Stopping ${name} (${i+1}/${apps.length})…`);
-        try {
-          const resp = await rpc("stop", { name });
-          if (resp.ok) ok++; else fail++;
-        } catch (_) {
-          fail++;
-        }
-      }
-      showAlert(fail ? "warning" : "success", `Stop all done: ${ok} ok, ${fail} failed.`);
+      const resp = await rpc("stop_all", {});
+      if (resp.message) showAlert(resp.ok ? "success" : "warning", resp.message);
     } finally {
       if (prevAuto) startAutoRefresh();
       setBulkDisabled(false);
@@ -580,20 +874,22 @@
     const prevAuto = autoRefreshToggle.checked;
     stopAutoRefresh();
     try {
-      const apps = appsEnabledNow();
-      if (!apps.length) { showAlert("info", "No enabled services to start."); return; }
-      let ok = 0, fail = 0;
-      for (let i = 0; i < apps.length; i++) {
-        const name = apps[i];
-        showAlert("info", `Starting ${name} (${i+1}/${apps.length})…`);
-        try {
-          const resp = await rpc("start", { name, force: false });
-          if (resp.ok) ok++; else fail++;
-        } catch (_) {
-          fail++;
-        }
-      }
-      showAlert(fail ? "warning" : "success", `Start all done: ${ok} ok, ${fail} failed.`);
+      const resp = await rpc("start_all", { force: false });
+      if (resp.message) showAlert(resp.ok ? "success" : "warning", resp.message);
+    } finally {
+      if (prevAuto) startAutoRefresh();
+      setBulkDisabled(false);
+    }
+  }
+
+  async function restartAllEnabled() {
+    if (bulkInFlight) return;
+    setBulkDisabled(true);
+    const prevAuto = autoRefreshToggle.checked;
+    stopAutoRefresh();
+    try {
+      const resp = await rpc("restart_all", { force: false });
+      if (resp.message) showAlert(resp.ok ? "success" : "warning", resp.message);
     } finally {
       if (prevAuto) startAutoRefresh();
       setBulkDisabled(false);
@@ -602,12 +898,15 @@
 
   btnStopAll.addEventListener("click", () => askConfirm("stop_all", null));
   btnStartAll.addEventListener("click", () => askConfirm("start_all", null));
+  btnRestartAll.addEventListener("click", () => askConfirm("restart_all", null));
 
   // filters: re-render on change (client-side)
-  for (const id of ["f-app","f-desired","f-actual","f-status","f-flags"]) {
-    document.getElementById(id).addEventListener("input", () => applyFilterSortAndRender());
+  for (const id of ["f-app","f-status","f-flags"]) {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("input", () => applyFilterSortAndRender());
   }
-  document.getElementById("f-enabled").addEventListener("change", () => applyFilterSortAndRender());
+  const fEnabled = document.getElementById("f-enabled");
+  if (fEnabled) fEnabled.addEventListener("change", () => applyFilterSortAndRender());
 
   // sorting: click header cells with data-sort
   document.querySelectorAll("th[data-sort]").forEach(th => {
@@ -657,6 +956,11 @@
       body.textContent = `Stop ${app}?`;
       ok.className = "btn btn-danger";
       ok.textContent = "Stop";
+    } else if (action === "restart") {
+      title.textContent = "Confirm restart";
+      body.textContent = `Restart ${app}?`;
+      ok.className = "btn btn-primary";
+      ok.textContent = "Restart";
     } else if (action === "start_all") {
       title.textContent = "Confirm start all";
       body.textContent = "Start all enabled services?";
@@ -667,6 +971,11 @@
       body.textContent = "Stop all running services?";
       ok.className = "btn btn-danger";
       ok.textContent = "Stop all";
+    } else if (action === "restart_all") {
+      title.textContent = "Confirm restart all";
+      body.textContent = "Restart all enabled services?";
+      ok.className = "btn btn-primary";
+      ok.textContent = "Restart all";
     } else {
       title.textContent = "Confirm";
       body.textContent = `Proceed with ${action} ${app}?`;
@@ -688,10 +997,15 @@
       } else if (action === "stop") {
         const resp = await rpc("stop", { name: app });
         if (resp.message) showAlert(resp.ok ? "success" : "danger", resp.message);
+      } else if (action === "restart") {
+        const resp = await rpc("restart", { name: app, force: false });
+        if (resp.message) showAlert(resp.ok ? "success" : "danger", resp.message);
       } else if (action === "start_all") {
         await startAllEnabled();
       } else if (action === "stop_all") {
         await stopAllRunning();
+      } else if (action === "restart_all") {
+        await restartAllEnabled();
       }
       await refresh();
     } catch (e) {
@@ -817,10 +1131,10 @@
     return out;
   }
 
-  async function loadLogs() {
+  async function loadLogs(opts) {
     if (!logsApp) return;
     const n = parseInt(logsLines.value || "200", 10);
-    const resp = await rpc("logs", { name: logsApp, n });
+    const resp = await rpc("logs", { name: logsApp, n }, opts);
     // daemon returns logs in resp.message (pmctl format); keep as-is.
     const trimmed = trimLogsForUi(resp.message || "", n);
     logsPre.innerHTML = ansiToHtml(trimmed);
@@ -839,8 +1153,11 @@
 
   function startLogsTail() {
     stopLogsTail();
+    // First fetch immediately (without the global spinner/blur).
+    loadLogs({ busy: false }).catch(() => {});
     logsTimer = window.setInterval(() => {
-      loadLogs().catch(() => {});
+      // Background tail polling: don't show the global spinner/blur.
+      loadLogs({ busy: false }).catch(() => {});
     }, 1000);
   }
 
@@ -970,16 +1287,6 @@
     }
   });
 
-  // -------- service actions modal --------
-  const actionsModalEl = document.getElementById("actionsModal");
-  const actionsModal = new bootstrap.Modal(actionsModalEl);
-  const actionsAppEl = document.getElementById("actionsApp");
-  const actionsLogsBtn = document.getElementById("actionsLogs");
-  const actionsFlagsBtn = document.getElementById("actionsFlags");
-  const actionsStartBtn = document.getElementById("actionsStart");
-  const actionsStopBtn = document.getElementById("actionsStop");
-  let actionsApp = null;
-
   function openLogsFor(app) {
     logsApp = app;
     logsAppEl.textContent = app;
@@ -998,50 +1305,205 @@
     renderActiveFlagsFor(app);
   }
 
-  actionsModalEl.addEventListener("hidden.bs.modal", () => {
-    actionsApp = null;
-    actionsAppEl.textContent = "";
+  // -------- schedule modal (cron) --------
+  const scheduleModalEl = document.getElementById("scheduleModal");
+  const scheduleModal = new bootstrap.Modal(scheduleModalEl);
+  function fmtMaybeDate(ms) {
+    if (ms === null || ms === undefined) return "-";
+    return fmtLastRun(ms);
+  }
+  function fmtMaybeDurationMs(ms) {
+    if (ms === null || ms === undefined) return "-";
+    const n = Number(ms);
+    if (!Number.isFinite(n) || n <= 0) return "-";
+    if (n < 1000) return `${n}ms`;
+    if (n < 60_000) return `${Math.round(n/100)/10}s`;
+    const m = Math.floor(n/60_000);
+    const s = Math.floor((n % 60_000)/1000);
+    return `${m}m${s}s`;
+  }
+  function openScheduleFor(app) {
+    const entry = (lastStatuses || []).find(s => s.application === app);
+    if (!entry) return;
+    document.getElementById("scheduleApp").textContent = app;
+    document.getElementById("scheduleExpr").textContent = entry.schedule || "-";
+    document.getElementById("scheduleNotBefore").textContent = fmtMaybeDate(entry.schedule_not_before_ms);
+    document.getElementById("scheduleNotAfter").textContent = fmtMaybeDate(entry.schedule_not_after_ms);
+    document.getElementById("scheduleMaxRun").textContent = fmtMaybeDurationMs(entry.schedule_max_time_per_run_ms);
+    scheduleModal.show();
+  }
+
+  // -------- column visibility (per-user cookie, no expiry) --------
+  const colsModalEl = document.getElementById("colsModal");
+  const colsModal = new bootstrap.Modal(colsModalEl);
+  const colsBody = document.getElementById("colsBody");
+  // v2: separate preferences for services vs cron so we can enforce different "always visible" columns.
+  const COL_COOKIE = "pm_cols_hidden_v2";
+  const SERVICES_REQUIRED = new Set(["app", "status", "pid", "uptime", "flags", "actions"]);
+  // Cron: PID is always visible too.
+  const CRON_REQUIRED = new Set(["app", "status", "schedule", "pid", "uptime", "flags", "actions"]);
+  // Default visibility (only used when the user has no cookie yet):
+  // - Services: hide Crashes(10m) + Last Run by default
+  // - Cron: hide Last Run by default
+  const DEFAULT_HIDDEN_SERVICES = ["crashes_10m", "last_run"];
+  const DEFAULT_HIDDEN_CRON = ["last_run"];
+  const SERVICES_COLS = [
+    { key: "app", label: "Application", required: true },
+    { key: "status", label: "Status", required: true },
+    { key: "pid", label: "PID", required: true },
+    { key: "uptime", label: "Uptime", required: true },
+    { key: "flags", label: "Flags", required: true },
+    { key: "actions", label: "Actions", required: true },
+    { key: "crashes_10m", label: "Crashes (10m)", required: false },
+    { key: "enabled", label: "Enabled", required: false },
+    { key: "last_run", label: "Last Run", required: false },
+  ];
+  const CRON_COLS = [
+    { key: "app", label: "Application", required: true },
+    { key: "status", label: "Status", required: true },
+    { key: "schedule", label: "Schedule", required: true },
+    { key: "uptime", label: "Uptime", required: true },
+    { key: "flags", label: "Flags", required: true },
+    { key: "actions", label: "Actions", required: true },
+    { key: "pid", label: "PID", required: true },
+    { key: "enabled", label: "Enabled", required: false },
+    { key: "last_run", label: "Last Run", required: false },
+  ];
+
+  function getCookie(name) {
+    const parts = document.cookie.split(";").map(s => s.trim());
+    for (const p of parts) {
+      if (!p) continue;
+      const idx = p.indexOf("=");
+      const k = idx >= 0 ? p.slice(0, idx) : p;
+      const v = idx >= 0 ? p.slice(idx + 1) : "";
+      if (k === name) return decodeURIComponent(v);
+    }
+    return null;
+  }
+  function setCookie(name, value) {
+    // "cookie does not expire" => set a long Max-Age.
+    const maxAge = 315360000; // 10 years
+    document.cookie = `${name}=${encodeURIComponent(value)}; Max-Age=${maxAge}; Path=/processmaster; SameSite=Strict`;
+  }
+
+  // -------- column resizing (per-user cookie, no expiry) --------
+  // Column resizing was removed: we use fixed `ch` widths and let Flags take the remaining width.
+
+  function setColumnHiddenIn(scope, key, hidden) {
+    const root = (scope === "cron") ? "#pane-cron" : "#pane-services";
+    document.querySelectorAll(`${root} .col-${CSS.escape(key)}`).forEach(el => {
+      el.classList.toggle("pm-col-hidden", !!hidden);
+    });
+  }
+
+  function loadHiddenColsObj() {
+    const raw = getCookie(COL_COOKIE);
+    if (!raw) return null;
+    try {
+      const obj = JSON.parse(raw);
+      return (obj && typeof obj === "object") ? obj : null;
+    } catch {
+      return null;
+    }
+  }
+  function loadHiddenCols(scope) {
+    const obj = loadHiddenColsObj();
+    // Default behavior when no cookie exists yet.
+    if (!obj) {
+      return (scope === "cron") ? DEFAULT_HIDDEN_CRON.slice() : DEFAULT_HIDDEN_SERVICES.slice();
+    }
+    const arr = (scope === "cron") ? (obj.cron_hidden || []) : (obj.services_hidden || []);
+    return Array.isArray(arr) ? arr : [];
+  }
+  function saveHiddenCols(scope, hidden) {
+    const obj = loadHiddenColsObj() || {};
+    if (scope === "cron") obj.cron_hidden = hidden;
+    else obj.services_hidden = hidden;
+    setCookie(COL_COOKIE, JSON.stringify(obj));
+  }
+  function applyHiddenColsAll() {
+    const svcHidden = new Set(loadHiddenCols("services"));
+    const cronHidden = new Set(loadHiddenCols("cron"));
+
+    for (const c of SERVICES_COLS) {
+      const hidden = c.required ? false : svcHidden.has(c.key);
+      setColumnHiddenIn("services", c.key, hidden);
+    }
+    for (const c of CRON_COLS) {
+      const hidden = c.required ? false : cronHidden.has(c.key);
+      setColumnHiddenIn("cron", c.key, hidden);
+    }
+  }
+  function buildColsUi() {
+    const svcHidden = new Set(loadHiddenCols("services"));
+    const cronHidden = new Set(loadHiddenCols("cron"));
+
+    function section(title, scope, cols, hiddenSet) {
+      const items = cols.map(c => {
+        const checked = c.required ? true : !hiddenSet.has(c.key);
+        const disabled = c.required ? "disabled" : "";
+        const note = c.required ? ' <span class="text-muted">(always visible)</span>' : "";
+        return `<div class="form-check">
+          <input class="form-check-input" type="checkbox" id="col-${esc(scope)}-${esc(c.key)}" data-scope="${esc(scope)}" data-col="${esc(c.key)}" ${checked ? "checked" : ""} ${disabled}>
+          <label class="form-check-label" for="col-${esc(scope)}-${esc(c.key)}">${esc(c.label)}${note}</label>
+        </div>`;
+      }).join("");
+      return `<div class="mb-3">
+        <div class="fw-semibold mb-2">${esc(title)}</div>
+        ${items}
+      </div>`;
+    }
+
+    colsBody.innerHTML =
+      section("Services", "services", SERVICES_COLS, svcHidden) +
+      section("Cron jobs", "cron", CRON_COLS, cronHidden);
+  }
+
+  document.getElementById("btn-cols").addEventListener("click", () => {
+    buildColsUi();
+    colsModal.show();
+  });
+  colsBody.addEventListener("change", (ev) => {
+    const el = ev.target.closest("input[data-col][data-scope]");
+    if (!el) return;
+    if (el.disabled) return;
+    const scope = el.getAttribute("data-scope");
+    const key = el.getAttribute("data-col");
+    const hidden = loadHiddenCols(scope);
+    const set = new Set(hidden);
+    const required = (scope === "cron") ? CRON_REQUIRED.has(key) : SERVICES_REQUIRED.has(key);
+    if (required) {
+      // hard rule: required columns are not customizable
+      el.checked = true;
+      return;
+    }
+    if (el.checked) set.delete(key);
+    else set.add(key);
+    const out = Array.from(set.values());
+    saveHiddenCols(scope, out);
+    applyHiddenColsAll();
   });
 
-  actionsLogsBtn.addEventListener("click", () => {
-    if (!actionsApp) return;
-    actionsModal.hide();
-    openLogsFor(actionsApp);
-  });
-  actionsFlagsBtn.addEventListener("click", () => {
-    if (!actionsApp) return;
-    actionsModal.hide();
-    openFlagsFor(actionsApp);
-  });
-  actionsStartBtn.addEventListener("click", () => {
-    if (!actionsApp) return;
-    actionsModal.hide();
-    askConfirm("start", actionsApp);
-  });
-  actionsStopBtn.addEventListener("click", () => {
-    if (!actionsApp) return;
-    actionsModal.hide();
-    askConfirm("stop", actionsApp);
-  });
+  // Apply user column prefs at startup.
+  applyHiddenColsAll();
 
-  document.getElementById("status-body").addEventListener("click", async (ev) => {
+  // -------- actions column (icon buttons) --------
+  function onActionClick(ev) {
     const el = ev.target.closest("[data-action]");
     if (!el) return;
     const action = el.getAttribute("data-action");
     const app = el.getAttribute("data-app");
-    if (action === "actions") {
-      ev.preventDefault();
-      actionsApp = app;
-      actionsAppEl.textContent = app;
-      actionsModal.show();
-      return;
-    }
-    try {
-      // no-op: table no longer has direct actions; everything goes through the actions modal.
-    } catch (e) {
-      showAlert("danger", e.toString());
-    }
-  });
+    if (!action || !app) return;
+    if (action === "logs") { openLogsFor(app); return; }
+    if (action === "flags") { openFlagsFor(app); return; }
+    if (action === "schedule") { openScheduleFor(app); return; }
+    if (action === "start") { askConfirm("start", app); return; }
+    if (action === "stop") { askConfirm("stop", app); return; }
+    if (action === "restart") { askConfirm("restart", app); return; }
+  }
+  document.getElementById("status-body-services").addEventListener("click", onActionClick);
+  document.getElementById("status-body-cron").addEventListener("click", onActionClick);
 
   refresh().catch(e => showAlert("danger", e.toString()));
 </script>

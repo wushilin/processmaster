@@ -1,0 +1,50 @@
+{
+  "backoff": {
+    "clears": ["failed", "ot_killed", "user_start", "user_stop", "system_start"],
+    "also_sets": []
+  },
+  "failed": {
+    "clears": ["backoff", "ot_killed", "user_start", "user_stop", "system_start"],
+    "also_sets": []
+  },
+  "ot_killed": {
+    "clears": ["failed", "backoff", "user_start", "user_stop", "system_start"],
+    "also_sets": []
+  },
+  "user_start": {
+    "clears": ["user_stop", "ot_killed", "failed", "backoff", "system_start"],
+    "also_sets": []
+  },
+  "user_stop": {
+    "clears": ["user_start", "system_start","ot_killed", "failed", "backoff"],
+    "also_sets": []
+  },
+  "system_start": {
+    "clears": ["user_start", "user_stop", "ot_killed", "failed", "backoff", "system_start"],
+    "also_sets": []
+  },
+  "no_flag": {
+    "clears": ["*"],
+    "also_sets": []
+  },
+  "exit_ok": {
+    "clears": ["exit_err", "dummy2"],
+    "also_sets": ["dummy1"]
+  },
+  "exit_err": {
+    "clears": ["exit_ok", "dummy1"],
+    "also_sets": ["dummy2"]
+  },
+  "dummy1": { "clears": [], "also_sets": [] },
+  "dummy2": { "clears": [], "also_sets": [] },
+  "dummy3": { "clears": [], "also_sets": [] },
+  "dummy4": { "clears": [], "also_sets": [] },
+  "dummy5": { "clears": [], "also_sets": [] },
+  "dummy6": { "clears": [], "also_sets": [] },
+  "dummy7": { "clears": [], "also_sets": [] },
+  "dummy8": { "clears": [], "also_sets": [] },
+  "dummy9": { "clears": [], "also_sets": [] },
+  "dummy10": { "clears": [], "also_sets": [] }
+}
+
+

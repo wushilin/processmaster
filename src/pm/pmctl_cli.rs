@@ -54,6 +54,11 @@ impl fmt::Display for MissingSockHelp {
 
 pub fn run() -> anyhow::Result<()> {
     let args = PmctlArgs::parse();
+    if matches!(&args.cmd, Some(cli::Cmd::Version)) {
+        println!("{}", crate::pm::build_info::banner());
+        return Ok(());
+    }
+
     let sock = resolve_sock(&args)?;
 
     let cmd = args.cmd.unwrap_or(cli::Cmd::Status {
@@ -62,6 +67,13 @@ pub fn run() -> anyhow::Result<()> {
     });
 
     match cmd {
+        cli::Cmd::ServerVersion => {
+            let resp = rpc::client_call(&sock, rpc::Request::ServerVersion)?;
+            if !resp.message.trim().is_empty() {
+                println!("{}", resp.message.trim_end());
+            }
+            Ok(())
+        }
         cli::Cmd::Update => {
             let resp = rpc::client_call(&sock, rpc::Request::Update)?;
             if !resp.message.trim().is_empty() {
@@ -184,6 +196,39 @@ pub fn run() -> anyhow::Result<()> {
                 }
             }
         }
+        cli::Cmd::AdminList => {
+            let resp = rpc::client_call(&sock, rpc::Request::AdminList)?;
+            if resp.admin_actions.is_empty() {
+                println!("(no admin actions configured)");
+            } else {
+                for a in resp.admin_actions {
+                    println!("{} ({})", a.label, a.name);
+                }
+            }
+            Ok(())
+        }
+        cli::Cmd::AdminKill => {
+            let resp = rpc::client_call(&sock, rpc::Request::AdminKill)?;
+            if !resp.message.trim().is_empty() {
+                println!("{}", resp.message.trim_end());
+            }
+            Ok(())
+        }
+        cli::Cmd::AdminRun { id } => {
+            let resp = rpc::client_call(&sock, rpc::Request::AdminAction { name: id })?;
+            if !resp.message.trim().is_empty() {
+                println!("{}", resp.message.trim_end());
+            }
+            Ok(())
+        }
+        cli::Cmd::AdminPs => {
+            let resp = rpc::client_call(&sock, rpc::Request::AdminPs)?;
+            if !resp.message.trim().is_empty() {
+                println!("{}", resp.message.trim_end());
+            }
+            Ok(())
+        }
+        cli::Cmd::Version => unreachable!("handled before sock resolution"),
     }
 }
 

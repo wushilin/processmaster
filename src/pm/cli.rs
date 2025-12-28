@@ -79,6 +79,19 @@ pub enum Cmd {
         #[arg(long = "format", default_value = "text")]
         format: OutputFormat,
     },
+    /// Print local build info
+    Version,
+    /// Print server build info (requires daemon socket)
+    ServerVersion,
+
+    /// List configured admin actions (name + label)
+    AdminList,
+    /// Kill all running admin actions via cgroup.kill (no mercy)
+    AdminKill,
+    /// Run an admin action by its id (the admin_actions map key)
+    AdminRun { id: String },
+    /// Show PIDs currently running in the admin_actions cgroup
+    AdminPs,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -89,10 +102,21 @@ pub enum OutputFormat {
 
 pub fn run() -> anyhow::Result<()> {
     let args = Args::parse();
+    if matches!(&args.cmd, Some(Cmd::Version)) {
+        println!("{}", crate::pm::build_info::banner());
+        return Ok(());
+    }
     let cfg = config::load_master_config(&args.config)?;
 
     match args.cmd {
         None => daemon::run_daemon(&cfg),
+        Some(Cmd::ServerVersion) => {
+            let resp = rpc::client_call(&cfg.sock, rpc::Request::ServerVersion)?;
+            if !resp.message.trim().is_empty() {
+                println!("{}", resp.message.trim_end());
+            }
+            Ok(())
+        }
         Some(Cmd::Update) => {
             let resp = rpc::client_call(&cfg.sock, rpc::Request::Update)?;
             if !resp.message.trim().is_empty() {
@@ -212,6 +236,35 @@ pub fn run() -> anyhow::Result<()> {
                 }
             }
         }
+        Some(Cmd::AdminList) => {
+            let resp = rpc::client_call(&cfg.sock, rpc::Request::AdminList)?;
+            for a in resp.admin_actions {
+                println!("{} ({})", a.label, a.name);
+            }
+            Ok(())
+        }
+        Some(Cmd::AdminKill) => {
+            let resp = rpc::client_call(&cfg.sock, rpc::Request::AdminKill)?;
+            if !resp.message.trim().is_empty() {
+                println!("{}", resp.message.trim_end());
+            }
+            Ok(())
+        }
+        Some(Cmd::AdminRun { id }) => {
+            let resp = rpc::client_call(&cfg.sock, rpc::Request::AdminAction { name: id })?;
+            if !resp.message.trim().is_empty() {
+                println!("{}", resp.message.trim_end());
+            }
+            Ok(())
+        }
+        Some(Cmd::AdminPs) => {
+            let resp = rpc::client_call(&cfg.sock, rpc::Request::AdminPs)?;
+            if !resp.message.trim().is_empty() {
+                println!("{}", resp.message.trim_end());
+            }
+            Ok(())
+        }
+        Some(Cmd::Version) => unreachable!("handled before config load"),
     }
 }
 

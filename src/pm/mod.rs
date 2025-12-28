@@ -1,5 +1,6 @@
 pub mod app;
 pub mod asyncutil;
+pub mod build_info;
 pub mod cli;
 pub mod config;
 pub mod cgroup;

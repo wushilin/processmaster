@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +53,20 @@ pub struct MasterConfig {
     /// Optional embedded web console (axum) configuration.
     #[serde(default)]
     pub web_console: WebConsoleConfig,
+
+    /// Optional: operator-triggered admin commands (run as root, from working dir '.').
+    #[serde(default)]
+    pub admin_actions: BTreeMap<String, AdminActionConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminActionConfig {
+    /// Optional button label; defaults to the map key.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Command argv list.
+    pub command: Vec<String>,
 }
 
 // -------- YAML file schema (grouped only; strict) --------
@@ -200,7 +216,18 @@ struct MasterConfigFile {
     global: Option<GlobalConfigFile>,
     #[serde(default)]
     web_console: Option<WebConsoleConfigFile>,
+    #[serde(default)]
+    admin_actions: Option<BTreeMap<String, AdminActionConfigFile>>,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminActionConfigFile {
+    #[serde(default)]
+    label: Option<String>,
+    command: Vec<String>,
+}
+
 
 fn default_cgroup_root() -> String {
     "/sys/fs/cgroup".to_string()
@@ -329,6 +356,7 @@ pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
         config_directory: default_config_directory(),
         auto_service_directory: None,
         web_console: WebConsoleConfig::default(),
+        admin_actions: BTreeMap::new(),
     };
 
     if let Some(cg) = file_cfg.cgroup {
@@ -376,6 +404,45 @@ pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
             if let Some(basic) = auth.basic {
                 cfg.web_console.auth.basic.users = basic.users;
             }
+        }
+    }
+
+    if let Some(actions) = file_cfg.admin_actions {
+        for (name, a) in actions {
+            anyhow::ensure!(!name.trim().is_empty(), "admin_actions: action name must not be empty");
+            anyhow::ensure!(
+                name.trim() == name,
+                "admin_actions: action name must not have leading/trailing whitespace: {name:?}"
+            );
+            anyhow::ensure!(
+                !a.command.is_empty(),
+                "admin_actions.{name}.command must not be empty"
+            );
+            if let Some(label) = a.label.as_deref() {
+                anyhow::ensure!(
+                    !label.trim().is_empty(),
+                    "admin_actions.{name}.label must not be empty if provided"
+                );
+            }
+            cfg.admin_actions.insert(
+                name,
+                AdminActionConfig {
+                    label: a.label,
+                    command: a.command,
+                },
+            );
+        }
+    }
+
+    // Validate uniqueness of action ids (names) in a canonicalized form.
+    // This prevents confusing configs like `Foo` vs `foo` or trailing whitespace variants.
+    let mut seen: HashMap<String, String> = HashMap::new(); // canonical -> original
+    for name in cfg.admin_actions.keys() {
+        let canon = name.trim().to_ascii_lowercase();
+        if let Some(prev) = seen.insert(canon.clone(), name.clone()) {
+            anyhow::bail!(
+                "duplicate admin action id (case-insensitive) {canon:?} for actions {prev:?} and {name:?}"
+            );
         }
     }
 

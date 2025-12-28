@@ -20,6 +20,7 @@ use libc;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::ffi::OsString;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::ffi::OsStringExt;
@@ -43,6 +44,27 @@ use tokio::task::JoinSet;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
 use serde::{Deserialize, Serialize};
+
+const EMBEDDED_FLAG_RULES_JSON: &str = include_str!("flag_rules.default.json");
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct FlagRuleFileEntry {
+    #[serde(default)]
+    clears: Vec<String>,
+    #[serde(default)]
+    also_sets: Vec<String>,
+}
+
+type FlagRulesFile = HashMap<String, FlagRuleFileEntry>;
+
+#[derive(Debug, Clone, Default)]
+struct FlagRuleCompiled {
+    clear_all_except_fresh: bool,
+    clears: Vec<SystemFlag>,
+    also_sets: Vec<SystemFlag>,
+}
+
+type FlagRulesCompiled = HashMap<SystemFlag, FlagRuleCompiled>;
 
 // (removed TOKIO_HANDLE: daemon is now async end-to-end; callers should `await` directly)
 static TASKS: OnceLock<TaskTracker> = OnceLock::new();
@@ -72,6 +94,13 @@ static DAEMON_LOG_TX: OnceLock<tokio_mpsc::UnboundedSender<String>> = OnceLock::
 static EARLY_DAEMON_LOG: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
 const EARLY_DAEMON_LOG_MAX_LINES: usize = 5000;
 
+static FLAG_RULES: OnceLock<FlagRulesCompiled> = OnceLock::new();
+
+// Operator intent is expressed via transient system flags (not persisted).
+const SYSFLAG_USER_STOP: SystemFlag = SystemFlag::UserStop;
+const SYSFLAG_USER_START: SystemFlag = SystemFlag::UserStart;
+const SYSFLAG_OT_KILLED: SystemFlag = SystemFlag::OtKilled;
+
 #[derive(Debug)]
 pub(crate) struct DaemonState {
     pub(crate) cfg: MasterConfig,
@@ -93,7 +122,6 @@ struct RunInfo {
     // "start" or "restart" for the last actual start
     last_start_kind: Option<String>,
     last_exit_code: Option<i32>,
-    desired: DesiredState,
     /// System flags controlled by the daemon logic.
     /// value: expiry timestamp (ms since epoch) or None (never expires)
     system_flags: BTreeMap<SystemFlag, Option<i64>>,
@@ -120,11 +148,38 @@ struct PersistedStateFile {
     apps: HashMap<String, PersistedAppState>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum SystemFlag {
     Failed,
     Backoff,
     Outdated,
+    UserStop,
+    UserStart,
+    OtKilled,
+    ExitOk,
+    ExitErr,
+    Dummy1,
+    Dummy2,
+    Dummy3,
+    Dummy4,
+    Dummy5,
+    Dummy6,
+    Dummy7,
+    Dummy8,
+    Dummy9,
+    Dummy10,
+    SystemStart,
+    NoFlag,
+    #[allow(dead_code)] // constructed by the flag rules engine (runtime-configured)
+    FlagBug,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // may be extended with RUNNING-only flags; kept for the design
+enum FlagScope {
+    Running,
+    Stopped,
+    Both,
 }
 
 impl SystemFlag {
@@ -133,6 +188,82 @@ impl SystemFlag {
             SystemFlag::Failed => "failed",
             SystemFlag::Backoff => "backoff",
             SystemFlag::Outdated => "outdated",
+            SystemFlag::UserStop => "user_stop",
+            SystemFlag::UserStart => "user_start",
+            SystemFlag::OtKilled => "ot_killed",
+            SystemFlag::ExitOk => "exit_ok",
+            SystemFlag::ExitErr => "exit_err",
+            SystemFlag::Dummy1 => "dummy1",
+            SystemFlag::Dummy2 => "dummy2",
+            SystemFlag::Dummy3 => "dummy3",
+            SystemFlag::Dummy4 => "dummy4",
+            SystemFlag::Dummy5 => "dummy5",
+            SystemFlag::Dummy6 => "dummy6",
+            SystemFlag::Dummy7 => "dummy7",
+            SystemFlag::Dummy8 => "dummy8",
+            SystemFlag::Dummy9 => "dummy9",
+            SystemFlag::Dummy10 => "dummy10",
+            SystemFlag::SystemStart => "system_start",
+            SystemFlag::NoFlag => "no_flag",
+            SystemFlag::FlagBug => "flag_bug",
+        }
+    }
+
+    fn scope(&self) -> FlagScope {
+        match self {
+            // These describe stopped-state conditions only.
+            SystemFlag::Failed => FlagScope::Stopped,
+            SystemFlag::Backoff => FlagScope::Stopped,
+            SystemFlag::OtKilled => FlagScope::Stopped,
+            SystemFlag::ExitOk => FlagScope::Stopped,
+            SystemFlag::ExitErr => FlagScope::Stopped,
+            SystemFlag::Dummy1 => FlagScope::Both,
+            SystemFlag::Dummy2 => FlagScope::Both,
+            SystemFlag::Dummy3 => FlagScope::Both,
+            SystemFlag::Dummy4 => FlagScope::Both,
+            SystemFlag::Dummy5 => FlagScope::Both,
+            SystemFlag::Dummy6 => FlagScope::Both,
+            SystemFlag::Dummy7 => FlagScope::Both,
+            SystemFlag::Dummy8 => FlagScope::Both,
+            SystemFlag::Dummy9 => FlagScope::Both,
+            SystemFlag::Dummy10 => FlagScope::Both,
+
+            // These can be useful in either state (or might be set transiently during transitions).
+            SystemFlag::Outdated => FlagScope::Both,
+            SystemFlag::UserStop => FlagScope::Stopped,
+            SystemFlag::UserStart => FlagScope::Running,
+            // Internal/controller-only flags; generally should not be displayed, but scoping doesn't matter much
+            // because rules clear them immediately.
+            SystemFlag::SystemStart => FlagScope::Running,
+            SystemFlag::NoFlag => FlagScope::Both,
+            SystemFlag::FlagBug => FlagScope::Both,
+        }
+    }
+
+    fn parse(s: &str) -> Option<SystemFlag> {
+        match s.trim() {
+            "failed" => Some(SystemFlag::Failed),
+            "backoff" => Some(SystemFlag::Backoff),
+            "outdated" => Some(SystemFlag::Outdated),
+            "user_stop" => Some(SystemFlag::UserStop),
+            "user_start" => Some(SystemFlag::UserStart),
+            "ot_killed" => Some(SystemFlag::OtKilled),
+            "exit_ok" => Some(SystemFlag::ExitOk),
+            "exit_err" => Some(SystemFlag::ExitErr),
+            "dummy1" => Some(SystemFlag::Dummy1),
+            "dummy2" => Some(SystemFlag::Dummy2),
+            "dummy3" => Some(SystemFlag::Dummy3),
+            "dummy4" => Some(SystemFlag::Dummy4),
+            "dummy5" => Some(SystemFlag::Dummy5),
+            "dummy6" => Some(SystemFlag::Dummy6),
+            "dummy7" => Some(SystemFlag::Dummy7),
+            "dummy8" => Some(SystemFlag::Dummy8),
+            "dummy9" => Some(SystemFlag::Dummy9),
+            "dummy10" => Some(SystemFlag::Dummy10),
+            "system_start" => Some(SystemFlag::SystemStart),
+            "no_flag" => Some(SystemFlag::NoFlag),
+            "flag_bug" => Some(SystemFlag::FlagBug),
+            _ => None,
         }
     }
 }
@@ -141,14 +272,6 @@ impl std::fmt::Display for SystemFlag {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum DesiredState {
-    Running,
-    Scheduled,
-    #[default]
-    Stopped,
 }
 
 fn sysflag_set(map: &mut BTreeMap<SystemFlag, Option<i64>>, flag: SystemFlag, expires_at_ms: Option<i64>) {
@@ -161,6 +284,262 @@ fn sysflag_clear(map: &mut BTreeMap<SystemFlag, Option<i64>>, flag: SystemFlag) 
 
 fn sysflag_has(map: &BTreeMap<SystemFlag, Option<i64>>, flag: SystemFlag) -> bool {
     map.contains_key(&flag)
+}
+
+fn sysflag_set_with_rules(
+    app: &str,
+    map: &mut BTreeMap<SystemFlag, Option<i64>>,
+    flag: SystemFlag,
+    expires_at_ms: Option<i64>,
+) {
+    // Two-phase rule application:
+    // - Evaluate rules on a snapshot (BFS) to compute (1) flags to remove, (2) flags to add/update.
+    // - Apply removals first, then apply adds/updates.
+    //
+    // Conflict resolution: if a flag is both set and cleared by rules, "set wins".
+    use std::collections::{HashSet, VecDeque};
+
+    // Rules source (avoid allocating/cloning in the common case).
+    let rules_owned;
+    let rules: &FlagRulesCompiled = match FLAG_RULES.get() {
+        Some(r) => r,
+        None => {
+            rules_owned = default_flag_rules_compiled();
+            &rules_owned
+        }
+    };
+
+    // Snapshot of existing flags.
+    let existing: Vec<SystemFlag> = map.keys().copied().collect();
+
+    // BFS evaluation.
+    let mut queue: VecDeque<SystemFlag> = VecDeque::new();
+    let mut expanded: HashSet<SystemFlag> = HashSet::new();
+    let mut to_clear: std::collections::BTreeSet<SystemFlag> = std::collections::BTreeSet::new();
+    // These are flags being applied in this round (the "fresh set" to keep under clears=["*"] semantics).
+    let mut applied_set: std::collections::BTreeSet<SystemFlag> = std::collections::BTreeSet::new();
+    // Track which flags are requested via also_sets (used to decide whether to insert them if absent).
+    let mut also_set_requested: std::collections::BTreeSet<SystemFlag> = std::collections::BTreeSet::new();
+
+    let mut clear_all = false;
+    let mut actions: usize = 0;
+    applied_set.insert(flag);
+    queue.push_back(flag);
+
+    while let Some(f) = queue.pop_front() {
+        if actions > 10_000 {
+            break;
+        }
+        if !expanded.insert(f) {
+            continue;
+        }
+        let Some(rule) = rules.get(&f) else { continue };
+
+        if rule.clear_all_except_fresh {
+            clear_all = true;
+            actions += 1;
+        }
+
+        for c in &rule.clears {
+            if to_clear.insert(*c) {
+                actions += 1;
+            }
+        }
+
+        for a in &rule.also_sets {
+            if also_set_requested.insert(*a) {
+                actions += 1;
+            }
+            // "Apply" the flag in this round (even if it already existed) so its clears/also_sets are evaluated.
+            applied_set.insert(*a);
+            queue.push_back(*a);
+        }
+    }
+
+    if actions > 10_000 {
+        applied_set.insert(SystemFlag::FlagBug);
+        pm_event("flags", Some(app), "decision=stop reason=side_effect_limit_exceeded limit=10000");
+    }
+
+    // Expand clears=["*"] as: clear all existing flags except those applied in this round.
+    if clear_all {
+        let mut n = 0usize;
+        for k in &existing {
+            if applied_set.contains(k) {
+                continue;
+            }
+            if to_clear.insert(*k) {
+                n += 1;
+            }
+        }
+        pm_event(
+            "flags",
+            Some(app),
+            format!("effect=clear_all kept_applied={} clear_candidates={}", applied_set.len(), n),
+        );
+    }
+
+    // Resolve conflicts: set wins.
+    for k in &applied_set {
+        to_clear.remove(k);
+    }
+
+    // Apply removals.
+    for r in to_clear {
+        if map.remove(&r).is_some() {
+            pm_event("flags", Some(app), format!("effect=clear cleared={}", r.as_str()));
+        }
+    }
+
+    // Apply adds/updates:
+    // - The primary flag is always set/updated with the requested expiry.
+    map.insert(flag, expires_at_ms);
+    pm_event("flags", Some(app), format!("effect=set flag={}", flag.as_str()));
+
+    // - also_sets are inserted if missing; existing ones are kept as-is.
+    for a in also_set_requested {
+        if a == flag {
+            continue;
+        }
+        if map.contains_key(&a) {
+            continue;
+        }
+        map.insert(a, None);
+        pm_event("flags", Some(app), format!("effect=also_set flag={}", a.as_str()));
+    }
+}
+
+fn default_flag_rules_compiled() -> FlagRulesCompiled {
+    // Safe defaults matching current semantics:
+    // - user_start implies not user_stop, and clears the "ot_killed" marker (manual intervention acknowledges it).
+    // - user_stop implies not user_start.
+    let mut m: FlagRulesCompiled = HashMap::new();
+    m.insert(
+        SystemFlag::UserStart,
+        FlagRuleCompiled {
+            clear_all_except_fresh: false,
+            clears: vec![SystemFlag::UserStop, SystemFlag::OtKilled],
+            also_sets: vec![],
+        },
+    );
+    m.insert(
+        SystemFlag::UserStop,
+        FlagRuleCompiled {
+            clear_all_except_fresh: false,
+            clears: vec![SystemFlag::UserStart],
+            also_sets: vec![],
+        },
+    );
+    m.insert(
+        SystemFlag::Failed,
+        FlagRuleCompiled {
+            clear_all_except_fresh: false,
+            clears: vec![SystemFlag::Backoff],
+            also_sets: vec![],
+        },
+    );
+    m
+}
+
+fn load_flag_rules(cfg: &MasterConfig) -> FlagRulesCompiled {
+    fn compile_from_parsed(parsed: FlagRulesFile) -> FlagRulesCompiled {
+        let mut compiled: FlagRulesCompiled = HashMap::new();
+        for (k, v) in parsed {
+            let Some(flag) = SystemFlag::parse(&k) else {
+                pm_event("flags", None, &format!("ignore_rule reason=unknown_flag flag={k}"));
+                continue;
+            };
+            let mut clears: Vec<SystemFlag> = vec![];
+            let mut clear_all_except_fresh = false;
+            for c in v.clears {
+                if c.trim() == "*" {
+                    clear_all_except_fresh = true;
+                    continue;
+                }
+                if let Some(f) = SystemFlag::parse(&c) {
+                    clears.push(f);
+                } else {
+                    pm_event(
+                        "flags",
+                        None,
+                        &format!(
+                            "ignore_rule_field reason=unknown_flag parent={} field=clears value={c}",
+                            flag.as_str()
+                        ),
+                    );
+                }
+            }
+            let mut also_sets: Vec<SystemFlag> = vec![];
+            for a in v.also_sets {
+                if let Some(f) = SystemFlag::parse(&a) {
+                    also_sets.push(f);
+                } else {
+                    pm_event(
+                        "flags",
+                        None,
+                        &format!(
+                            "ignore_rule_field reason=unknown_flag parent={} field=also_sets value={a}",
+                            flag.as_str()
+                        ),
+                    );
+                }
+            }
+            compiled.insert(
+                flag,
+                FlagRuleCompiled {
+                    clear_all_except_fresh,
+                    clears,
+                    also_sets,
+                },
+            );
+        }
+        compiled
+    }
+
+    // 1) Start from embedded JSON (compiled into the binary).
+    let embedded_parsed: Option<FlagRulesFile> = match serde_json::from_str(EMBEDDED_FLAG_RULES_JSON) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            pm_event("flags", None, &format!("decision=use_builtin_defaults reason=embedded_json_parse_error err={e}"));
+            None
+        }
+    };
+    let mut base = embedded_parsed
+        .map(compile_from_parsed)
+        .unwrap_or_else(default_flag_rules_compiled);
+
+    // 2) Optional on-disk override at <config_directory>/flag_rules.json.
+    let path = cfg.config_directory.join("flag_rules.json");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match serde_json::from_str::<FlagRulesFile>(&text) {
+            Ok(parsed) => {
+                base = compile_from_parsed(parsed);
+                pm_event("flags", None, &format!("loaded source=disk file={} rules={}", path.display(), base.len()));
+            }
+            Err(e) => {
+                pm_event(
+                    "flags",
+                    None,
+                    &format!(
+                        "decision=keep_embedded reason=json_parse_error file={} err={e}",
+                        path.display()
+                    ),
+                );
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            pm_event("flags", None, &format!("loaded source=embedded rules={}", base.len()));
+        }
+        Err(e) => {
+            pm_event(
+                "flags",
+                None,
+                &format!("decision=keep_embedded reason=read_error file={} err={e}", path.display()),
+            );
+        }
+    }
+
+    base
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -442,6 +821,18 @@ pub async fn run_daemon_async(cfg: MasterConfig) -> anyhow::Result<()> {
     // <config_directory>/logs/processmaster.log (rotate 10 MiB, 10 backups, gzip).
     start_daemon_log_file(&cfg);
 
+    // Build metadata (from build.rs) for easy debugging in deployed environments.
+    let build_time = option_env!("PROCESSMASTER_BUILD_TIME").unwrap_or("unknown");
+    let build_host = option_env!("PROCESSMASTER_BUILD_HOST").unwrap_or("unknown");
+    pm_event(
+        "boot",
+        None,
+        format!("build_time={build_time} build_host={build_host}"),
+    );
+
+    // Load sysflag rules once (runtime-configured). Used for chained clears/also_sets.
+    let _ = FLAG_RULES.set(load_flag_rules(&cfg));
+
     let appstate_path = cfg.config_directory.join("appstate.json");
     let appstate_dirty = Arc::new(AtomicBool::new(false));
 
@@ -621,8 +1012,8 @@ async fn stop_all_services_best_effort(state: Arc<Mutex<DaemonState>>) {
     for name in names {
         let st = Arc::clone(&state);
         js.spawn(async move {
-            // stop_one is blocking; run it on the blocking pool.
-            let _ = tasks().spawn_blocking(move || stop_one(&st, &name)).await;
+            // Best-effort: use the per-app supervisor stop path so it is consistent with normal shutdown.
+            let _ = shutdown_stop_via_supervisor_async(&st, &name).await;
         });
     }
     while js.join_next().await.is_some() {}
@@ -822,12 +1213,6 @@ fn start_scheduler_thread(state: Arc<Mutex<DaemonState>>) {
                 last_fired.insert(name.clone(), minute_key);
 
                 pm_event_state(&state, "schedule", Some(&name), format!("due schedule={expr:?} attempt=run_once"));
-                // Track last_run as "last start attempt" for scheduled run.
-                let run_info = {
-                    let st = state.lock().unwrap_or_else(|p| p.into_inner());
-                    Arc::clone(&st.run_info)
-                };
-                record_start_attempt_in_store(&run_info, &name);
                 match scheduled_start_via_supervisor_async(&state, &name).await {
                     Ok(()) => pm_event_state(&state, "schedule", Some(&name), "outcome=accepted"),
                     Err(e) => pm_event_state(&state, "schedule", Some(&name), format!("outcome=error err={e}")),
@@ -1053,7 +1438,8 @@ fn restore_app_state_best_effort(state: Arc<Mutex<DaemonState>>) {
             return;
         }
     };
-    if parsed.version != 1 {
+    // version 2 used to include a stopped_by_user field; we now express intent via user_flags instead.
+    if parsed.version != 1 && parsed.version != 2 {
         push_event(&events, "appstate", None, format!("discard_version_mismatch path={} version={}", path.display(), parsed.version));
         return;
     }
@@ -1063,7 +1449,7 @@ fn restore_app_state_best_effort(state: Arc<Mutex<DaemonState>>) {
         let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
         for (app, st) in parsed.apps {
             let e = ri.entry(app).or_default();
-            // Only restore user flags (system flags are derived).
+            // Restore persisted app state (only user flags; system flags are derived).
             e.user_flags = st.user_flags;
             // prune expired immediately
             e.user_flags.retain(|_, v| v.map(|d| now_ms < d).unwrap_or(true));
@@ -1832,19 +2218,46 @@ fn prepare_socket(sock: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_connection_async(state: Arc<Mutex<DaemonState>>, stream: tokio::net::UnixStream) -> anyhow::Result<()> {
+async fn handle_connection_async(
+    state: Arc<Mutex<DaemonState>>,
+    stream: tokio::net::UnixStream,
+) -> anyhow::Result<()> {
     let mut reader = TokioBufReader::new(stream);
     let mut line = String::new();
     let n = reader.read_line(&mut line).await?;
     if n == 0 || line.trim().is_empty() {
         return Ok(());
     }
-    let req: Request = serde_json::from_str(line.trim_end())?;
+    let wire: crate::pm::rpc::WireRequest = serde_json::from_str(line.trim_end())?;
 
     // Grab the underlying stream back so we can write response (or hand to follow).
     let mut stream = reader.into_inner();
 
-    match req {
+    let daemon_build_time = option_env!("PROCESSMASTER_BUILD_TIME").unwrap_or("unknown");
+    let daemon_build_host = option_env!("PROCESSMASTER_BUILD_HOST").unwrap_or("unknown");
+    if wire.client.build_time != daemon_build_time || wire.client.build_host != daemon_build_host {
+        let resp = Response {
+            ok: false,
+            message: format!(
+                "pmctl is not co-built with this daemon.\n\
+daemon: build_time={daemon_build_time} build_host={daemon_build_host}\n\
+client: build_time={} build_host={}\n\
+\n\
+Fix: use the `pmctl` binary built from the same build/release as the running daemon.",
+                wire.client.build_time, wire.client.build_host
+            ),
+            restarted: vec![],
+            statuses: vec![],
+            events: vec![],
+            admin_actions: vec![],
+        };
+        let resp_line = serde_json::to_string(&resp)? + "\n";
+        stream.write_all(resp_line.as_bytes()).await?;
+        stream.flush().await?;
+        return Ok(());
+    }
+
+    match wire.request {
         Request::LogsFollow { name, filename, n, .. } => {
             // Long-running follow loop; keep it off the core runtime threads for now.
             let std_stream = stream.into_std()?;
@@ -1858,7 +2271,14 @@ async fn handle_connection_async(state: Arc<Mutex<DaemonState>>, stream: tokio::
         other => {
             let resp = match dispatch_async(state, other).await {
                 Ok(r) => r,
-                Err(e) => Response { ok: false, message: e.to_string(), restarted: vec![], statuses: vec![], events: vec![] },
+                Err(e) => Response {
+                    ok: false,
+                    message: e.to_string(),
+                    restarted: vec![],
+                    statuses: vec![],
+                    events: vec![],
+                    admin_actions: vec![],
+                },
             };
             let resp_line = serde_json::to_string(&resp)? + "\n";
             stream.write_all(resp_line.as_bytes()).await?;
@@ -1871,9 +2291,17 @@ async fn handle_connection_async(state: Arc<Mutex<DaemonState>>, stream: tokio::
 pub(crate) async fn dispatch_async(state: Arc<Mutex<DaemonState>>, req: Request) -> anyhow::Result<Response> {
     match req {
         Request::Update => do_update_async(&state).await,
+        Request::AdminAction { name } => do_admin_action_async(&state, &name).await,
+        Request::AdminList => do_admin_list(&state),
+        Request::AdminKill => do_admin_kill(&state),
+        Request::AdminPs => do_admin_ps(&state),
+        Request::ServerVersion => do_server_version(),
         Request::Start { name, force } => do_start_async(&state, &name, force).await,
         Request::Stop { name } => do_stop_async(&state, &name).await,
         Request::Restart { name, force } => do_restart_async(&state, &name, force).await,
+        Request::StartAll { force } => do_start_all_async(&state, force).await,
+        Request::StopAll => do_stop_all_async(&state).await,
+        Request::RestartAll { force } => do_restart_all_async(&state, force).await,
         Request::Flag { name, flags, ttl } => {
             tasks().spawn_blocking({
                 let st = Arc::clone(&state);
@@ -1920,6 +2348,208 @@ pub(crate) async fn dispatch_async(state: Arc<Mutex<DaemonState>>, req: Request)
     }
 }
 
+// Compatibility helper (some call sites may format build-time strings for display).
+#[allow(dead_code)]
+pub(crate) fn format_build_time_pretty(raw: &str) -> String {
+    crate::pm::build_info::format_build_time_pretty(raw)
+}
+
+fn do_server_version() -> anyhow::Result<Response> {
+    Ok(Response {
+        ok: true,
+        message: crate::pm::build_info::banner(),
+        restarted: vec![],
+        statuses: vec![],
+        events: vec![],
+        admin_actions: vec![],
+    })
+}
+
+fn admin_actions_cgroup_dir(cfg: &MasterConfig) -> anyhow::Result<PathBuf> {
+    Ok(effective_master_cgroup_path(cfg)?.join("admin_actions"))
+}
+
+fn do_admin_ps(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Response> {
+    let cfg = {
+        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        st.cfg.clone()
+    };
+    let cg = admin_actions_cgroup_dir(&cfg)?;
+    let mut pids = crate::pm::cgroup::list_pids(&cg).unwrap_or_default();
+    pids.sort();
+    let msg = if pids.is_empty() {
+        "(none)".to_string()
+    } else {
+        pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join("\n")
+    };
+    Ok(Response {
+        ok: true,
+        message: msg,
+        restarted: vec![],
+        statuses: vec![],
+        events: vec![],
+        admin_actions: vec![],
+    })
+}
+
+fn do_admin_list(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Response> {
+    let actions = {
+        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        st.cfg
+            .admin_actions
+            .iter()
+            .map(|(name, a)| crate::pm::rpc::AdminActionInfo {
+                name: name.clone(),
+                label: a.label.clone().unwrap_or_else(|| name.clone()),
+            })
+            .collect::<Vec<_>>()
+    };
+    Ok(Response {
+        ok: true,
+        message: String::new(),
+        restarted: vec![],
+        statuses: vec![],
+        events: vec![],
+        admin_actions: actions,
+    })
+}
+
+fn do_admin_kill(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Response> {
+    let cfg = {
+        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        st.cfg.clone()
+    };
+    let cg = admin_actions_cgroup_dir(&cfg)?;
+    let before = crate::pm::cgroup::list_pids(&cg).unwrap_or_default();
+    crate::pm::cgroup::kill_all_pids(&cg)?;
+    pm_event_state(
+        state,
+        "admin_action",
+        None,
+        format!("decision=kill_all cgroup={} pids_before={}", cg.display(), before.len()),
+    );
+    Ok(Response {
+        ok: true,
+        message: format!("killed admin actions via cgroup.kill (pids_before={})", before.len()),
+        restarted: vec![],
+        statuses: vec![],
+        events: vec![],
+        admin_actions: vec![],
+    })
+}
+
+async fn do_admin_action_async(state: &Arc<Mutex<DaemonState>>, name: &str) -> anyhow::Result<Response> {
+    if !geteuid().is_root() {
+        return Ok(Response {
+            ok: false,
+            message: "admin_action requires the daemon to run as root".to_string(),
+            restarted: vec![],
+            statuses: vec![],
+            events: vec![],
+            admin_actions: vec![],
+        });
+    }
+
+    let (label, argv, cfg) = {
+        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        match st.cfg.admin_actions.get(name) {
+            Some(a) => (
+                a.label.clone().unwrap_or_else(|| name.to_string()),
+                a.command.clone(),
+                st.cfg.clone(),
+            ),
+            None => {
+                return Ok(Response {
+                    ok: false,
+                    message: format!("admin_action {name:?} is not configured in the main config (admin_actions)"),
+                    restarted: vec![],
+                    statuses: vec![],
+                    events: vec![],
+                    admin_actions: vec![],
+                });
+            }
+        }
+    };
+
+    if argv.is_empty() {
+        return Ok(Response {
+            ok: false,
+            message: format!("admin_action {name:?} has empty command"),
+            restarted: vec![],
+            statuses: vec![],
+            events: vec![],
+            admin_actions: vec![],
+        });
+    }
+
+    pm_event_state(
+        state,
+        "admin_action",
+        None,
+        format!("decision=spawn name={name} label={label:?} argv={}", argv.join(" ")),
+    );
+
+    // Capture output for debugging (best-effort, but fail fast if we can't open the files).
+    let logs_dir = PathBuf::from("./logs");
+    fs::create_dir_all(&logs_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to create admin_action logs dir {}: {e}",
+            logs_dir.display()
+        )
+    })?;
+    let stdout_path = logs_dir.join("admin_action_stdout.log");
+    let stderr_path = logs_dir.join("admin_action_stderr.log");
+    let stdout_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stdout_path)
+        .map_err(|e| anyhow::anyhow!("failed to open {}: {e}", stdout_path.display()))?;
+    let stderr_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stderr_path)
+        .map_err(|e| anyhow::anyhow!("failed to open {}: {e}", stderr_path.display()))?;
+
+    // Place all admin actions under a dedicated cgroup so operators can inspect/kill them.
+    // Example (default config): /sys/fs/cgroup/processmaster/admin_actions
+    let admin_cg = effective_master_cgroup_path(&cfg)?.join("admin_actions");
+
+    let argv_os: Vec<OsString> = argv.iter().map(OsString::from).collect();
+    let mut p = cgroup::LaunchParams::new(argv_os, PathBuf::from("."), admin_cg);
+    p.environment.push((
+        OsString::from("PROCESSMASTER_ADMIN_ACTION"),
+        OsString::from(name),
+    ));
+    let mut cmd = cgroup::build_command(&p)?;
+    // Fire-and-forget: don't tie up the daemon waiting on output pipes.
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(stdout_file))
+        .stderr(std::process::Stdio::from(stderr_file));
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn admin_action {name:?}: {e}"))?;
+    let pid = child.id();
+    // Drop the child handle to "disown" it. The daemon's child reaper thread will reap it.
+    drop(child);
+
+    pm_event_state(
+        state,
+        "admin_action",
+        None,
+        format!("outcome=spawned name={name} pid={pid}"),
+    );
+
+    Ok(Response {
+        ok: true,
+        message: format!("admin_action {name} spawned pid={pid}"),
+        restarted: vec![],
+        statuses: vec![],
+        events: vec![],
+        admin_actions: vec![],
+    })
+}
+
 fn do_events(state: &Arc<Mutex<DaemonState>>, name: Option<&str>, n: usize) -> anyhow::Result<Response> {
     let events = {
         let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
@@ -1943,6 +2573,7 @@ fn do_events(state: &Arc<Mutex<DaemonState>>, name: Option<&str>, n: usize) -> a
         restarted: vec![],
         statuses: vec![],
         events: v,
+        admin_actions: vec![],
     })
 }
 
@@ -1973,6 +2604,7 @@ async fn do_set_enabled_async(state: &Arc<Mutex<DaemonState>>, name: &str, enabl
         restarted: vec![],
         statuses: vec![],
         events: vec![],
+        admin_actions: vec![],
     })
 }
 
@@ -2051,6 +2683,7 @@ fn do_logs(state: &Arc<Mutex<DaemonState>>, name: &str, n: usize) -> anyhow::Res
         restarted: vec![],
         statuses: vec![],
         events: vec![],
+        admin_actions: vec![],
     })
 }
 
@@ -2086,6 +2719,7 @@ fn handle_logs_follow(
         restarted: vec![],
         statuses: vec![],
         events: vec![],
+        admin_actions: vec![],
     };
     let resp_line = serde_json::to_string(&resp)? + "\n";
     stream.write_all(resp_line.as_bytes())?;
@@ -2337,6 +2971,7 @@ async fn do_update_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Resp
                 restarted: vec![],
                 statuses: vec![],
                 events: vec![],
+                admin_actions: vec![],
             });
         }
     };
@@ -2456,12 +3091,21 @@ async fn do_update_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Resp
         if def.schedule.is_some() {
             continue;
         }
-
-        // Treat as a user request: record a start attempt and clear suppression flags via manual SetDesired.
-        record_start_attempt_in_store(&{
-            let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
-            Arc::clone(&st.run_info)
-        }, name);
+        // Respect operator intent to keep the service stopped ("user_stop" flag).
+        let stopped_by_user = {
+            let ri = {
+                let st = state.lock().unwrap_or_else(|p| p.into_inner());
+                Arc::clone(&st.run_info)
+            };
+            let g = ri.lock().unwrap_or_else(|p| p.into_inner());
+            g.get(name)
+                .map(|i| sysflag_has(&i.system_flags, SYSFLAG_USER_STOP))
+                .unwrap_or(false)
+        };
+        if stopped_by_user {
+            pm_event_state(state, "reconcile", Some(name), "skip reason=stopped_by_user");
+            continue;
+        }
 
         pm_event_state(state, "reconcile", Some(name), "decision=apply_modified_def intent=manual_start");
         if let Err(e) = manual_start_via_supervisor_async(state, name, false).await {
@@ -2519,6 +3163,7 @@ async fn do_update_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Resp
         restarted,
         statuses: vec![],
         events: vec![],
+        admin_actions: vec![],
     })
 }
 
@@ -2598,6 +3243,21 @@ async fn start_enabled_services_async(state: &Arc<Mutex<DaemonState>>) -> anyhow
         let st = Arc::clone(state);
         let cfg2 = cfg.clone();
         js.spawn(async move {
+            // Respect operator intent to keep the service stopped ("user_stop" flag).
+            let run_info = {
+                let g = st.lock().unwrap_or_else(|p| p.into_inner());
+                Arc::clone(&g.run_info)
+            };
+            let stopped_by_user = {
+                let ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+                ri.get(&name)
+                    .map(|i| sysflag_has(&i.system_flags, SYSFLAG_USER_STOP))
+                    .unwrap_or(false)
+            };
+            if stopped_by_user {
+                pm_event_state(&st, "autostart", Some(&name), "skip stopped_by_user");
+                return;
+            }
             // If already running, skip.
             match cgroup_running_async(&cfg2, &name).await {
                 Ok(true) => {
@@ -2611,11 +3271,6 @@ async fn start_enabled_services_async(state: &Arc<Mutex<DaemonState>>) -> anyhow
                 }
             }
             pm_event_state(&st, "autostart", Some(&name), "attempt=set_desired enabled");
-            let run_info = {
-                let g = st.lock().unwrap_or_else(|p| p.into_inner());
-                Arc::clone(&g.run_info)
-            };
-            record_start_attempt_in_store(&run_info, &name);
             match boot_start_via_supervisor_async(&st, &name).await {
                 Ok(()) => pm_event_state(&st, "autostart", Some(&name), "outcome=accepted desired=RUNNING"),
                 Err(e) => pm_event_state(&st, "autostart", Some(&name), format!("outcome=error err={e}")),
@@ -2628,19 +3283,21 @@ async fn start_enabled_services_async(state: &Arc<Mutex<DaemonState>>) -> anyhow
 
 // record_start_attempt removed: desired state changes are handled via controller commands.
 
-fn record_started_in_store(run_info: &Arc<Mutex<HashMap<String, RunInfo>>>, name: &str, kind: StartKind) {
+fn record_started_in_store(
+    run_info: &Arc<Mutex<HashMap<String, RunInfo>>>,
+    name: &str,
+    kind: StartKind,
+    reason_flag: SystemFlag,
+) {
     let now = Local::now().timestamp_millis();
     let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
     let e = ri.entry(name.to_string()).or_default();
     e.last_started_ms = Some(now);
     e.last_start_kind = Some(kind.as_str().to_string());
-    // For cron/scheduled jobs, desired should remain SCHEDULED (run-once is an execution, not a
-    // permanent desire to be running).
-    if e.desired != DesiredState::Scheduled {
-        e.desired = DesiredState::Running;
-    }
-    e.system_flags.clear();
-    // IMPORTANT: user_flags are operator intent and must survive starts/restarts.
+    // On successful start, apply the "reason the running app is started" marker. Its rule side-effects
+    // are the single source of truth for clearing stale flags (failed/backoff/user_stop/ot_killed/...).
+    sysflag_set_with_rules(name, &mut e.system_flags, reason_flag, None);
+    // NOTE: user_flags are persisted operator labels and must survive starts/restarts.
 }
 
 fn record_start_attempt_in_store(run_info: &Arc<Mutex<HashMap<String, RunInfo>>>, name: &str) {
@@ -2707,12 +3364,6 @@ async fn do_start_async(state: &Arc<Mutex<DaemonState>>, name: &str, force: bool
             let g = st.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
             g.defs.get(t).cloned().ok_or_else(|| anyhow::anyhow!("unknown service: {t}"))?
         };
-        // Track last_run as "last start attempt" for all starts (manual or run-once).
-        let run_info = {
-            let g = st.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
-            Arc::clone(&g.run_info)
-        };
-        record_start_attempt_in_store(&run_info, t);
         // Cron jobs: "start" means run once, not set desired=RUNNING forever.
         if def.schedule.is_some() {
             pm_event_state(st, "cmd", Some(t), format!("attempt=run_once force={force2}"));
@@ -2765,7 +3416,7 @@ async fn do_start_async(state: &Arc<Mutex<DaemonState>>, name: &str, force: bool
         }
     }
 
-    Ok(Response { ok: true, message: lines.join("\n"), restarted: vec![], statuses: vec![], events: vec![] })
+    Ok(Response { ok: true, message: lines.join("\n"), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![] })
 }
 
 async fn do_stop_async(state: &Arc<Mutex<DaemonState>>, name: &str) -> anyhow::Result<Response> {
@@ -2826,20 +3477,13 @@ async fn do_stop_async(state: &Arc<Mutex<DaemonState>>, name: &str) -> anyhow::R
         }
     }
 
-    Ok(Response { ok: true, message: lines.join("\n"), restarted: vec![], statuses: vec![], events: vec![] })
+    Ok(Response { ok: true, message: lines.join("\n"), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![] })
 }
 
 async fn do_restart_async(state: &Arc<Mutex<DaemonState>>, name: &str, force: bool) -> anyhow::Result<Response> {
     let targets = resolve_targets(state, name, !force)?;
 
     async fn restart_one_cmd(st: &Arc<Mutex<DaemonState>>, t: &str, force2: bool) -> anyhow::Result<String> {
-        // Track last_run as "last start attempt" for restart requests too.
-        let run_info = {
-            let g = st.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
-            Arc::clone(&g.run_info)
-        };
-        record_start_attempt_in_store(&run_info, t);
-
         pm_event_state(st, "cmd", Some(t), format!("attempt=restart force={force2}"));
         // NOTE: this will be routed to the per-app supervisor command queue after the supervisor refactor.
         // For now, implement it as stop + start for services, and stop-now + run-once for scheduled jobs.
@@ -2897,7 +3541,281 @@ async fn do_restart_async(state: &Arc<Mutex<DaemonState>>, name: &str, force: bo
         }
     }
 
-    Ok(Response { ok: true, message: lines.join("\n"), restarted: vec![], statuses: vec![], events: vec![] })
+    Ok(Response { ok: true, message: lines.join("\n"), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![] })
+}
+
+async fn do_start_all_async(state: &Arc<Mutex<DaemonState>>, force: bool) -> anyhow::Result<Response> {
+    // Server-side bulk op for the web UI: start all enabled non-scheduled services.
+    let names: Vec<String> = {
+        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let mut v: Vec<String> = st
+            .defs
+            .iter()
+            .filter(|(_n, d)| d.enabled && d.schedule.is_none())
+            .map(|(n, _)| n.clone())
+            .collect();
+        v.sort();
+        v
+    };
+    if names.is_empty() {
+        return Ok(Response { ok: true, message: "no enabled services to start".to_string(), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![] });
+    }
+
+    let mut js: JoinSet<(String, bool, String)> = JoinSet::new();
+    let mut pending = names.into_iter();
+    let limit = 16usize;
+
+    for _ in 0..limit {
+        if let Some(name) = pending.next() {
+            let st2 = Arc::clone(state);
+            js.spawn(async move {
+                let r = do_start_async(&st2, &name, force).await;
+                match r {
+                    Ok(resp) => (name, resp.ok, resp.message),
+                    Err(e) => (name, false, e.to_string()),
+                }
+            });
+        }
+    }
+
+    let mut ok = 0usize;
+    let mut fail = 0usize;
+    let mut failures: Vec<String> = vec![];
+    while let Some(res) = js.join_next().await {
+        if let Ok((name, is_ok, msg)) = res {
+            if is_ok { ok += 1; } else { fail += 1; failures.push(format!("{name}: {msg}")); }
+            if let Some(next) = pending.next() {
+                let st2 = Arc::clone(state);
+                js.spawn(async move {
+                    let r = do_start_async(&st2, &next, force).await;
+                    match r {
+                        Ok(resp) => (next, resp.ok, resp.message),
+                        Err(e) => (next, false, e.to_string()),
+                    }
+                });
+            }
+        }
+    }
+
+    failures.sort();
+    let mut message = format!("start_all done: {ok} ok, {fail} failed.");
+    if !failures.is_empty() {
+        let cap = 20usize;
+        let shown = failures.iter().take(cap).cloned().collect::<Vec<_>>().join("\n");
+        let more = if failures.len() > cap { format!("\n…(+{})", failures.len() - cap) } else { "".to_string() };
+        message.push_str("\n");
+        message.push_str(&shown);
+        message.push_str(&more);
+    }
+    Ok(Response { ok: fail == 0, message, restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![] })
+}
+
+async fn do_stop_all_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Response> {
+    // Server-side bulk op for the web UI: stop all *running* apps.
+    // Because this is an operator action ("Stop all"), we DO apply operator-intent flags where applicable:
+    // - services (non-scheduled) should get SYSFLAG_USER_STOP (and clear SYSFLAG_USER_START)
+    // - scheduled jobs do not use user_stop/user_start markers
+    //
+    // IMPORTANT: we set the intent marker BEFORE issuing the stop so the subsequent exit event
+    // is reliably treated as "stopped by user" and will not auto-restart.
+    let (cfg, names): (MasterConfig, Vec<String>) = {
+        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let mut v: Vec<String> = st.defs.keys().cloned().collect();
+        v.sort();
+        (st.cfg.clone(), v)
+    };
+    if names.is_empty() {
+        return Ok(Response { ok: true, message: "no services".to_string(), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![] });
+    }
+
+    // First: only target apps that are actually running right now.
+    // This avoids "stop_all" affecting disabled/stopped apps (and keeps the counts meaningful).
+    let total = names.len();
+    let mut running: Vec<String> = vec![];
+    {
+        let mut js: JoinSet<(String, bool)> = JoinSet::new();
+        let mut pending = names.clone().into_iter();
+        let limit = 32usize;
+        for _ in 0..limit {
+            if let Some(name) = pending.next() {
+                let cfg2 = cfg.clone();
+                js.spawn(async move {
+                    let is_running = cgroup_running_async(&cfg2, &name).await.unwrap_or(false);
+                    (name, is_running)
+                });
+            }
+        }
+        while let Some(res) = js.join_next().await {
+            if let Ok((name, is_running)) = res {
+                if is_running {
+                    running.push(name);
+                }
+                if let Some(next) = pending.next() {
+                    let cfg2 = cfg.clone();
+                    js.spawn(async move {
+                        let is_running = cgroup_running_async(&cfg2, &next).await.unwrap_or(false);
+                        (next, is_running)
+                    });
+                }
+            }
+        }
+    }
+    running.sort();
+    let skipped = total.saturating_sub(running.len());
+    if running.is_empty() {
+        return Ok(Response {
+            ok: true,
+            message: format!("stop_all: no running apps (skipped_not_running={skipped})"),
+            restarted: vec![],
+            statuses: vec![],
+            events: vec![],
+            admin_actions: vec![],
+        });
+    }
+
+    // Apply operator intent markers for running apps up-front (including cron jobs).
+    // Also clear FAILED/BACKOFF suppression so the UI state is clean after an operator intervention.
+    {
+        let (run_info, _defs) = {
+            let st = state.lock().unwrap_or_else(|p| p.into_inner());
+            (Arc::clone(&st.run_info), st.defs.clone())
+        };
+        let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+        for name in &running {
+            let e = ri.entry(name.clone()).or_default();
+            sysflag_set_with_rules(name, &mut e.system_flags, SYSFLAG_USER_STOP, None);
+            e.recent_system_crashes_ms.clear();
+        }
+    }
+
+    let mut js: JoinSet<(String, bool, String)> = JoinSet::new();
+    let mut pending = running.into_iter();
+    let limit = 16usize;
+
+    for _ in 0..limit {
+        if let Some(name) = pending.next() {
+            let st2 = Arc::clone(state);
+            js.spawn(async move {
+                match shutdown_stop_via_supervisor_async(&st2, &name).await {
+                    Ok(()) => (name, true, String::new()),
+                    Err(e) => (name, false, e.to_string()),
+                }
+            });
+        }
+    }
+
+    let mut ok = 0usize;
+    let mut fail = 0usize;
+    let mut failures: Vec<String> = vec![];
+    while let Some(res) = js.join_next().await {
+        if let Ok((name, is_ok, msg)) = res {
+            if is_ok {
+                ok += 1;
+            } else {
+                // Stop failed: revert the pre-set operator stop marker for services, so we don't leave a stale
+                // "stopped by user" intent on a still-running service.
+                {
+                    let (run_info, _defs) = {
+                        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+                        (Arc::clone(&st.run_info), st.defs.clone())
+                    };
+                    let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(entry) = ri.get_mut(&name) {
+                        sysflag_clear(&mut entry.system_flags, SYSFLAG_USER_STOP);
+                    }
+                }
+                fail += 1;
+                failures.push(format!("{name}: {msg}"));
+            }
+            if let Some(next) = pending.next() {
+                let st2 = Arc::clone(state);
+                js.spawn(async move {
+                    match shutdown_stop_via_supervisor_async(&st2, &next).await {
+                        Ok(()) => (next, true, String::new()),
+                        Err(e) => (next, false, e.to_string()),
+                    }
+                });
+            }
+        }
+    }
+
+    failures.sort();
+    let mut message = format!("stop_all done: {ok} ok, {fail} failed. skipped_not_running={skipped}");
+    if !failures.is_empty() {
+        let cap = 20usize;
+        let shown = failures.iter().take(cap).cloned().collect::<Vec<_>>().join("\n");
+        let more = if failures.len() > cap { format!("\n…(+{})", failures.len() - cap) } else { "".to_string() };
+        message.push_str("\n");
+        message.push_str(&shown);
+        message.push_str(&more);
+    }
+    Ok(Response { ok: fail == 0, message, restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![] })
+}
+
+async fn do_restart_all_async(state: &Arc<Mutex<DaemonState>>, force: bool) -> anyhow::Result<Response> {
+    // Server-side bulk op for the web UI: restart all enabled non-scheduled services.
+    let names: Vec<String> = {
+        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let mut v: Vec<String> = st
+            .defs
+            .iter()
+            .filter(|(_n, d)| d.enabled && d.schedule.is_none())
+            .map(|(n, _)| n.clone())
+            .collect();
+        v.sort();
+        v
+    };
+    if names.is_empty() {
+        return Ok(Response { ok: true, message: "no enabled services to restart".to_string(), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![] });
+    }
+
+    let mut js: JoinSet<(String, bool, String)> = JoinSet::new();
+    let mut pending = names.into_iter();
+    let limit = 16usize;
+
+    for _ in 0..limit {
+        if let Some(name) = pending.next() {
+            let st2 = Arc::clone(state);
+            js.spawn(async move {
+                let r = do_restart_async(&st2, &name, force).await;
+                match r {
+                    Ok(resp) => (name, resp.ok, resp.message),
+                    Err(e) => (name, false, e.to_string()),
+                }
+            });
+        }
+    }
+
+    let mut ok = 0usize;
+    let mut fail = 0usize;
+    let mut failures: Vec<String> = vec![];
+    while let Some(res) = js.join_next().await {
+        if let Ok((name, is_ok, msg)) = res {
+            if is_ok { ok += 1; } else { fail += 1; failures.push(format!("{name}: {msg}")); }
+            if let Some(next) = pending.next() {
+                let st2 = Arc::clone(state);
+                js.spawn(async move {
+                    let r = do_restart_async(&st2, &next, force).await;
+                    match r {
+                        Ok(resp) => (next, resp.ok, resp.message),
+                        Err(e) => (next, false, e.to_string()),
+                    }
+                });
+            }
+        }
+    }
+
+    failures.sort();
+    let mut message = format!("restart_all done: {ok} ok, {fail} failed.");
+    if !failures.is_empty() {
+        let cap = 20usize;
+        let shown = failures.iter().take(cap).cloned().collect::<Vec<_>>().join("\n");
+        let more = if failures.len() > cap { format!("\n…(+{})", failures.len() - cap) } else { "".to_string() };
+        message.push_str("\n");
+        message.push_str(&shown);
+        message.push_str(&more);
+    }
+    Ok(Response { ok: fail == 0, message, restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![] })
 }
 
 fn parse_flag_ttl_ms(spec: &str) -> anyhow::Result<u64> {
@@ -3063,6 +3981,7 @@ fn do_flag(state: &Arc<Mutex<DaemonState>>, name: &str, flags: &[String], ttl: O
         restarted: vec![],
         statuses: vec![],
         events: vec![],
+        admin_actions: vec![],
     })
 }
 
@@ -3114,6 +4033,7 @@ fn do_unflag(state: &Arc<Mutex<DaemonState>>, name: &str, flags: &[String]) -> a
         restarted: vec![],
         statuses: vec![],
         events: vec![],
+        admin_actions: vec![],
     })
 }
 
@@ -3320,24 +4240,21 @@ fn do_status(state: &Arc<Mutex<DaemonState>>, name: Option<&str>) -> anyhow::Res
                     .min(u32::MAX as usize) as u32
             };
             let user_flags: Vec<String> = info.user_flags.keys().cloned().collect();
-            let system_flags: Vec<String> = info.system_flags.keys().map(|k| k.to_string()).collect();
-            let desired_state = if !def.enabled {
-                DesiredState::Stopped
-            } else if def.schedule.is_some() {
-                DesiredState::Scheduled
-            } else {
-                info.desired
-            };
-            let desired = match desired_state {
-                DesiredState::Running => "RUNNING",
-                DesiredState::Stopped => "STOPPED",
-                DesiredState::Scheduled => "SCHEDULED",
-            }
-            .to_string();
+            let is_running_now = !pids.is_empty();
+            let system_flags: Vec<String> = info
+                .system_flags
+                .keys()
+                .copied()
+                .filter(|k| match (is_running_now, k.scope()) {
+                    (true, FlagScope::Running | FlagScope::Both) => true,
+                    (false, FlagScope::Stopped | FlagScope::Both) => true,
+                    _ => false,
+                })
+                .map(|k| k.to_string())
+                .collect();
             let actual = if pids.is_empty() { "STOPPED" } else { "RUNNING" }.to_string();
 
             let phase = {
-                let desired = desired_state;
                 let actual_running = !pids.is_empty();
                 let oldest_uptime_ms: i64 = pid_uptimes_ms
                     .iter()
@@ -3346,39 +4263,27 @@ fn do_status(state: &Arc<Mutex<DaemonState>>, name: Option<&str>) -> anyhow::Res
                     .max()
                     .unwrap_or(0);
 
-                // Derive phase from desired/actual/flags + probation window.
+                // Derive phase from actual/flags + probation window.
                 if actual_running {
-                    match desired {
-                        DesiredState::Stopped => Phase::Stopping.to_string(),
-                        DesiredState::Scheduled => Phase::Running.to_string(), // scheduled tasks are allowed to run; not a transition
-                        DesiredState::Running => {
-                            // STARTING/RESTARTING until the oldest PID is >= 10s.
-                            if oldest_uptime_ms < 10_000 {
-                                if info.last_start_kind.as_deref() == Some("restart") {
-                                    Phase::Restarting.to_string()
-                                } else {
-                                    Phase::Starting.to_string()
-                                }
-                            } else {
-                                Phase::Running.to_string()
-                            }
+                    // STARTING/RESTARTING until the oldest PID is >= 10s.
+                    if oldest_uptime_ms < 10_000 {
+                        if info.last_start_kind.as_deref() == Some("restart") {
+                            Phase::Restarting.to_string()
+                        } else {
+                            Phase::Starting.to_string()
                         }
+                    } else {
+                        Phase::Running.to_string()
                     }
                 } else {
-                    match desired {
-                        // When desired is STOPPED, we intentionally show STOPPED regardless of flags.
-                        // Flags like FAILED/BACKOFF are only meaningful when desired=RUNNING.
-                        DesiredState::Stopped => Phase::Stopped.to_string(),
-                        DesiredState::Scheduled => Phase::Stopped.to_string(),
-                        DesiredState::Running => {
-                            if sysflag_has(&info.system_flags, SystemFlag::Backoff) {
-                                Phase::Backoff.to_string()
-                            } else if sysflag_has(&info.system_flags, SystemFlag::Failed) {
-                                Phase::Failed.to_string()
-                            } else {
-                                Phase::Stopped.to_string()
-                            }
-                        }
+                    if !def.enabled || sysflag_has(&info.system_flags, SYSFLAG_USER_STOP) {
+                        Phase::Stopped.to_string()
+                    } else if sysflag_has(&info.system_flags, SystemFlag::Backoff) {
+                        Phase::Backoff.to_string()
+                    } else if sysflag_has(&info.system_flags, SystemFlag::Failed) {
+                        Phase::Failed.to_string()
+                    } else {
+                        Phase::Stopped.to_string()
                     }
                 }
             };
@@ -3386,7 +4291,6 @@ fn do_status(state: &Arc<Mutex<DaemonState>>, name: Option<&str>) -> anyhow::Res
                 application: app.clone(),
                 enabled: def.enabled,
                 running: !pids.is_empty(),
-                desired,
                 actual,
                 phase,
                 restarts_10m,
@@ -3394,12 +4298,25 @@ fn do_status(state: &Arc<Mutex<DaemonState>>, name: Option<&str>) -> anyhow::Res
                 user_flags,
                 pids,
                 pid_uptimes_ms,
+                working_directory: Some(def.working_directory.display().to_string()),
+                provisioning_marker: if def.provisioning.is_empty() {
+                    None
+                } else {
+                    Some(def.working_directory.join(".pm_provisioned").display().to_string())
+                },
+                provisioning_defined: !def.provisioning.is_empty(),
+                provisioning_marker_exists: !def.provisioning.is_empty()
+                    && def.working_directory.join(".pm_provisioned").exists(),
                 source_file: def
                     .source_file
                     .as_ref()
                     .map(|p| p.display().to_string()),
                 last_run_at_ms,
                 last_exit_code,
+                schedule: def.schedule.clone(),
+                schedule_not_before_ms: def.schedule_not_before_ms,
+                schedule_not_after_ms: def.schedule_not_after_ms,
+                schedule_max_time_per_run_ms: def.schedule_max_time_per_run_ms,
             });
         }
         v
@@ -3413,6 +4330,7 @@ fn do_status(state: &Arc<Mutex<DaemonState>>, name: Option<&str>) -> anyhow::Res
         restarted: vec![],
         statuses: entries,
         events: vec![],
+        admin_actions: vec![],
     })
 }
 
@@ -3563,46 +4481,8 @@ fn spawn_launcher_child(cfg: &MasterConfig, def: &AppDefinition) -> anyhow::Resu
     }
 
     // processmaster is now self-contained: we launch directly and self-attach into the app cgroup.
-    let cgroup_dir = app_cgroup_dir(cfg, &def.application);
-    let mut lp = cgroup::LaunchParams::new(
-        argv.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        def.working_directory.clone(),
-        cgroup_dir,
-    );
-
-    // Preserve existing semantics: only attempt privilege drop if we're root; otherwise ignore.
-    if geteuid().is_root() {
-        lp.user = def.user.clone();
-        lp.group = def.group.clone();
-    }
-
-    // Optional argv0 decoration: sleep[app]
-    lp.argv0_decoration_group = Some(def.application.clone());
-
-    // Resources (best-effort).
-    if let Some(cpu) = def.max_cpu.as_deref() {
-        // "MAX" means no cpu limit.
-        if !cpu.trim().eq_ignore_ascii_case("max") {
-            let mc = parse_cpu_millicores(cpu)?;
-            let period: u64 = 100_000;
-            let quota = (period * mc) / 1000;
-            lp.resources.cpu_max = Some(format!("{quota} {period}"));
-        }
-    }
-    if let Some(mem) = def.max_memory.as_deref() {
-        // Keep existing normalizer behavior for now; it already supports MAX and size suffixes.
-        lp.resources.memory_max = Some(to_mem_max_string(&normalize_memory_string(mem)?)?.trim().to_string());
-        // to_mem_max_string returns content with newline; trim it.
-    }
-    lp.resources.swap_max = Some(to_mem_max_string(&normalize_swap_string(def.max_swap.as_deref())?)?.trim().to_string());
-
-    // Environment: support user-specified indirections (@file/@base64/@hex) but otherwise set directly.
-    for ev in &def.environment {
-        validate_env_name(&ev.name)?;
-        let v = decode_env_value(&ev.value)
-            .with_context(|| format!("decode environment value app={} name={}", def.application, ev.name))?;
-        lp.environment.push((ev.name.clone().into(), v));
-    }
+    // Keep the start/stop launch path consistent by using the shared LaunchParams builder.
+    let lp = build_launch_params_for_app(cfg, def, &argv, Some(def.application.clone()))?;
 
     let mut cmd = cgroup::build_command(&lp)
         .with_context(|| format!("build command app={} cgroup_dir={}", def.application, lp.cgroup_dir.display()))?;
@@ -3621,6 +4501,195 @@ fn spawn_launcher_child(cfg: &MasterConfig, def: &AppDefinition) -> anyhow::Resu
         spawn_log_pump_stderr_async(def.clone(), stderr_path.clone(), s);
     }
     Ok(child)
+}
+
+fn maybe_provision_workdir(def: &AppDefinition) -> anyhow::Result<()> {
+    if def.provisioning.is_empty() {
+        return Ok(());
+    }
+    let marker = def.working_directory.join(".pm_provisioned");
+    if marker.exists() {
+        pm_event(
+            "provision",
+            Some(&def.application),
+            format!("decision=skip reason=marker_exists marker={}", marker.display()),
+        );
+        return Ok(());
+    }
+    pm_event(
+        "provision",
+        Some(&def.application),
+        format!(
+            "decision=attempt marker_missing marker={} workdir={} entries={}",
+            marker.display(),
+            def.working_directory.display(),
+            def.provisioning.len()
+        ),
+    );
+
+    pm_event(
+        "provision",
+        Some(&def.application),
+        format!("decision=run reason=marker_missing marker={}", marker.display()),
+    );
+
+    // If we need root-only actions, fail fast with a clear error.
+    if !geteuid().is_root() {
+        for p in &def.provisioning {
+            let wants_chown = p
+                .ownership
+                .as_ref()
+                .map(|o| o.owner.as_ref().is_some() || o.group.as_ref().is_some())
+                .unwrap_or(false);
+            if wants_chown || p.add_net_bind_capability {
+                anyhow::bail!(
+                    "service {} provisioning requires root for ownership/capabilities (pm is not root)",
+                    def.application
+                );
+            }
+        }
+    }
+
+    for (idx, p) in def.provisioning.iter().enumerate() {
+        let target = resolve_under_workdir(&def.working_directory, &p.path);
+
+        // If the target doesn't exist, create it only when it looks like a directory provisioning action.
+        if !target.exists() {
+            if p.add_net_bind_capability {
+                anyhow::bail!(
+                    "service {} provisioning[{}]: target {} does not exist (needed for setcap)",
+                    def.application,
+                    idx,
+                    target.display()
+                );
+            }
+            fs::create_dir_all(&target).map_err(|e| {
+                anyhow::anyhow!(
+                    "service {} provisioning[{}]: failed to create directory {}: {e}",
+                    def.application,
+                    idx,
+                    target.display()
+                )
+            })?;
+        }
+
+        // Ownership (optional)
+        if let Some(own) = p.ownership.as_ref() {
+            let uid_opt: Option<Uid> = match own.owner.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(s) => {
+                    if let Ok(n) = s.parse::<u32>() {
+                        Some(Uid::from_raw(n))
+                    } else {
+                        let usr = get_user_by_name(s).ok_or_else(|| anyhow::anyhow!("unknown user: {s}"))?;
+                        Some(Uid::from_raw(usr.uid()))
+                    }
+                }
+            };
+            let gid_opt: Option<Gid> = match own.group.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(s) => {
+                    if let Ok(n) = s.parse::<u32>() {
+                        Some(Gid::from_raw(n))
+                    } else {
+                        let grp = get_group_by_name(s).ok_or_else(|| anyhow::anyhow!("unknown group: {s}"))?;
+                        Some(Gid::from_raw(grp.gid()))
+                    }
+                }
+            };
+            if uid_opt.is_some() || gid_opt.is_some() {
+                if own.recursive {
+                    chown_recursive(&target, uid_opt, gid_opt)
+                        .with_context(|| format!("service {} provisioning[{}]: chown_recursive {}", def.application, idx, target.display()))?;
+                } else {
+                    chown(&target, uid_opt, gid_opt).map_err(|e| {
+                        anyhow::anyhow!(
+                            "service {} provisioning[{}]: chown failed for {}: {e}",
+                            def.application,
+                            idx,
+                            target.display()
+                        )
+                    })?;
+                }
+            }
+        }
+
+        // Mode (optional; non-recursive)
+        if let Some(mode) = p.mode {
+            let perm = std::fs::Permissions::from_mode(mode);
+            fs::set_permissions(&target, perm).map_err(|e| {
+                anyhow::anyhow!(
+                    "service {} provisioning[{}]: chmod {:o} failed for {}: {e}",
+                    def.application,
+                    idx,
+                    mode,
+                    target.display()
+                )
+            })?;
+        }
+
+        // Capabilities (optional)
+        if p.add_net_bind_capability {
+            let status = Command::new("setcap")
+                .arg("cap_net_bind_service=+ep")
+                .arg(&target)
+                .status()
+                .map_err(|e| anyhow::anyhow!("service {} provisioning[{}]: setcap exec failed: {e}", def.application, idx))?;
+            if !status.success() {
+                anyhow::bail!(
+                    "service {} provisioning[{}]: setcap failed for {} (status={status})",
+                    def.application,
+                    idx,
+                    target.display()
+                );
+            }
+        }
+
+        pm_event(
+            "provision",
+            Some(&def.application),
+            format!("effect=applied idx={idx} target={}", target.display()),
+        );
+    }
+
+    fs::write(
+        &marker,
+        format!("provisioned_at_ms={}\n", Local::now().timestamp_millis()),
+    )
+    .map_err(|e| anyhow::anyhow!("service {}: failed to write marker {}: {e}", def.application, marker.display()))?;
+
+    pm_event(
+        "provision",
+        Some(&def.application),
+        format!("decision=done marker={}", marker.display()),
+    );
+    Ok(())
+}
+
+fn chown_recursive(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> anyhow::Result<()> {
+    // Apply to root itself
+    chown(root, uid, gid).map_err(|e| anyhow::anyhow!("chown failed for {}: {e}", root.display()))?;
+    let md = fs::symlink_metadata(root)?;
+    if !md.is_dir() {
+        return Ok(());
+    }
+    fn walk(path: &Path, uid: Option<Uid>, gid: Option<Gid>) -> anyhow::Result<()> {
+        for ent in fs::read_dir(path)? {
+            let ent = ent?;
+            let p = ent.path();
+            let md = fs::symlink_metadata(&p)?;
+            if md.file_type().is_symlink() {
+                // Do not follow symlinks (avoid loops / unexpected ownership changes).
+                continue;
+            }
+            chown(&p, uid, gid).map_err(|e| anyhow::anyhow!("chown failed for {}: {e}", p.display()))?;
+            if md.is_dir() {
+                walk(&p, uid, gid)?;
+            }
+        }
+        Ok(())
+    }
+    walk(root, uid, gid)
 }
 
 async fn open_append_log_async(path: &Path) -> anyhow::Result<tokio::fs::File> {
@@ -3983,42 +5052,55 @@ fn stop_common(
             anyhow::bail!("stop_command for {name} is empty");
         }
         let status = match run_stop_command_in_context(cfg, def, name, argv, stop_deadline) {
-            Ok(s) => s,
+            Ok(s) => Some(s),
             Err(e) => {
-                // Stop command didn't finish before the overall stop deadline.
-                log(format!(
-                    "outcome=stop_command_timeout stop_deadline_ms={} decision=kill-all err={e}",
-                    def.stop_grace_period_ms
-                ));
-                // Fall through to kill-all below.
-                // (We intentionally do not try to keep waiting; we've hit the fixed deadline.)
-                let _ = e;
-                // Force-kill everything left in the cgroup, including the stop command itself.
-                launcher_kill_all(cfg, name)?;
-                if !wait_until_empty(cfg, name, Duration::from_millis(3000)) && cgroup_running(cfg, name)? {
-                    let pids = launcher_pids(cfg, name).unwrap_or_default();
-                    log(format!("outcome=kill-all_failed remaining_pids={}", pids.len()));
-                    anyhow::bail!("{name}: still running after kill-all");
+                // IMPORTANT: do not treat all errors as "timeout". Only a real timeout should go straight to kill-all.
+                let es = e.to_string();
+                if es.contains("stop_command_timeout") {
+                    log(format!(
+                        "outcome=stop_command_timeout stop_deadline_ms={} decision=kill-all",
+                        def.stop_grace_period_ms
+                    ));
+                    // Force-kill everything left in the cgroup, including the stop command itself.
+                    launcher_kill_all(cfg, name)?;
+                    if !wait_until_empty(cfg, name, Duration::from_millis(3000)) && cgroup_running(cfg, name)? {
+                        let pids = launcher_pids(cfg, name).unwrap_or_default();
+                        log(format!("outcome=kill-all_failed remaining_pids={}", pids.len()));
+                        anyhow::bail!("{name}: still running after kill-all");
+                    }
+                    log("outcome=stopped".to_string());
+                    return Ok(StopResult::Stopped);
                 }
-                log("outcome=stopped".to_string());
-                return Ok(StopResult::Stopped);
+
+                // Spawn/chdir/permission/etc failure: fall back to signal+grace instead of kill-all immediately.
+                log(format!("outcome=stop_command_error elapsed_ms={} fallback=signal err={e}", t0.elapsed().as_millis()));
+                let sig_s = def.stop_signal.as_deref().unwrap_or("SIGTERM");
+                let sig = parse_signal(sig_s)?;
+                log(format!("attempt=signal sig={} sig_num={}", sig_s, sig as i32));
+                launcher_kill_signal(cfg, name, sig_s)?;
+                log("outcome=signal_sent".to_string());
+                None
             }
         };
         let elapsed_ms = t0.elapsed().as_millis();
-        if !status.success() {
-            let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "-".to_string());
-            log(format!(
-                "outcome=stop_command_failed exit_code={} elapsed_ms={} fallback=signal",
-                code, elapsed_ms
-            ));
-            let sig_s = def.stop_signal.as_deref().unwrap_or("SIGTERM");
-            let sig = parse_signal(sig_s)?;
-            log(format!("attempt=signal sig={} sig_num={}", sig_s, sig as i32));
-            launcher_kill_signal(cfg, name, def.stop_signal.as_deref().unwrap_or("SIGTERM"))?;
-            log("outcome=signal_sent".to_string());
+        if let Some(status) = status {
+            if !status.success() {
+                let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "-".to_string());
+                log(format!(
+                    "outcome=stop_command_failed exit_code={} elapsed_ms={} fallback=signal",
+                    code, elapsed_ms
+                ));
+                let sig_s = def.stop_signal.as_deref().unwrap_or("SIGTERM");
+                let sig = parse_signal(sig_s)?;
+                log(format!("attempt=signal sig={} sig_num={}", sig_s, sig as i32));
+                launcher_kill_signal(cfg, name, def.stop_signal.as_deref().unwrap_or("SIGTERM"))?;
+                log("outcome=signal_sent".to_string());
+            } else {
+                let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "0".to_string());
+                log(format!("outcome=stop_command_ok exit_code={} elapsed_ms={}", code, elapsed_ms));
+            }
         } else {
-            let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "0".to_string());
-            log(format!("outcome=stop_command_ok exit_code={} elapsed_ms={}", code, elapsed_ms));
+            // stop_command_error path already logged fallback to signal
         }
     } else {
         let sig_s = def.stop_signal.as_deref().unwrap_or("SIGTERM");
@@ -4064,59 +5146,18 @@ fn stop_common(
     Ok(StopResult::Stopped)
 }
 
-fn stop_one(state: &Arc<Mutex<DaemonState>>, name: &str) -> anyhow::Result<StopResult> {
-    let (cfg, def) = {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
-        let cfg = st.cfg.clone();
-        let def = st
-            .defs
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("unknown service: {name}"))?
-            .clone();
-        (cfg, def)
-    };
-
-    let events = {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
-        Arc::clone(&st.events)
-    };
-    let run_info = {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
-        Arc::clone(&st.run_info)
-    };
-
-    // Desired state for stop.
-    {
-        let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
-        let e = ri.entry(name.to_string()).or_default();
-        e.desired = DesiredState::Stopped;
-        sysflag_clear(&mut e.system_flags, SystemFlag::Backoff);
-    }
-
-    // If it's already stopped, don't move into STOPPING (avoids getting "stuck" when stopping `all`).
-    if !cgroup_running(&cfg, name).unwrap_or(false) {
-        set_phase_and_emit(&run_info, &events, name, Phase::Stopped, "stop_noop_already_stopped");
-        return Ok(StopResult::AlreadyStopped);
-    }
-
-    // Phase transition: STOPPING (until cgroup becomes empty or kill-all completes).
-    set_phase_and_emit(&run_info, &events, name, Phase::Stopping, "stop_requested");
-    let r = stop_common(Some(&events), &cfg, &def, name)?;
-    // Ensure we end in STOPPED even if it was already stopped by the time we acted.
-    if matches!(r, StopResult::Stopped | StopResult::AlreadyStopped) {
-        set_phase_and_emit(&run_info, &events, name, Phase::Stopped, "stop_completed");
-    }
-    Ok(r)
-}
-
 fn resources_for_app(def: &AppDefinition) -> anyhow::Result<cgroup::Resources> {
     let mut r = cgroup::Resources::default();
 
     if let Some(cpu) = def.max_cpu.as_deref() {
-        let mc = parse_cpu_millicores(cpu)?;
-        let period: u64 = 100_000;
-        let quota = (period * mc) / 1000;
-        r.cpu_max = Some(format!("{quota} {period}"));
+        // Keep semantics consistent with start path: "MAX" means no cpu limit.
+        let t = cpu.trim();
+        if !t.is_empty() && !t.eq_ignore_ascii_case("max") {
+            let mc = parse_cpu_millicores(t)?;
+            let period: u64 = 100_000;
+            let quota = (period * mc) / 1000;
+            r.cpu_max = Some(format!("{quota} {period}"));
+        }
     }
     if let Some(mem) = def.max_memory.as_deref() {
         // Reuse existing parsing rules (MAX and size suffixes).
@@ -4128,6 +5169,39 @@ fn resources_for_app(def: &AppDefinition) -> anyhow::Result<cgroup::Resources> {
     Ok(r)
 }
 
+fn build_launch_params_for_app(
+    cfg: &MasterConfig,
+    def: &AppDefinition,
+    argv: &[String],
+    argv0_group: Option<String>,
+) -> anyhow::Result<cgroup::LaunchParams> {
+    anyhow::ensure!(!argv.is_empty(), "argv is empty");
+    let cgroup_dir = app_cgroup_dir(cfg, &def.application);
+    let mut lp = cgroup::LaunchParams::new(argv.to_vec(), def.working_directory.clone(), cgroup_dir);
+
+    // Same user/group as the app, when possible.
+    if geteuid().is_root() {
+        lp.user = def.user.clone();
+        lp.group = def.group.clone();
+    }
+
+    // Optional argv0 decoration.
+    lp.argv0_decoration_group = argv0_group;
+
+    // Environment: support user-specified indirections (@file/@base64/@hex).
+    for ev in &def.environment {
+        validate_env_name(&ev.name)?;
+        let v = decode_env_value(&ev.value)
+            .with_context(|| format!("decode environment value app={} name={}", def.application, ev.name))?;
+        lp.environment.push((ev.name.clone().into(), v));
+    }
+
+    // Resources (best-effort).
+    lp.resources = resources_for_app(def)?;
+
+    Ok(lp)
+}
+
 fn run_stop_command_in_context(
     cfg: &MasterConfig,
     def: &AppDefinition,
@@ -4137,32 +5211,7 @@ fn run_stop_command_in_context(
 ) -> anyhow::Result<std::process::ExitStatus> {
     // Run stop_command in the *same* app cgroup: on timeout/escalation we want `cgroup.kill`
     // to kill everything, including a stuck stop helper.
-    let cgroup_dir = app_cgroup_dir(cfg, &def.application);
-    let mut lp = cgroup::LaunchParams::new(
-        argv.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        def.working_directory.clone(),
-        cgroup_dir,
-    );
-
-    // Same env decoding behavior as start.
-    for ev in &def.environment {
-        validate_env_name(&ev.name)?;
-        let v = decode_env_value(&ev.value)
-            .with_context(|| format!("decode environment value app={} name={}", def.application, ev.name))?;
-        lp.environment.push((ev.name.clone().into(), v));
-    }
-
-    // The command will run under the app cgroup limits automatically. Best-effort also
-    // re-apply the same knobs (harmless if already set).
-    lp.resources = resources_for_app(def)?;
-
-    // Same user/group as the app, when possible.
-    if geteuid().is_root() {
-        lp.user = def.user.clone();
-        lp.group = def.group.clone();
-    }
-
-    lp.argv0_decoration_group = Some(format!("{name}.stop"));
+    let lp = build_launch_params_for_app(cfg, def, argv, Some(format!("{name}.stop")))?;
 
     let mut cmd = cgroup::build_command(&lp)?;
     // Stop command output:
@@ -4262,25 +5311,20 @@ fn spawn_supervisor_thread(
         let mut def = def0;
         let app = def.application.clone();
 
-        // Desired state lives in run_info for status. For scheduled jobs, desired is always SCHEDULED.
-        // For services, desired follows the last explicit command, but is initialized from config.
-        {
-            let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
-            let e = ri.entry(app.clone()).or_default();
-            e.desired = if def.schedule.is_some() {
-                DesiredState::Scheduled
-            } else if def.enabled {
-                DesiredState::Running
-            } else {
-                DesiredState::Stopped
-            };
-        }
+        // No separate "desired" state; operator intent is represented via user flags.
 
         let mut restart_times: VecDeque<Instant> = VecDeque::new();
         let mut waiter_running = false;
         let mut waiter_epoch: u64 = 0;
         let mut waiter_cancel: Option<Arc<AtomicBool>> = None;
         let mut pending_failure_restart_at: Option<Instant> = None;
+
+        fn cancel_waiter(waiter_running: &mut bool, waiter_cancel: &mut Option<Arc<AtomicBool>>) {
+            *waiter_running = false;
+            if let Some(c) = waiter_cancel.take() {
+                c.store(true, Ordering::Relaxed);
+            }
+        }
 
         async fn wait_for_cgroup_nonempty(cfg: &MasterConfig, app: &str, timeout: Duration) -> bool {
             let deadline = Instant::now() + timeout;
@@ -4382,43 +5426,22 @@ fn spawn_supervisor_thread(
             match cmd {
                 SupervisorCmd::Update { def: new_def } => {
                     def = new_def;
-                    // Keep desired consistent with config shape changes.
-                    let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
-                    let e = ri.entry(app.clone()).or_default();
-                    e.desired = if def.schedule.is_some() {
-                        DesiredState::Scheduled
-                    } else if def.enabled {
-                        e.desired // preserve last explicit desired for services
-                    } else {
-                        DesiredState::Stopped
-                    };
                 }
                 SupervisorCmd::ManualStart { force, resp } => {
+                    // Track "last start attempt" for any accepted start command (even if already running).
+                    record_start_attempt_in_store(&run_info, &app);
                     // Manual start clears FAILED/BACKOFF suppression.
                     restart_times.clear();
                     pending_failure_restart_at = None;
-                    {
-                        let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
-                        let e = ri.entry(app.clone()).or_default();
-                        sysflag_clear(&mut e.system_flags, SystemFlag::Failed);
-                        sysflag_clear(&mut e.system_flags, SystemFlag::Backoff);
-                        e.recent_system_crashes_ms.clear();
-                    }
 
                     if !force && !def.enabled {
                         let _ = resp.send(Err(anyhow::anyhow!("service {app} is disabled")));
                         continue;
                     }
 
-                    // Services: desired becomes RUNNING. Scheduled jobs remain SCHEDULED.
-                    if def.schedule.is_none() {
-                        let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
-                        let e = ri.entry(app.clone()).or_default();
-                        e.desired = DesiredState::Running;
-                    }
-
                     // If already running, just ensure waiter and return OK.
                     if cgroup_running_async(&cfg, &app).await.unwrap_or(false) {
+                        // No-op: starting an already running service should not change intent markers or other flags.
                         ensure_waiter_attached(
                             &cfg,
                             &app,
@@ -4433,15 +5456,46 @@ fn spawn_supervisor_thread(
                         continue;
                     }
 
+                    // Not running: this manual start will actually start it, so mark operator intent.
+                    // Clear crash history on accepted manual start attempts.
+                    {
+                        let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+                        let e = ri.entry(app.clone()).or_default();
+                        e.recent_system_crashes_ms.clear();
+                    }
+
                     set_phase_and_emit(&run_info, &events, &app, Phase::Starting, "manual_start");
-                    record_start_attempt_in_store(&run_info, &app);
                     let cfg2 = cfg.clone();
                     let def2 = def.clone();
                     let spawn_r = tasks()
                         .spawn_blocking(move || spawn_launcher_child(&cfg2, &def2))
                         .await
                         .map_err(|e| anyhow::anyhow!("join error: {e}"));
-                    if let Err(e) = spawn_r {
+                    let child_r = match spawn_r {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = resp.send(Err(e));
+                            continue;
+                        }
+                    };
+                    if def.schedule.is_some() {
+                        // For scheduled jobs, we want a real exit code. Attach a process waiter to the spawned child.
+                        // This replaces the cgroup-only waiter (which cannot provide an exit status).
+                        let child = match child_r {
+                            Ok(c) => c,
+                            Err(e) => {
+                                let _ = resp.send(Err(e));
+                                continue;
+                            }
+                        };
+                        waiter_epoch = waiter_epoch.wrapping_add(1);
+                        if let Some(c) = waiter_cancel.take() {
+                            c.store(true, Ordering::Relaxed);
+                        }
+                        waiter_running = true;
+                        waiter_cancel = None;
+                        let _ = spawn_process_waiter(child, &tx_self, waiter_epoch);
+                    } else if let Err(e) = child_r {
                         let _ = resp.send(Err(e));
                         continue;
                     }
@@ -4450,37 +5504,77 @@ fn spawn_supervisor_thread(
                         {
                             let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
                             let e = ri.entry(app.clone()).or_default();
-                            sysflag_set(&mut e.system_flags, SystemFlag::Failed, None);
+                            sysflag_set_with_rules(&app, &mut e.system_flags, SystemFlag::Failed, None);
                         }
                         set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "manual_start_timeout");
                         let _ = resp.send(Err(anyhow::anyhow!("{app}: start timeout (cgroup stayed empty)")));
                         continue;
                     }
-                    record_started_in_store(&run_info, &app, StartKind::Start);
-                    ensure_waiter_attached(
-                        &cfg,
-                        &app,
-                        &tx_self,
-                        &mut waiter_running,
-                        &mut waiter_epoch,
-                        &mut waiter_cancel,
-                        &events,
-                    )
-                    .await;
+                    record_started_in_store(&run_info, &app, StartKind::Start, SYSFLAG_USER_START);
+                    if def.schedule.is_none() {
+                        ensure_waiter_attached(
+                            &cfg,
+                            &app,
+                            &tx_self,
+                            &mut waiter_running,
+                            &mut waiter_epoch,
+                            &mut waiter_cancel,
+                            &events,
+                        )
+                        .await;
+                    }
                     set_phase_and_emit(&run_info, &events, &app, Phase::Running, "manual_start_completed");
                     let _ = resp.send(Ok(()));
                 }
                 SupervisorCmd::ManualStop { resp }
-                | SupervisorCmd::ShutdownStop { resp }
-                | SupervisorCmd::OverTimeStop { resp } => {
-                    // Scheduled jobs: manual/system stop is "stop now" (do not change desired).
-                    // Services: desired becomes STOPPED.
-                    if def.schedule.is_none() {
+                => {
+                    // If already stopped, do NOT update markers OR clear FAILED/BACKOFF/history.
+                    // "Stop" should be a no-op if nothing is running; keeping FAILED makes sense for failed/stopped services.
+                    if !cgroup_running_async(&cfg, &app).await.unwrap_or(false) {
+                        set_phase_and_emit(&run_info, &events, &app, Phase::Stopped, "stop_noop_already_stopped");
+                        let _ = resp.send(Ok(()));
+                        continue;
+                    }
+
+                    // Now we know it's actually running: manual stop is a real intervention.
+                    // Clear pending auto-restart state and failure suppression/history.
+                    restart_times.clear();
+                    pending_failure_restart_at = None;
+                    {
                         let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
                         let e = ri.entry(app.clone()).or_default();
-                        e.desired = DesiredState::Stopped;
-                        sysflag_clear(&mut e.system_flags, SystemFlag::Backoff);
+                        e.recent_system_crashes_ms.clear();
                     }
+
+                    // The app is actually running: now apply operator intent markers.
+                    // Manual stop: persist operator intent marker, including for cron jobs (it will clear on next start).
+                    {
+                        let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+                        let e = ri.entry(app.clone()).or_default();
+                        sysflag_set_with_rules(&app, &mut e.system_flags, SYSFLAG_USER_STOP, None);
+                    }
+
+                    set_phase_and_emit(&run_info, &events, &app, Phase::Stopping, "stop_requested");
+                    let r = exec_stop_blocking(cfg.clone(), def.clone(), app.clone(), Arc::clone(&events)).await;
+                    match r {
+                        Ok(_) => {
+                            set_phase_and_emit(&run_info, &events, &app, Phase::Stopped, "stop_completed");
+                            let _ = resp.send(Ok(()));
+                        }
+                        Err(e) => {
+                            // If the stop failed, revert the operator "stopped-by-user" marker.
+                            // We set it pre-stop to avoid auto-restart races when the exit is observed,
+                            // but if we didn't actually stop the service we must not leave a stale marker behind.
+                            let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+                            if let Some(entry) = ri.get_mut(&app) {
+                                sysflag_clear(&mut entry.system_flags, SYSFLAG_USER_STOP);
+                            }
+                            let _ = resp.send(Err(e));
+                        }
+                    }
+                }
+                SupervisorCmd::ShutdownStop { resp } => {
+                    // System stop should not persist operator intent.
                     if !cgroup_running_async(&cfg, &app).await.unwrap_or(false) {
                         set_phase_and_emit(&run_info, &events, &app, Phase::Stopped, "stop_noop_already_stopped");
                         let _ = resp.send(Ok(()));
@@ -4498,29 +5592,52 @@ fn spawn_supervisor_thread(
                         }
                     }
                 }
+                SupervisorCmd::OverTimeStop { resp } => {
+                    // Overtime stop should not persist operator intent, but does set an informational sysflag for cron jobs.
+                    if !cgroup_running_async(&cfg, &app).await.unwrap_or(false) {
+                        set_phase_and_emit(&run_info, &events, &app, Phase::Stopped, "stop_noop_already_stopped");
+                        let _ = resp.send(Ok(()));
+                        continue;
+                    }
+                    set_phase_and_emit(&run_info, &events, &app, Phase::Stopping, "stop_requested");
+                    let r = exec_stop_blocking(cfg.clone(), def.clone(), app.clone(), Arc::clone(&events)).await;
+                    match r {
+                        Ok(_) => {
+                            if def.schedule.is_some() {
+                                let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+                                let e = ri.entry(app.clone()).or_default();
+                                sysflag_set(&mut e.system_flags, SYSFLAG_OT_KILLED, None);
+                            }
+                            set_phase_and_emit(&run_info, &events, &app, Phase::Stopped, "stop_completed");
+                            let _ = resp.send(Ok(()));
+                        }
+                        Err(e) => {
+                            let _ = resp.send(Err(e));
+                        }
+                    }
+                }
                 SupervisorCmd::ManualRestart { force, resp } => {
+                    // Track "last start attempt" for restart requests (even if already running later).
+                    record_start_attempt_in_store(&run_info, &app);
                     // Manual restart clears FAILED/BACKOFF suppression.
                     restart_times.clear();
                     pending_failure_restart_at = None;
-                    {
-                        let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
-                        let e = ri.entry(app.clone()).or_default();
-                        sysflag_clear(&mut e.system_flags, SystemFlag::Failed);
-                        sysflag_clear(&mut e.system_flags, SystemFlag::Backoff);
-                        e.recent_system_crashes_ms.clear();
-                    }
                     if !force && !def.enabled {
                         let _ = resp.send(Err(anyhow::anyhow!("service {app} is disabled")));
                         continue;
                     }
-                    // Keep desired: services want RUNNING after restart; scheduled jobs stay SCHEDULED.
-                    if def.schedule.is_none() {
+                    {
                         let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
                         let e = ri.entry(app.clone()).or_default();
-                        e.desired = DesiredState::Running;
+                        e.recent_system_crashes_ms.clear();
                     }
                     // Stop step
                     if cgroup_running_async(&cfg, &app).await.unwrap_or(false) {
+                        // IMPORTANT: during manual restart we intentionally stop the cgroup.
+                        // The existing waiter is "wait until cgroup empty" and would report this as an exit event,
+                        // which can race and be interpreted as a crash after restart. Invalidate it before stopping.
+                        waiter_epoch = waiter_epoch.wrapping_add(1);
+                        cancel_waiter(&mut waiter_running, &mut waiter_cancel);
                         set_phase_and_emit(&run_info, &events, &app, Phase::Stopping, "manual_restart_stop");
                         if let Err(e) = exec_stop_blocking(cfg.clone(), def.clone(), app.clone(), Arc::clone(&events)).await {
                             set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "manual_restart_stop_error");
@@ -4544,14 +5661,35 @@ fn spawn_supervisor_thread(
                         continue;
                     }
                     set_phase_and_emit(&run_info, &events, &app, Phase::Restarting, "manual_restart_start");
-                    record_start_attempt_in_store(&run_info, &app);
                     let cfg2 = cfg.clone();
                     let def2 = def.clone();
                     let spawn_r = tasks()
                         .spawn_blocking(move || spawn_launcher_child(&cfg2, &def2))
                         .await
                         .map_err(|e| anyhow::anyhow!("join error: {e}"));
-                    if let Err(e) = spawn_r {
+                    let child_r = match spawn_r {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = resp.send(Err(e));
+                            continue;
+                        }
+                    };
+                    if def.schedule.is_some() {
+                        let child = match child_r {
+                            Ok(c) => c,
+                            Err(e) => {
+                                let _ = resp.send(Err(e));
+                                continue;
+                            }
+                        };
+                        waiter_epoch = waiter_epoch.wrapping_add(1);
+                        if let Some(c) = waiter_cancel.take() {
+                            c.store(true, Ordering::Relaxed);
+                        }
+                        waiter_running = true;
+                        waiter_cancel = None;
+                        let _ = spawn_process_waiter(child, &tx_self, waiter_epoch);
+                    } else if let Err(e) = child_r {
                         let _ = resp.send(Err(e));
                         continue;
                     }
@@ -4559,27 +5697,41 @@ fn spawn_supervisor_thread(
                         {
                             let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
                             let e = ri.entry(app.clone()).or_default();
-                            sysflag_set(&mut e.system_flags, SystemFlag::Failed, None);
+                            sysflag_set_with_rules(&app, &mut e.system_flags, SystemFlag::Failed, None);
                         }
                         set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "manual_restart_start_timeout");
                         let _ = resp.send(Err(anyhow::anyhow!("{app}: restart timeout (cgroup stayed empty)")));
                         continue;
                     }
-                    record_started_in_store(&run_info, &app, StartKind::Restart);
-                    ensure_waiter_attached(
-                        &cfg,
-                        &app,
-                        &tx_self,
-                        &mut waiter_running,
-                        &mut waiter_epoch,
-                        &mut waiter_cancel,
-                        &events,
-                    )
-                    .await;
+                    record_started_in_store(&run_info, &app, StartKind::Restart, SYSFLAG_USER_START);
+                    if def.schedule.is_none() {
+                        ensure_waiter_attached(
+                            &cfg,
+                            &app,
+                            &tx_self,
+                            &mut waiter_running,
+                            &mut waiter_epoch,
+                            &mut waiter_cancel,
+                            &events,
+                        )
+                        .await;
+                    }
+                    // After a successful manual restart:
+                    // - clear FAILED (operator intervened)
+                    // - clear restart history used for tolerance/backoff decisions
+                    restart_times.clear();
+                    pending_failure_restart_at = None;
+                    {
+                        let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+                        let e = ri.entry(app.clone()).or_default();
+                        e.recent_system_crashes_ms.clear();
+                    }
                     set_phase_and_emit(&run_info, &events, &app, Phase::Running, "manual_restart_completed");
                     let _ = resp.send(Ok(()));
                 }
                 SupervisorCmd::BootStart { resp } => {
+                    // Track start attempt for boot starts too.
+                    record_start_attempt_in_store(&run_info, &app);
                     // Boot start is a system action: do not clear FAILED; if FAILED is set, skip.
                     if !def.enabled || def.schedule.is_some() {
                         let _ = resp.send(Ok(()));
@@ -4592,12 +5744,10 @@ fn spawn_supervisor_thread(
                             let _ = resp.send(Err(anyhow::anyhow!("{app}: failed (manual intervention required)")));
                             continue;
                         }
-                    }
-                    // Desired becomes RUNNING at boot for enabled services.
-                    {
-                        let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
-                        let e = ri.entry(app.clone()).or_default();
-                        e.desired = DesiredState::Running;
+                        if sysflag_has(&info.system_flags, SYSFLAG_USER_STOP) {
+                            let _ = resp.send(Err(anyhow::anyhow!("{app}: stopped by user")));
+                            continue;
+                        }
                     }
                     if cgroup_running_async(&cfg, &app).await.unwrap_or(false) {
                         ensure_waiter_attached(
@@ -4614,7 +5764,6 @@ fn spawn_supervisor_thread(
                         continue;
                     }
                     set_phase_and_emit(&run_info, &events, &app, Phase::Starting, "boot_start");
-                    record_start_attempt_in_store(&run_info, &app);
                     let cfg2 = cfg.clone();
                     let def2 = def.clone();
                     let spawn_r = tasks()
@@ -4629,13 +5778,13 @@ fn spawn_supervisor_thread(
                         {
                             let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
                             let e = ri.entry(app.clone()).or_default();
-                            sysflag_set(&mut e.system_flags, SystemFlag::Failed, None);
+                            sysflag_set_with_rules(&app, &mut e.system_flags, SystemFlag::Failed, None);
                         }
                         set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "boot_start_timeout");
                         let _ = resp.send(Err(anyhow::anyhow!("{app}: start timeout (cgroup stayed empty)")));
                         continue;
                     }
-                    record_started_in_store(&run_info, &app, StartKind::Start);
+                    record_started_in_store(&run_info, &app, StartKind::Start, SystemFlag::SystemStart);
                     ensure_waiter_attached(
                         &cfg,
                         &app,
@@ -4650,6 +5799,8 @@ fn spawn_supervisor_thread(
                     let _ = resp.send(Ok(()));
                 }
                 SupervisorCmd::ScheduledStart { resp } => {
+                    // Track last start attempt for scheduled triggers too.
+                    record_start_attempt_in_store(&run_info, &app);
                     // Scheduled start is only meaningful for scheduled jobs.
                     if def.schedule.is_none() {
                         let _ = resp.send(Err(anyhow::anyhow!("{app}: not a scheduled job")));
@@ -4674,47 +5825,57 @@ fn spawn_supervisor_thread(
                         continue;
                     }
                     set_phase_and_emit(&run_info, &events, &app, Phase::Starting, "scheduled_start");
-                    record_start_attempt_in_store(&run_info, &app);
                     let cfg2 = cfg.clone();
                     let def2 = def.clone();
                     let spawn_r = tasks()
                         .spawn_blocking(move || spawn_launcher_child(&cfg2, &def2))
                         .await
                         .map_err(|e| anyhow::anyhow!("join error: {e}"));
-                    if let Err(e) = spawn_r {
-                        let _ = resp.send(Err(e));
-                        continue;
+                    let child = match spawn_r {
+                        Ok(Ok(c)) => c,
+                        Ok(Err(e)) => {
+                            let _ = resp.send(Err(e));
+                            continue;
+                        }
+                        Err(e) => {
+                            let _ = resp.send(Err(e));
+                            continue;
+                        }
+                    };
+                    // For scheduled jobs, attach a process waiter to capture the real exit code (0 vs non-0).
+                    // The cgroup-only waiter cannot provide an exit status and would report code=None.
+                    waiter_epoch = waiter_epoch.wrapping_add(1);
+                    if let Some(c) = waiter_cancel.take() {
+                        c.store(true, Ordering::Relaxed);
                     }
+                    waiter_running = true;
+                    waiter_cancel = None;
+                    let _ = spawn_process_waiter(child, &tx_self, waiter_epoch);
                     if !wait_for_cgroup_nonempty(&cfg, &app, Duration::from_secs(3)).await {
                         let _ = resp.send(Err(anyhow::anyhow!("{app}: start timeout (cgroup stayed empty)")));
                         continue;
                     }
-                    record_started_in_store(&run_info, &app, StartKind::Start);
-                    ensure_waiter_attached(
-                        &cfg,
-                        &app,
-                        &tx_self,
-                        &mut waiter_running,
-                        &mut waiter_epoch,
-                        &mut waiter_cancel,
-                        &events,
-                    )
-                    .await;
+                    record_started_in_store(&run_info, &app, StartKind::Start, SystemFlag::SystemStart);
                     set_phase_and_emit(&run_info, &events, &app, Phase::Running, "scheduled_start_completed");
                     let _ = resp.send(Ok(()));
                 }
                 SupervisorCmd::FailureAutoRestart => {
+                    // Track last start attempt for auto-restart attempts too.
+                    record_start_attempt_in_store(&run_info, &app);
                     // Auto restart attempt after a failure/backoff window.
                     // Respect FAILED: it permanently disables auto restart until manual intervention.
                     if !def.enabled || def.schedule.is_some() {
                         continue;
                     }
+                    // Restart config defaults to "always" with tolerance 3 restarts / 3 minutes.
+                    // Treat missing restart config as the default (so we don't immediately become FAILED).
+                    let restart = def.restart.clone().unwrap_or_default();
                     let info = {
                         let ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
                         ri.get(&app).cloned().unwrap_or_default()
                     };
-                    if info.desired != DesiredState::Running {
-                        set_phase_and_emit(&run_info, &events, &app, Phase::Stopped, "failure_auto_restart_not_desired");
+                    if sysflag_has(&info.system_flags, SYSFLAG_USER_STOP) {
+                        set_phase_and_emit(&run_info, &events, &app, Phase::Stopped, "failure_auto_restart_stopped_by_user");
                         continue;
                     }
                     if sysflag_has(&info.system_flags, SystemFlag::Failed) {
@@ -4737,7 +5898,6 @@ fn spawn_supervisor_thread(
                     }
 
                     set_phase_and_emit(&run_info, &events, &app, Phase::Restarting, "failure_auto_restart");
-                    record_start_attempt_in_store(&run_info, &app);
                     let cfg2 = cfg.clone();
                     let def2 = def.clone();
                     let spawn_r = tasks()
@@ -4745,30 +5905,110 @@ fn spawn_supervisor_thread(
                         .await
                         .map_err(|e| anyhow::anyhow!("join error: {e}"));
                     if let Err(e) = spawn_r {
-                        push_event(&events, "restart", Some(&app), format!("outcome=spawn_error err={e}"));
-                        {
-                            let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
-                            let e2 = ri.entry(app.clone()).or_default();
-                            sysflag_set(&mut e2.system_flags, SystemFlag::Failed, None);
-                            sysflag_clear(&mut e2.system_flags, SystemFlag::Backoff);
+                        // Treat restart attempt failures as restart attempts within tolerance.
+                        // Do NOT immediately mark FAILED; only do so once tolerance is exceeded.
+                        let now = Instant::now();
+                        while let Some(front) = restart_times.front() {
+                            if now.duration_since(*front).as_millis() as u64 > restart.tolerance.duration {
+                                restart_times.pop_front();
+                            } else {
+                                break;
+                            }
                         }
-                        set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "failure_auto_restart_spawn_error");
+                        restart_times.push_back(now);
+                        if restart_times.len() > restart.tolerance.max_restarts {
+                            push_event(
+                                &events,
+                                "restart",
+                                Some(&app),
+                                format!(
+                                    "decision=suppress reason=tolerance_exceeded outcome=spawn_error max_restarts={} window_ms={} err={e}",
+                                    restart.tolerance.max_restarts, restart.tolerance.duration
+                                ),
+                            );
+                            {
+                                let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+                                let e2 = ri.entry(app.clone()).or_default();
+                                sysflag_set_with_rules(&app, &mut e2.system_flags, SystemFlag::Failed, None);
+                            }
+                            set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "failure_auto_restart_tolerance_exceeded_spawn_error");
+                        } else {
+                            let backoff_ms = restart.restart_backoff_ms;
+                            push_event(
+                                &events,
+                                "restart",
+                                Some(&app),
+                                format!(
+                                    "decision=backoff outcome=spawn_error backoff_ms={} recent_restarts_in_window={} err={e}",
+                                    backoff_ms,
+                                    restart_times.len()
+                                ),
+                            );
+                            {
+                                let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+                                let e2 = ri.entry(app.clone()).or_default();
+                                let until_ms = Local::now().timestamp_millis() + backoff_ms as i64;
+                                sysflag_set(&mut e2.system_flags, SystemFlag::Backoff, Some(until_ms));
+                            }
+                            set_phase_and_emit(&run_info, &events, &app, Phase::Backoff, "failure_auto_restart_spawn_error_backoff");
+                            pending_failure_restart_at = Some(Instant::now() + Duration::from_millis(backoff_ms));
+                        }
                         continue;
                     }
 
                     if !wait_for_cgroup_nonempty(&cfg, &app, Duration::from_secs(3)).await {
-                        push_event(&events, "restart", Some(&app), "outcome=start_timeout cgroup_empty_after_ms=3000");
-                        {
-                            let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
-                            let e2 = ri.entry(app.clone()).or_default();
-                            sysflag_set(&mut e2.system_flags, SystemFlag::Failed, None);
-                            sysflag_clear(&mut e2.system_flags, SystemFlag::Backoff);
+                        // Treat restart attempt failures as restart attempts within tolerance.
+                        // Do NOT immediately mark FAILED; only do so once tolerance is exceeded.
+                        let now = Instant::now();
+                        while let Some(front) = restart_times.front() {
+                            if now.duration_since(*front).as_millis() as u64 > restart.tolerance.duration {
+                                restart_times.pop_front();
+                            } else {
+                                break;
+                            }
                         }
-                        set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "failure_auto_restart_timeout");
+                        restart_times.push_back(now);
+                        if restart_times.len() > restart.tolerance.max_restarts {
+                            push_event(
+                                &events,
+                                "restart",
+                                Some(&app),
+                                format!(
+                                    "decision=suppress reason=tolerance_exceeded outcome=start_timeout max_restarts={} window_ms={} cgroup_empty_after_ms=3000",
+                                    restart.tolerance.max_restarts, restart.tolerance.duration
+                                ),
+                            );
+                            {
+                                let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+                                let e2 = ri.entry(app.clone()).or_default();
+                                sysflag_set_with_rules(&app, &mut e2.system_flags, SystemFlag::Failed, None);
+                            }
+                            set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "failure_auto_restart_tolerance_exceeded_timeout");
+                        } else {
+                            let backoff_ms = restart.restart_backoff_ms;
+                            push_event(
+                                &events,
+                                "restart",
+                                Some(&app),
+                                format!(
+                                    "decision=backoff outcome=start_timeout backoff_ms={} recent_restarts_in_window={} cgroup_empty_after_ms=3000",
+                                    backoff_ms,
+                                    restart_times.len()
+                                ),
+                            );
+                            {
+                                let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+                                let e2 = ri.entry(app.clone()).or_default();
+                                let until_ms = Local::now().timestamp_millis() + backoff_ms as i64;
+                                sysflag_set(&mut e2.system_flags, SystemFlag::Backoff, Some(until_ms));
+                            }
+                            set_phase_and_emit(&run_info, &events, &app, Phase::Backoff, "failure_auto_restart_timeout_backoff");
+                            pending_failure_restart_at = Some(Instant::now() + Duration::from_millis(backoff_ms));
+                        }
                         continue;
                     }
 
-                    record_started_in_store(&run_info, &app, StartKind::Restart);
+                    record_started_in_store(&run_info, &app, StartKind::Restart, SystemFlag::SystemStart);
                     ensure_waiter_attached(
                         &cfg,
                         &app,
@@ -4801,24 +6041,34 @@ fn spawn_supervisor_thread(
                         if c != 0 {
                             record_system_crash_in_store(&run_info, &app);
                         }
+                        // Cron exit outcome flags (mutually exclusive via flag rules).
                         {
                             let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
                             let e = ri.entry(app.clone()).or_default();
-                            e.desired = DesiredState::Scheduled;
-                            e.system_flags.clear();
+                            if c == 0 {
+                                sysflag_set_with_rules(&app, &mut e.system_flags, SystemFlag::ExitOk, None);
+                            } else {
+                                sysflag_set_with_rules(&app, &mut e.system_flags, SystemFlag::ExitErr, None);
+                            }
                         }
+                        // Do not clear sysflags for cron jobs on exit. Cron has no auto-restart/backoff semantics,
+                        // and flags like `ot_killed` should remain visible until the next run clears them.
                         set_phase_and_emit(&run_info, &events, &app, Phase::Stopped, "scheduled_completed");
                         continue;
                     }
 
                     // Services: decide whether to auto-restart.
-                    // If disabled, or not desired RUNNING, just mark stopped.
+                    // If disabled, or stopped by user, just mark stopped.
                     let info = {
                         let ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
                         ri.get(&app).cloned().unwrap_or_default()
                     };
-                    if !def.enabled || info.desired != DesiredState::Running {
-                        set_phase_and_emit(&run_info, &events, &app, Phase::Stopped, "exit_observed_not_desired");
+                    if !def.enabled {
+                        set_phase_and_emit(&run_info, &events, &app, Phase::Stopped, "exit_observed_disabled");
+                        continue;
+                    }
+                    if sysflag_has(&info.system_flags, SYSFLAG_USER_STOP) {
+                        set_phase_and_emit(&run_info, &events, &app, Phase::Stopped, "exit_observed_stopped_by_user");
                         continue;
                     }
 
@@ -4830,16 +6080,9 @@ fn spawn_supervisor_thread(
 
                     record_system_crash_in_store(&run_info, &app);
 
-                    let Some(restart) = def.restart.as_ref() else {
-                        {
-                            let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
-                            let e = ri.entry(app.clone()).or_default();
-                            sysflag_set(&mut e.system_flags, SystemFlag::Failed, None);
-                            sysflag_clear(&mut e.system_flags, SystemFlag::Backoff);
-                        }
-                        set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "exit_no_restart_config");
-                        continue;
-                    };
+                    // Restart config defaults to "always" with tolerance 3 restarts / 3 minutes.
+                    // Treat missing restart config as the default (so the first crash doesn't immediately become FAILED).
+                    let restart = def.restart.clone().unwrap_or_default();
 
                     let policy = match restart.policy.parsed() {
                         Ok(p) => p,
@@ -4848,8 +6091,7 @@ fn spawn_supervisor_thread(
                             {
                                 let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
                                 let e = ri.entry(app.clone()).or_default();
-                                sysflag_set(&mut e.system_flags, SystemFlag::Failed, None);
-                                sysflag_clear(&mut e.system_flags, SystemFlag::Backoff);
+                                sysflag_set_with_rules(&app, &mut e.system_flags, SystemFlag::Failed, None);
                             }
                             set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "restart_policy_parse_error");
                             continue;
@@ -4861,8 +6103,7 @@ fn spawn_supervisor_thread(
                             {
                                 let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
                                 let e = ri.entry(app.clone()).or_default();
-                                sysflag_set(&mut e.system_flags, SystemFlag::Failed, None);
-                                sysflag_clear(&mut e.system_flags, SystemFlag::Backoff);
+                                sysflag_set_with_rules(&app, &mut e.system_flags, SystemFlag::Failed, None);
                             }
                             set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "exit_policy_never");
                         }
@@ -4890,8 +6131,7 @@ fn spawn_supervisor_thread(
                                 {
                                     let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
                                     let e = ri.entry(app.clone()).or_default();
-                                    sysflag_set(&mut e.system_flags, SystemFlag::Failed, None);
-                                    sysflag_clear(&mut e.system_flags, SystemFlag::Backoff);
+                                    sysflag_set_with_rules(&app, &mut e.system_flags, SystemFlag::Failed, None);
                                 }
                                 set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "tolerance_exceeded");
                             } else {
@@ -4947,6 +6187,22 @@ fn spawn_cgroup_waiter(
                 let _ = tx2.send(SupervisorCmd::WaiterExited { epoch, code: Some(1) });
             }
         }
+    });
+    Ok(())
+}
+
+fn spawn_process_waiter(
+    mut child: std::process::Child,
+    tx: &tokio_mpsc::UnboundedSender<SupervisorCmd>,
+    epoch: u64,
+) -> anyhow::Result<()> {
+    let tx2 = tx.clone();
+    std::thread::spawn(move || {
+        let code = match child.wait() {
+            Ok(st) => st.code().unwrap_or(1),
+            Err(_) => 1,
+        };
+        let _ = tx2.send(SupervisorCmd::WaiterExited { epoch, code: Some(code) });
     });
     Ok(())
 }
@@ -5113,6 +6369,29 @@ fn load_app_definitions_best_effort(
                     continue;
                 }
 
+                // Provisioning is an optional, one-time setup step. If defined and not yet provisioned
+                // (marker missing), provisioning must succeed for the app to be loadable.
+                // If provisioning fails, we drop the app from this load (do NOT keep last-known-good),
+                // so a subsequent reload will retry provisioning.
+                if !def.provisioning.is_empty() {
+                    if let Err(e) = maybe_provision_workdir(&def) {
+                        pm_event(
+                            "provision",
+                            Some(&def.application),
+                            format!(
+                                "decision=drop_load reason=provision_failed file={} err={e}",
+                                path.display()
+                            ),
+                        );
+                        warnings.push(format!(
+                            "provision_failed file={} dropped_app={} err={e}",
+                            path.display(),
+                            def.application
+                        ));
+                        continue;
+                    }
+                }
+
                 let app = def.application.clone();
                 seen_sources.entry(app.clone()).or_default().push(path.to_path_buf());
                 if defs.contains_key(&app) {
@@ -5238,6 +6517,7 @@ fn build_auto_service_def(app: &str, workdir: &Path, source_file: PathBuf) -> an
         schedule_not_before_ms: None,
         schedule_not_after_ms: None,
         schedule_max_time_per_run_ms: None,
+        provisioning: vec![],
         source_file: Some(source_file),
         source_mtime_ms,
     })
@@ -5578,6 +6858,29 @@ fn merge_auto_services_best_effort(
                 build_auto_service_def(app, &path, target)?
             }
         };
+
+        // Provisioning gate (auto services too): if provisioning is defined and marker is missing,
+        // provisioning must succeed for the app to be loadable. If it fails, do NOT keep any old def;
+        // the next reload will retry.
+        if !def.provisioning.is_empty() {
+            if let Err(e) = maybe_provision_workdir(&def) {
+                let file_s = def
+                    .source_file
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(none)".to_string());
+                pm_event(
+                    "provision",
+                    Some(&def.application),
+                    format!("decision=drop_load reason=provision_failed auto_service=true file={} err={e}", file_s),
+                );
+                warnings.push(format!(
+                    "auto_service_provision_failed app={} file={} err={e}",
+                    def.application, file_s
+                ));
+                continue;
+            }
+        }
 
         defs.insert(app.to_string(), def);
     }

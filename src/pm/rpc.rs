@@ -5,12 +5,53 @@ use std::path::Path;
 use chrono::{Local, TimeZone};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientBuildInfo {
+    pub build_time: String,
+    pub build_host: String,
+}
+
+impl ClientBuildInfo {
+    pub fn current() -> Self {
+        Self {
+            build_time: option_env!("PROCESSMASTER_BUILD_TIME")
+                .unwrap_or("unknown")
+                .to_string(),
+            build_host: option_env!("PROCESSMASTER_BUILD_HOST")
+                .unwrap_or("unknown")
+                .to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireRequest {
+    pub client: ClientBuildInfo,
+    pub request: Request,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum Request {
     Update,
+    /// Run a configured admin action from master config (`admin_actions`).
+    AdminAction { name: String },
+    /// List configured admin actions (name + label).
+    AdminList,
+    /// Kill all running admin actions by issuing `cgroup.kill` on the admin_actions cgroup.
+    AdminKill,
+    /// List PIDs currently running in the admin_actions cgroup.
+    AdminPs,
+    /// Return server build info (build_host/build_time).
+    ServerVersion,
     Start { name: String, #[serde(default)] force: bool },
     Stop { name: String },
     Restart { name: String, #[serde(default)] force: bool },
+    /// Start all enabled non-scheduled services.
+    StartAll { #[serde(default)] force: bool },
+    /// Stop all apps (services + any currently-running cron jobs). Best-effort.
+    StopAll,
+    /// Restart all enabled non-scheduled services.
+    RestartAll { #[serde(default)] force: bool },
     Flag { name: String, flags: Vec<String>, #[serde(default)] ttl: Option<String> },
     Unflag { name: String, flags: Vec<String> },
     Enable { name: String },
@@ -55,9 +96,6 @@ pub struct StatusEntry {
     pub application: String,
     pub enabled: bool,
     pub running: bool,
-    /// Desired state (daemon-side intent): RUNNING / STOPPED / SCHEDULED
-    #[serde(default)]
-    pub desired: String,
     /// Actual state (cgroup truth): RUNNING / STOPPED
     #[serde(default)]
     pub actual: String,
@@ -79,11 +117,35 @@ pub struct StatusEntry {
     /// Computed on the daemon host (so pmctl can run remotely in the future).
     #[serde(default)]
     pub pid_uptimes_ms: Vec<i64>,
+    /// Working directory for the service (useful for provisioning/debug).
+    #[serde(default)]
+    pub working_directory: Option<String>,
+    /// Provisioning marker file path (if provisioning is configured).
+    #[serde(default)]
+    pub provisioning_marker: Option<String>,
+    /// Whether provisioning is configured (non-empty provisioning list in the loaded def).
+    #[serde(default)]
+    pub provisioning_defined: bool,
+    /// Whether the provisioning marker file exists.
+    #[serde(default)]
+    pub provisioning_marker_exists: bool,
     pub source_file: Option<String>,
     #[serde(default)]
     pub last_run_at_ms: Option<i64>,
     #[serde(default)]
     pub last_exit_code: Option<i32>,
+    /// Cron schedule expression, if this is a scheduled job.
+    #[serde(default)]
+    pub schedule: Option<String>,
+    /// Do not trigger scheduled runs before this local time (ms since epoch), if configured.
+    #[serde(default)]
+    pub schedule_not_before_ms: Option<i64>,
+    /// Do not trigger scheduled runs after this local time (ms since epoch), if configured.
+    #[serde(default)]
+    pub schedule_not_after_ms: Option<i64>,
+    /// Maximum wall-clock runtime per scheduled run (ms), if configured.
+    #[serde(default)]
+    pub schedule_max_time_per_run_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +160,15 @@ pub struct Response {
     pub statuses: Vec<StatusEntry>,
     #[serde(default)]
     pub events: Vec<EventEntry>,
+    /// Admin actions (for `AdminList`).
+    #[serde(default)]
+    pub admin_actions: Vec<AdminActionInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminActionInfo {
+    pub name: String,
+    pub label: String,
 }
 
 impl Response {
@@ -153,7 +224,6 @@ impl Response {
 
         let headers = vec![
             "application",
-            "desired",
             "actual",
             "status",
             "crashes_10m",
@@ -170,7 +240,6 @@ impl Response {
         // We keep them grouped so we can draw a border only once per service.
         let mut groups: Vec<Vec<Row>> = vec![];
         for s in &self.statuses {
-            let desired = if s.desired.is_empty() { "-" } else { s.desired.as_str() };
             let actual = if s.actual.is_empty() {
                 if s.running { "RUNNING" } else { "STOPPED" }
             } else {
@@ -201,7 +270,6 @@ impl Response {
                 groups.push(vec![Row {
                     cols: vec![
                         s.application.clone(),
-                        desired.to_string(),
                         actual.to_string(),
                         status.to_string(),
                         crashes_10m,
@@ -231,7 +299,6 @@ impl Response {
             g.push(Row {
                 cols: vec![
                     s.application.clone(),
-                    desired.to_string(),
                     actual.to_string(),
                     status.to_string(),
                     crashes_10m,
@@ -255,7 +322,6 @@ impl Response {
                     .unwrap_or_else(|| "-".to_string());
                 g.push(Row {
                     cols: vec![
-                        "".to_string(),
                         "".to_string(),
                         "".to_string(),
                         "".to_string(),
@@ -339,7 +405,11 @@ pub fn client_call(sock: &Path, req: Request) -> anyhow::Result<Response> {
         )
     })?;
 
-    let line = serde_json::to_string(&req)? + "\n";
+    let wire = WireRequest {
+        client: ClientBuildInfo::current(),
+        request: req,
+    };
+    let line = serde_json::to_string(&wire)? + "\n";
     stream.write_all(line.as_bytes())?;
     stream.flush()?;
 
@@ -367,7 +437,11 @@ where
         )
     })?;
 
-    let line = serde_json::to_string(&req)? + "\n";
+    let wire = WireRequest {
+        client: ClientBuildInfo::current(),
+        request: req,
+    };
+    let line = serde_json::to_string(&wire)? + "\n";
     stream.write_all(line.as_bytes())?;
     stream.flush()?;
 
