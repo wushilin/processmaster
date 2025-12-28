@@ -16,6 +16,11 @@ cgroup:
   memory_swap_max: MAX
   cpu_max: MAX
 
+  # If true (default), processmaster enables all controllers listed in `cgroup.controllers`
+  # into `cgroup.subtree_control` for this master cgroup. This allows child cgroups (pm-<app>/...)
+  # to use any available controllers.
+  subtree_control_allow: true
+
 unix_socket:
   # unix socket path used by pmctl + web console JSON-RPC
   path: /tmp/processmaster.sock

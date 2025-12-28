@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs as tokio_fs;
+use tokio::task;
 
 /// Minimal cgroup-v2 helpers intended to replace external "launcher" features over time.
 ///
@@ -36,8 +37,8 @@ fn ensure_dir(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// List pids in a cgroup by reading `cgroup.procs`.
-pub(crate) fn list_pids(cgroup_dir: &Path) -> anyhow::Result<Vec<u32>> {
+/// List pids in a cgroup by reading `cgroup.procs` (this cgroup only; not recursive).
+pub(crate) fn list_pids_self_only(cgroup_dir: &Path) -> anyhow::Result<Vec<u32>> {
     let procs = cgroup_dir.join("cgroup.procs");
     let s = match fs::read_to_string(&procs) {
         Ok(s) => s,
@@ -61,8 +62,69 @@ pub(crate) fn list_pids(cgroup_dir: &Path) -> anyhow::Result<Vec<u32>> {
     Ok(out)
 }
 
-/// Async list pids in a cgroup by reading `cgroup.procs`.
+/// List pids in a cgroup **recursively**, including all descendant cgroups.
+///
+/// This walks the cgroup directory tree and unions all `cgroup.procs` contents.
+pub(crate) fn list_pids(cgroup_dir: &Path) -> anyhow::Result<Vec<u32>> {
+    // A missing cgroup is treated as empty.
+    if !cgroup_dir.exists() {
+        return Ok(vec![]);
+    }
+
+    // Iterative DFS to avoid deep recursion.
+    let mut stack: Vec<PathBuf> = vec![cgroup_dir.to_path_buf()];
+    let mut pids: Vec<u32> = Vec::new();
+
+    // Safety guard: avoid pathological trees.
+    const MAX_DIRS: usize = 50_000;
+    let mut dirs_seen = 0usize;
+
+    while let Some(dir) = stack.pop() {
+        dirs_seen += 1;
+        if dirs_seen > MAX_DIRS {
+            anyhow::bail!(
+                "cgroup tree too large under {} (>{MAX_DIRS} dirs)",
+                cgroup_dir.display()
+            );
+        }
+
+        pids.extend(list_pids_self_only(&dir)?);
+
+        let rd = match fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("read_dir {}", dir.display())),
+        };
+        for ent in rd {
+            let ent = ent.with_context(|| format!("read_dir entry under {}", dir.display()))?;
+            let ft = ent
+                .file_type()
+                .with_context(|| format!("file_type {}", ent.path().display()))?;
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                stack.push(ent.path());
+            }
+        }
+    }
+
+    // Keep stable output.
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(pids)
+}
+
+/// Async list pids in a cgroup (recursive).
 pub(crate) async fn list_pids_async(cgroup_dir: &Path) -> anyhow::Result<Vec<u32>> {
+    let dir = cgroup_dir.to_path_buf();
+    task::spawn_blocking(move || list_pids(&dir))
+        .await
+        .map_err(|e| anyhow::anyhow!("list_pids_async join error: {e}"))?
+}
+
+/// Async list pids in a cgroup by reading `cgroup.procs` (this cgroup only; not recursive).
+pub(crate) async fn list_pids_self_only_async(cgroup_dir: &Path) -> anyhow::Result<Vec<u32>> {
     let procs = cgroup_dir.join("cgroup.procs");
     let s = match tokio_fs::read_to_string(&procs).await {
         Ok(s) => s,
@@ -342,7 +404,13 @@ fn decorate_argv0(program: &OsString, group: &str) -> OsString {
 pub(crate) fn build_command(p: &LaunchParams) -> anyhow::Result<Command> {
     anyhow::ensure!(!p.argv.is_empty(), "LaunchParams.argv must not be empty");
 
+    // `p.cgroup_dir` is treated as the app's *parent* cgroup. Services may create sub-cgroups under it.
+    // In cgroup v2, a cgroup with child cgroups must not host processes ("no internal processes"),
+    // otherwise attaching a process can fail with EBUSY. To avoid that, we always attach the process
+    // into a dedicated leaf child cgroup `${p.cgroup_dir}/run`.
     apply_resources(&p.cgroup_dir, &p.resources)?;
+    let attach_cgroup_dir = p.cgroup_dir.join("run");
+    ensure_dir(&attach_cgroup_dir)?;
 
     let program = p.argv[0].clone();
     let mut cmd = Command::new(&program);
@@ -358,9 +426,18 @@ pub(crate) fn build_command(p: &LaunchParams) -> anyhow::Result<Command> {
         cmd.arg0(decorate_argv0(&program, group));
     }
 
-    let cgroup_procs = p.cgroup_dir.join("cgroup.procs");
+    let cgroup_procs = attach_cgroup_dir.join("cgroup.procs");
     let user = p.user.clone();
     let group = p.group.clone();
+
+    // Preflight in parent: ensure we can at least open cgroup.procs for write.
+    // This does NOT move the parent into the cgroup (only writing a pid would).
+    if let Err(e) = std::fs::OpenOptions::new().write(true).open(&cgroup_procs) {
+        return Err(anyhow::anyhow!(
+            "cannot open cgroup.procs for write: {}: {e}",
+            cgroup_procs.display()
+        ));
+    }
 
     // Child-side setup order:
     // - detach from processmaster's controlling terminal (setsid)
@@ -373,12 +450,10 @@ pub(crate) fn build_command(p: &LaunchParams) -> anyhow::Result<Command> {
 
             // Attach child to cgroup.
             // "0" means "self" when written to cgroup.procs.
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&cgroup_procs)
-                .map_err(|e| std::io::Error::new(e.kind(), format!("open {}: {e}", cgroup_procs.display())))?;
-            f.write_all(b"0\n")
-                .map_err(|e| std::io::Error::new(e.kind(), format!("write {}: {e}", cgroup_procs.display())))?;
+            // NOTE: do not wrap these io::Errors with `io::Error::new(...)` because that loses
+            // the raw OS error code. The parent only reliably receives errno from pre_exec failures.
+            let mut f = std::fs::OpenOptions::new().write(true).open(&cgroup_procs)?;
+            f.write_all(b"0\n")?;
 
             // Drop privileges if requested.
             if let Some(gname) = group.as_deref() {

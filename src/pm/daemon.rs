@@ -1753,8 +1753,13 @@ fn setup_master_cgroup(cfg: &MasterConfig) -> anyhow::Result<()> {
     })?;
 
     // Enable controllers for children (cgroup v2).
-    // If these are not enabled, child cgroups won't be able to use cpu/memory/io/pids/misc knobs.
-    enable_subtree_controllers(&cg_path, &["cpu", "memory", "io", "pids", "misc"])?;
+    // If these are not enabled, child cgroups won't be able to use those controller knobs.
+    if cfg.cgroup_subtree_control_allow {
+        enable_all_subtree_controllers(&cg_path)?;
+    } else {
+        // Conservative default list (legacy behavior).
+        enable_subtree_controllers(&cg_path, &["cpu", "memory", "io", "pids", "misc"])?;
+    }
 
     // Apply limits.
     let cpu_max = to_cpu_max_string(&cfg.cgroup_cpu_max)?;
@@ -1777,8 +1782,10 @@ fn setup_master_cgroup(cfg: &MasterConfig) -> anyhow::Result<()> {
     // IMPORTANT (cgroup v2): the "no internal processes" rule means the cgroup that contains
     // child cgroups for apps (domain controllers like cpu/memory) should not itself contain
     // processes. So we keep `${cgroup_name}` as a pure parent and move processmaster into a
-    // dedicated child cgroup.
-    let pm_cg = cg_path.join("processmasterd");
+    // dedicated leaf child cgroup.
+    //
+    // Naming convention: `${cgroup_name}/run` is always the daemon's own leaf cgroup.
+    let pm_cg = cg_path.join("run");
     fs::create_dir_all(&pm_cg).map_err(|e| {
         anyhow::anyhow!(
             "failed to create processmaster cgroup {}: {e}",
@@ -1813,7 +1820,7 @@ or:   run processmaster as root",
         }
     }
 
-    // Before moving ourselves into processmasterd, kill any leftover processes in that cgroup.
+    // Before moving ourselves into the daemon leaf cgroup, kill any leftover processes in that cgroup.
     // This cleans up orphaned launcher --wait helpers from previous crashes/restarts.
     kill_orphan_pids_in_cgroup_procs_file(None, "cgroup", &pm_cg.join("cgroup.procs"), None);
 
@@ -1850,6 +1857,21 @@ fn enable_subtree_controllers(parent: &Path, wanted: &[&str]) -> anyhow::Result<
     fs::write(&subtree_path, format!("{}\n", ops.join(" ")))
         .with_context(|| format!("write {}", subtree_path.display()))?;
     Ok(())
+}
+
+fn enable_all_subtree_controllers(parent: &Path) -> anyhow::Result<()> {
+    let controllers_path = parent.join("cgroup.controllers");
+    let controllers = fs::read_to_string(&controllers_path)
+        .with_context(|| format!("read {}", controllers_path.display()))?;
+    let all: Vec<&str> = controllers
+        .split_whitespace()
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    if all.is_empty() {
+        // Not an error: some kernels may expose no controllers here depending on mount and delegation.
+        return Ok(());
+    }
+    enable_subtree_controllers(parent, &all)
 }
 
 fn kill_orphan_pids_in_cgroup_procs_file(
@@ -2094,32 +2116,58 @@ fn ensure_cgroup_access_or_instructions(cfg: &MasterConfig) -> anyhow::Result<()
         }
     }
 
-    // Ensure required controllers are enabled for children at this delegated subtree.
+    // Ensure controllers are enabled for children at this delegated subtree.
     // (cgroup v2: available controllers are in cgroup.controllers; enabled for children are in cgroup.subtree_control)
-    let want = ["cpu", "memory", "io", "pids", "misc"];
     let controllers_path = cg_path.join("cgroup.controllers");
     let subtree_path = cg_path.join("cgroup.subtree_control");
     let controllers = fs::read_to_string(&controllers_path).unwrap_or_default();
     let subtree = fs::read_to_string(&subtree_path).unwrap_or_default();
-    for c in want {
-        if !controllers.split_whitespace().any(|x| x == c) {
-            anyhow::bail!(
-                "cgroup subtree {} does not have controller {c:?} available (missing in {}); cannot run unprivileged",
-                cg_path.display(),
-                controllers_path.display()
-            );
+    if cfg.cgroup_subtree_control_allow {
+        for c in controllers.split_whitespace().filter(|s| !s.trim().is_empty()) {
+            if !subtree.split_whitespace().any(|x| x == c) {
+                eprintln!(
+                    "cgroup subtree {} exists but controllers are not enabled for children (missing {c:?} in {}).\n\
+To enable all available controllers as root, run:\n\
+\n\
+  cat {} | sed 's/^/+/' | tr '\\n' ' ' | xargs echo > {}\n\
+  # or: echo +<controller> +<controller> ... > {}\n",
+                    cg_path.display(),
+                    subtree_path.display(),
+                    controllers_path.display(),
+                    subtree_path.display(),
+                    subtree_path.display()
+                );
+                anyhow::bail!(
+                    "cgroup controllers not enabled for unprivileged usage: {}",
+                    cg_path.display()
+                );
+            }
         }
-        if !subtree.split_whitespace().any(|x| x == c) {
-            eprintln!(
-                "cgroup subtree {} exists but controllers are not enabled for children (missing {c:?} in {}).\n\
+    } else {
+        let want = ["cpu", "memory", "io", "pids", "misc"];
+        for c in want {
+            if !controllers.split_whitespace().any(|x| x == c) {
+                anyhow::bail!(
+                    "cgroup subtree {} does not have controller {c:?} available (missing in {}); cannot run unprivileged",
+                    cg_path.display(),
+                    controllers_path.display()
+                );
+            }
+            if !subtree.split_whitespace().any(|x| x == c) {
+                eprintln!(
+                    "cgroup subtree {} exists but controllers are not enabled for children (missing {c:?} in {}).\n\
 To enable controllers as root, run:\n\
 \n\
   echo +cpu +memory +io +pids +misc > {}\n",
-                cg_path.display(),
-                subtree_path.display(),
-                subtree_path.display()
-            );
-            anyhow::bail!("cgroup controllers not enabled for unprivileged usage: {}", cg_path.display());
+                    cg_path.display(),
+                    subtree_path.display(),
+                    subtree_path.display()
+                );
+                anyhow::bail!(
+                    "cgroup controllers not enabled for unprivileged usage: {}",
+                    cg_path.display()
+                );
+            }
         }
     }
 
@@ -2131,7 +2179,7 @@ To enable controllers as root, run:\n\
             // Also verify we can at least attempt to write cgroup.procs in a child.
             // This catches missing delegation early (EPERM) and is more actionable than failing
             // later when moving the daemon itself.
-            let pm_cg = cg_path.join("processmasterd");
+            let pm_cg = cg_path.join("run");
             let _ = fs::create_dir_all(&pm_cg);
             let procs = pm_cg.join("cgroup.procs");
             match fs::write(&procs, "0\n") {
@@ -2273,7 +2321,8 @@ Fix: use the `pmctl` binary built from the same build/release as the running dae
                 Ok(r) => r,
                 Err(e) => Response {
                     ok: false,
-                    message: e.to_string(),
+                    // Use the full anyhow chain so clients can actually debug failures (e.g. spawn/pre_exec/cgroup issues).
+                    message: format!("{e:#}"),
                     restarted: vec![],
                     statuses: vec![],
                     events: vec![],
@@ -3109,7 +3158,14 @@ async fn do_update_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Resp
 
         pm_event_state(state, "reconcile", Some(name), "decision=apply_modified_def intent=manual_start");
         if let Err(e) = manual_start_via_supervisor_async(state, name, false).await {
-            pm_event_state(state, "reconcile", Some(name), format!("outcome=error action=set_desired err={e}"));
+            // Keep this log line single-line, but preserve the full anyhow chain.
+            let chain = format!("{e:#}").replace('\n', "\\n");
+            pm_event_state(
+                state,
+                "reconcile",
+                Some(name),
+                format!("outcome=error action=set_desired err={chain}"),
+            );
             continue;
         }
 
@@ -4185,6 +4241,21 @@ fn refresh_supervisors(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<()> {
             let _ = tx.send(SupervisorCmd::Update { def: def.clone() });
             continue;
         }
+        // Enable controllers for children of this app cgroup so nested cgroup trees work
+        // (e.g. nested processmaster, or apps that create their own sub-cgroups).
+        if cfg.cgroup_subtree_control_allow {
+            if let Err(e) = enable_all_subtree_controllers(&cg_dir) {
+                pm_event_state(
+                    state,
+                    "cgroup",
+                    Some(name.as_str()),
+                    format!(
+                        "warn=enable_subtree_controllers_failed cgroup_dir={} err={e:#}",
+                        cg_dir.display()
+                    ),
+                );
+            }
+        }
 
         let (run_info, events) = {
             let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
@@ -4491,7 +4562,23 @@ fn spawn_launcher_child(cfg: &MasterConfig, def: &AppDefinition) -> anyhow::Resu
     // Capture-only mode: stdout/stderr always go through processmaster log pumps.
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let mut child = cmd.spawn().with_context(|| format!("spawn app={}", def.application))?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            // `Command::spawn` may fail due to exec errors OR due to `pre_exec` errors.
+            // For `pre_exec`, the OS error code is the most actionable signal, so always include it.
+            anyhow::bail!(
+                "spawn app={} cwd={} cgroup_dir={} argv={} failed: kind={:?} os_error={:?} err={}",
+                def.application,
+                def.working_directory.display(),
+                lp.cgroup_dir.display(),
+                argv.join(" "),
+                e.kind(),
+                e.raw_os_error(),
+                e
+            );
+        }
+    };
     let out = child.stdout.take();
     let err = child.stderr.take();
     if let Some(s) = out {

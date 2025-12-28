@@ -19,6 +19,11 @@ pub struct MasterConfig {
     #[serde(default = "default_max")]
     pub cgroup_cpu_max: String,
 
+    /// If true (default), enable all controllers listed in `cgroup.controllers` into `cgroup.subtree_control`
+    /// for the master cgroup. This allows child cgroups to use any available controllers.
+    #[serde(default = "default_subtree_control_allow")]
+    pub cgroup_subtree_control_allow: bool,
+
     #[serde(default = "default_sock")]
     pub sock: PathBuf,
 
@@ -77,6 +82,8 @@ struct CgroupConfigFile {
     memory_swap_max: String,
     #[serde(default = "default_max")]
     cpu_max: String,
+    #[serde(default = "default_subtree_control_allow")]
+    subtree_control_allow: bool,
 }
 
 fn default_unix_socket_path() -> PathBuf {
@@ -227,6 +234,9 @@ fn default_cgroup_name() -> String {
 fn default_max() -> String {
     "MAX".to_string()
 }
+fn default_subtree_control_allow() -> bool {
+    true
+}
 fn default_sock() -> PathBuf {
     "/tmp/processmaster.sock".into()
 }
@@ -336,6 +346,7 @@ pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
         cgroup_memory_max: default_max(),
         cgroup_memory_swap_max: default_max(),
         cgroup_cpu_max: default_max(),
+        cgroup_subtree_control_allow: default_subtree_control_allow(),
         sock: default_sock(),
         sock_owner: default_sock_owner(),
         sock_group: default_sock_group(),
@@ -352,6 +363,7 @@ pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
         cfg.cgroup_memory_max = cg.memory_max;
         cfg.cgroup_memory_swap_max = cg.memory_swap_max;
         cfg.cgroup_cpu_max = cg.cpu_max;
+        cfg.cgroup_subtree_control_allow = cg.subtree_control_allow;
     }
     if let Some(us) = file_cfg.unix_socket {
         cfg.sock = us.path;

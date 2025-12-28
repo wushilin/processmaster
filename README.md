@@ -107,6 +107,7 @@ cgroup:
   memory_max: MAX             # writes memory.max (use MAX for unlimited). the limit applies not only to process master, but also to all services combined
   memory_swap_max: MAX        # writes memory.swap.max. the limit applies not only to process master, but also to all services combined
   cpu_max: MAX                # writes cpu.max (use MAX for unlimited) the limit applies not only to process master, but also to all services combined
+  subtree_control_allow: true # default true. if enabled, it will auto enable all controllers listed in cgroup.controllers into cgroup.subtree_control for children cgroups.
 
 unix_socket:
   path: /tmp/processmaster.sock   # pmctl/web UI connect to this socket
