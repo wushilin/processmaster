@@ -18,7 +18,9 @@ It runs on ubuntu 22, ubuntu 24, redhat 8 and any cgroup v2 supported platform.
 - The stop is deterministic. When you stop a service on the web UI, it is **DEFINITELY** not running!
 - Supports cronjob  as well!
 - Supports one time setup required as root. like allowing your CADDY to bind on port 443
+- Auto restart failed daemons. Subject to a tolerance (Max of X failure in Y minutes, if exceeded, service marked as failed and won't restart again but you can set X to a huge number to keep restarting, if you like)
 - Modern, well maintained
+
 
 # How you would interact with processmaster
 - **`processmaster`**: the daemon (supervisor + web console + JSON-RPC server over a unix socket)
