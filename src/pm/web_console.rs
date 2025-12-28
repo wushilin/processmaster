@@ -32,20 +32,13 @@ struct WebState {
     tls_enabled: bool,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct AuthCacheKey {
-    user: String,
-    expected_hash: String,
-    pass: String,
-}
-
 struct AuthCache {
-    // Cache bcrypt verification result. Key includes the current stored hash, so when the password
-    // changes (hash changes), cached results stop matching automatically.
+    // Cache only SUCCESSFUL authentications, one per user (per current stored hash).
+    // This avoids unbounded growth from caching failures.
     //
-    // NOTE: This key includes the plaintext password (bounded cache). User explicitly accepted this tradeoff.
-    entries: HashMap<AuthCacheKey, bool>,
-    order: VecDeque<AuthCacheKey>,
+    // NOTE: This stores the plaintext password for the user (bounded cache). User explicitly accepted this tradeoff.
+    entries: HashMap<String, (String /* expected_hash */, String /* pass */)>,
+    order: VecDeque<String>,
 }
 
 impl AuthCache {
@@ -55,15 +48,18 @@ impl AuthCache {
         Self { entries: HashMap::new(), order: VecDeque::new() }
     }
 
-    fn get(&mut self, key: &AuthCacheKey) -> Option<bool> {
-        self.entries.get(key).copied()
+    fn is_cached_ok(&mut self, user: &str, expected_hash: &str, pass: &str) -> bool {
+        match self.entries.get(user) {
+            Some((h, p)) if h == expected_hash && p == pass => true,
+            _ => false,
+        }
     }
 
-    fn put(&mut self, key: AuthCacheKey, val: bool) {
-        if !self.entries.contains_key(&key) {
-            self.order.push_back(key.clone());
+    fn put_ok(&mut self, user: String, expected_hash: String, pass: String) {
+        if !self.entries.contains_key(&user) {
+            self.order.push_back(user.clone());
         }
-        self.entries.insert(key, val);
+        self.entries.insert(user, (expected_hash, pass));
         while self.entries.len() > Self::MAX_ENTRIES {
             if let Some(k) = self.order.pop_front() {
                 self.entries.remove(&k);
@@ -264,26 +260,23 @@ fn check_basic_auth(
         return Err("invalid credentials".to_string());
     };
 
-    let key = AuthCacheKey {
-        user: user.to_string(),
-        expected_hash: expected_hash.clone(),
-        pass: pass.to_string(),
-    };
-    // Cache lookup/insert around bcrypt to avoid repeated work. Cache is bounded; no TTL.
+    // Cache lookup: if this (user, hash, pass) succeeded before, accept immediately.
     if let Ok(mut c) = auth_cache.lock() {
-        if let Some(cached) = c.get(&key) {
-            return if cached { Ok(()) } else { Err("invalid credentials".to_string()) };
+        if c.is_cached_ok(user, expected_hash, pass) {
+            return Ok(());
         }
-        let ok = bcrypt::verify(pass, expected_hash).map_err(|_| "invalid credentials".to_string())?;
-        c.put(key, ok);
-        return ok.then_some(()).ok_or_else(|| "invalid credentials".to_string());
     }
 
-    // If cache lock is poisoned/unavailable, fall back to a direct verify.
-    bcrypt::verify(pass, expected_hash)
-        .map_err(|_| "invalid credentials".to_string())?
-        .then_some(())
-        .ok_or_else(|| "invalid credentials".to_string())
+    // Cache miss: verify once.
+    let ok = bcrypt::verify(pass, expected_hash).map_err(|_| "invalid credentials".to_string())?;
+    if !ok {
+        return Err("invalid credentials".to_string());
+    }
+    // Successful verify: remember it (best-effort).
+    if let Ok(mut c) = auth_cache.lock() {
+        c.put_ok(user.to_string(), expected_hash.clone(), pass.to_string());
+    }
+    Ok(())
 }
 
 // ---------------- CSRF ----------------
