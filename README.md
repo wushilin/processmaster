@@ -99,11 +99,11 @@ Example:
 
 ```yaml
 cgroup:
-  root: /sys/fs/cgroup        # cgroup v2 root
-  name: processmaster         # master cgroup name -> /sys/fs/cgroup/processmaster
-  memory_max: MAX             # writes memory.max (use MAX for unlimited)
-  memory_swap_max: MAX        # writes memory.swap.max
-  cpu_max: MAX                # writes cpu.max (use MAX for unlimited)
+  root: /sys/fs/cgroup        # cgroup v2 root, the value is default. you can ommit it.
+  name: processmaster         # master cgroup name -> /sys/fs/cgroup/processmaster. optional
+  memory_max: MAX             # writes memory.max (use MAX for unlimited). the limit applies not only to process master, but also to all services combined
+  memory_swap_max: MAX        # writes memory.swap.max. the limit applies not only to process master, but also to all services combined
+  cpu_max: MAX                # writes cpu.max (use MAX for unlimited) the limit applies not only to process master, but also to all services combined
 
 unix_socket:
   path: /tmp/processmaster.sock   # pmctl/web UI connect to this socket
@@ -112,21 +112,22 @@ unix_socket:
   mode: 0660                      # octal; accepts 660, "660", or "0660"
 
 global:
-  config_directory: ./config.d    # directory of explicit service YAML files (*.yml/*.yaml)
-  # auto_service_directory: ./auto_services  # optional implicit services (one per subdirectory)
+  config_directory: ./config.d    # directory of explicit service YAML files (*.yml/*.yaml). all service yamls in this folder will be loaded.
+  # auto_service_directory: ./auto_services  # optional implicit services. all folders in this directory will be auto recognized as a service using defaults, but customizable later.
 
 web_console:
-  enabled: true                   # serve web UI at http(s)://bind:port/
+  enabled: true                   # serve web UI at http(s)://bind:port/. Default is not enabled
   bind: 0.0.0.0                   # listen address
   port: 9001                      # listen port
   auth:
     basic:
       users:
         # htpasswd bcrypt entries in the form "user:hash".
-        # If you omit the whole web_console.auth section, it defaults to admin/admin (bootstrapping only).
+        # If you omit the whole web_console.auth section, it defaults to admin/admin (bootstrapping only). Please change it
         - "admin:$2a$10$jqNWtAzhWEVlPnvJwyI6g.Nwb8YPU5ypCED9lBEhahUSs13ac1MPe"
 
-# Operator-triggered commands (run as root; cwd="."; fire-and-forget).
+# Operator-triggered commands (run as root; cwd="."; fire-and-forget). You can use this mechanism update processmaster binary even!
+# if you did not define any, then there is extra "admin action" admin can trigger remotely on the web UI. By default no action possible.
 admin_actions:
   update-pm:
     label: "Update ProcessMaster"  # optional display label; defaults to the id ("update-pm")
@@ -138,8 +139,8 @@ admin_actions:
 The daemon:
 
 - Creates a master cgroup at `${cgroup.root}/${cgroup.name}` and applies the master limits (`cpu.max`, `memory.max`, `memory.swap.max`)
-- Creates one cgroup per app at `${cgroup.root}/${cgroup.name}/${app}`
-- Stops/force-kills by signaling/`cgroup.kill`
+- Creates one cgroup per app at `${cgroup.root}/${cgroup.name}/${app}`, and apply per-service limit, if they were defined.
+- Stops will force-kills by signaling/`cgroup.kill` if the default stop mechanism did not work (e.g. stop_command, signal).
 
 ### Unix socket permissions
 
@@ -159,9 +160,6 @@ After=network.target
 Type=simple
 User=root
 Group=root
-
-# IMPORTANT: allow the daemon to manage cgroups (create sub-cgroups, write controllers).
-Delegate=yes
 
 # Adjust paths as needed.
 WorkingDirectory=/opt/processmaster
@@ -189,6 +187,22 @@ sudo systemctl status processmaster
 
 If you set `global.auto_service_directory`, processmaster treats **each direct child directory** as a service.
 
+Again, it is super duper simple. all you really need to do is:
+
+```bash
+mkdir /path_to_process_master/auto_services/test2
+cp /other/path/run.sh /path_to_process_master/auto_services/test2/run.sh
+chmod +x /path_to_process_master/auto_services/test2/run.sh
+```
+
+the service defaults to run as root, use SIGTERM to stop, and start using run.sh. 
+
+Isn't that simple? of course, you would want to customize it. see below!
+
+The daemon generates a service.yaml with assumed defaults. if your app comforms to the defaults, it will work out of the box. see below.
+
+If your job did not match, it is okay, they will fail to start, you can edit the generated `service.yml` and at least you saved handcoding the services.
+
 - **App name**: the directory name (trimmed). Any directory ending with `.disabled` is ignored.
 - **Config file**: inside each app directory it prefers:
   - `service.yml` (preferred), otherwise
@@ -197,6 +211,8 @@ If you set `global.auto_service_directory`, processmaster treats **each direct c
 - **Collision rule**: if an app name exists in `config_directory` and `auto_service_directory`, that is a **hard error**.
 
 ### Regeneration flow (`.regen_pm_config`)
+Sometimes, after version upgrade, your older version became incompatible. you are too lazy to generate the new config, you can use
+this method to generate a stub for you to edit.
 
 Auto-services support a one-shot regeneration mechanism for upgrading an existing app directory to the latest default template.
 
@@ -209,6 +225,18 @@ If an auto-service directory contains a file named `.regen_pm_config`:
 This is intentionally explicit: you opt-in by creating the marker, and you can diff/inspect the `.bak` files.
 
 ## Service definition YAML (`config.d/<app>.yaml`)
+
+All services parameter has reasonable defaults.
+A super minimum service could be:
+
+test.yaml
+```
+process:
+  working_directory: /tmp/test
+```
+-> it will run /tmp/test/run.sh as root, in working directory /tmp/test. That's it. Stop signal is SIGTERM.
+
+Isn't that simple? Of course you can customize it more. See below!
 
 Service definitions are grouped and strict (`deny_unknown_fields`).
 `application:` is optional; if omitted it is derived from the filename (and `<app>/service.yml` derives from the parent dir name).
