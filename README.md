@@ -3,7 +3,7 @@
 `processmaster` is a small supervisor-style process manager built around **cgroup v2**, using Rust.
 It runs on ubuntu 22, ubuntu 24, redhat 8 and any cgroup v2 supported platform.
 
-WHy it is better than supervisor?
+Why it is better than supervisor? 
 
 1. It uses about 2% of supervisor's memory
 <img width="903" height="243" alt="image" src="https://github.com/user-attachments/assets/a8dba0f4-cac2-4e1e-9f1a-36b600862401" />
