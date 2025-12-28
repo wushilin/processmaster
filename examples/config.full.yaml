@@ -37,9 +37,7 @@ global:
   # - Relative `process.working_directory` is derived as ${auto_service_directory}/${application} when omitted.
   # auto_service_directory: ./auto_services
 
-  # If you run the daemon as root, you can ask it to drop privileges after startup:
-  # user: someuser
-  # group: somegroup
+  # Note: processmaster daemon must run as root (see README for systemd unit example).
 
 web_console:
   enabled: true

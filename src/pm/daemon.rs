@@ -15,7 +15,7 @@ use nix::sys::signal::Signal;
 use nix::sys::signal::kill;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
-use nix::unistd::{chown, geteuid, getegid, setgid, setuid, Gid, Uid};
+use nix::unistd::{chown, geteuid, getegid, Gid, Uid};
 use libc;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -773,6 +773,9 @@ pub fn run_daemon(cfg: &MasterConfig) -> anyhow::Result<()> {
 
 pub async fn run_daemon_async(cfg: MasterConfig) -> anyhow::Result<()> {
     let _ = TASKS.set(TaskTracker::new());
+    if !geteuid().is_root() {
+        anyhow::bail!("processmaster daemon is not running as root; please start it as root");
+    }
     validate_web_console_config(&cfg)?;
     // Preflight: validate config and app definitions before doing side effects (socket bind, cgroups).
     let defs = preflight_validate_and_load_defs(&cfg)?;
@@ -813,9 +816,6 @@ pub async fn run_daemon_async(cfg: MasterConfig) -> anyhow::Result<()> {
             ),
         );
     }
-
-    // Drop privileges after binding the socket (which may live in a privileged dir).
-    enforce_master_user_group(&cfg)?;
 
     // Default daemon logging to file (in addition to journald via stderr):
     // <config_directory>/logs/processmaster.log (rotate 10 MiB, 10 backups, gzip).
@@ -6917,48 +6917,6 @@ fn launcher_kill_signal(cfg: &MasterConfig, app: &str, sig: &str) -> anyhow::Res
 fn launcher_kill_all(cfg: &MasterConfig, app: &str) -> anyhow::Result<()> {
     let dir = app_cgroup_dir(cfg, app);
     cgroup::kill_all_pids(&dir)?;
-    Ok(())
-}
-
-fn enforce_master_user_group(cfg: &MasterConfig) -> anyhow::Result<()> {
-    let euid = geteuid();
-    let egid = getegid();
-
-    let cur_user = get_user_by_uid(euid.as_raw())
-        .map(|u| u.name().to_string_lossy().to_string())
-        .unwrap_or_else(|| euid.as_raw().to_string());
-    let cur_group = get_group_by_gid(egid.as_raw())
-        .map(|g| g.name().to_string_lossy().to_string())
-        .unwrap_or_else(|| egid.as_raw().to_string());
-
-    if !euid.is_root() {
-        if let Some(u) = cfg.user.as_deref() {
-            if u != cur_user {
-                anyhow::bail!(
-                    "pm is not root (running as {cur_user}:{cur_group}); config.user={u} is not applicable"
-                );
-            }
-        }
-        if let Some(g) = cfg.group.as_deref() {
-            if g != cur_group {
-                anyhow::bail!(
-                    "pm is not root (running as {cur_user}:{cur_group}); config.group={g} is not applicable"
-                );
-            }
-        }
-        return Ok(());
-    }
-
-    // Root: drop privileges if configured.
-    if let Some(g) = cfg.group.as_deref() {
-        let grp = get_group_by_name(g).ok_or_else(|| anyhow::anyhow!("unknown group: {g}"))?;
-        setgid(Gid::from_raw(grp.gid()))?;
-    }
-    if let Some(u) = cfg.user.as_deref() {
-        let usr = get_user_by_name(u).ok_or_else(|| anyhow::anyhow!("unknown user: {u}"))?;
-        setuid(Uid::from_raw(usr.uid()))?;
-    }
-
     Ok(())
 }
 

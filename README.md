@@ -89,6 +89,8 @@ See `examples/` for working samples:
 Master config is grouped and strict (`deny_unknown_fields`).
 At minimum you must set `global.config_directory` and/or `global.auto_service_directory`.
 
+Important: **processmaster daemon must run as root** (required for cgroup management, socket ownership, provisioning capabilities, and admin actions).
+
 Example:
 
 ```yaml
@@ -108,10 +110,6 @@ unix_socket:
 global:
   config_directory: ./config.d
   # auto_service_directory: ./auto_services
-
-  # If the daemon starts as root, it can drop privileges:
-  # user: someuser
-  # group: somegroup
 
 web_console:
   enabled: true
@@ -142,6 +140,45 @@ The daemon:
 
 If `unix_socket.owner` / `unix_socket.group` are set, the daemon needs to run as root to apply them.
 `unix_socket.mode` is always applied.
+
+## Running processmaster under systemd (recommended)
+
+Example unit file: `/etc/systemd/system/processmaster.service`
+
+```ini
+[Unit]
+Description=ProcessMaster daemon
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# IMPORTANT: allow the daemon to manage cgroups (create sub-cgroups, write controllers).
+Delegate=yes
+
+# Adjust paths as needed.
+WorkingDirectory=/opt/processmaster
+ExecStart=/opt/processmaster/processmaster -c /etc/processmaster/config.yaml
+
+Restart=always
+RestartSec=2
+
+# Let processmaster handle its own children (it uses its own cgroup tree).
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now processmaster
+sudo systemctl status processmaster
+```
 
 ## Auto-services (implicit services)
 
@@ -174,45 +211,67 @@ Service definitions are grouped and strict (`deny_unknown_fields`).
 Example (long-running service):
 
 ```yaml
-application: sleeper
+application: sleeper            # optional; if omitted, derived from the filename
 
 process:
-  working_directory: /tmp/processmaster/examples/sleeper
-  start_command: ["/bin/sleep", "1000000"]
-  # Choose exactly one:
-  # stop_signal: SIGTERM         # default SIGTERM when stop_command is not set
-  # stop_command: ["./stop.sh"]
+  working_directory: /tmp/processmaster/examples/sleeper   # required (unless auto-service and omitted there)
+  start_command: ["/bin/sleep", "1000000"]                 # required; argv list
+
+  # Stop behavior: choose exactly one of process.stop_signal or process.stop_command.
+  # - If stop_command is set, processmaster runs it first (no automatic signal).
+  # - Otherwise it signals the cgroup PIDs with stop_signal (default SIGTERM).
+  stop_signal: SIGTERM                                     # optional (default SIGTERM if stop_command is not set)
+  # stop_command: ["./stop.sh"]                            # optional; argv list
+
+  # How long to wait (ms) after stop_command/stop_signal before forcing `cgroup.kill`.
+  # Default: 5000.
   stop_grace_period_ms: 5000
+
+  # Environment variables passed to the service.
+  # Values can be literal strings or indirections like @file://..., @base64://..., @hex://...
   environment:
-    - name: FOO
+    - name: FOO                                            # must not contain '='
       value: bar
 
 logs:
+  # Where processmaster writes captured stdout/stderr.
+  # Absolute paths are allowed; relative paths are resolved under process.working_directory.
   stdout: ./logs/stdout.log
   stderr: ./logs/stderr.log
+
+  # Log rotation:
+  # - rotation_mode=size: rotate when file exceeds rotation_size (default mode)
+  # - rotation_mode=time: rotate on schedule boundary (daily/hourly/...)
   rotation_mode: size           # default: size
-  rotation_size: 10m            # default: 10m
-  rotation_backups: 10          # default: 10
-  compression_enabled: true     # default: true
-  stop_command_stdout: ./logs/stop_command_stdout.log
-  stop_command_stderr: ./logs/stop_command_stderr.log
+  rotation_size: 10m            # size-mode only; default: 10m
+  rotation_backups: 10          # size-mode only; default: 10
+  compression_enabled: true     # best-effort gzip for rotated logs; default: true
+
+  # If you use process.stop_command, you can optionally capture that command's stdout/stderr too.
+  stop_command_stdout: ./logs/stop_command_stdout.log      # default: ./logs/stop_command_stdout.log
+  stop_command_stderr: ./logs/stop_command_stderr.log      # default: ./logs/stop_command_stderr.log
+
+  # Extra log files that the application writes by itself (for viewing/tailing only).
+  # These are *not* written by processmaster; they just show up in pmctl/web log UI.
   hints:
     - ./logs/app.log
 
 resources:
-  max_cpu: 100m
-  max_memory: 64MiB
-  max_swap: 0
+  # Optional cgroup limits for this service.
+  max_cpu: 100m                 # e.g. "100m" or "1.5"
+  max_memory: 64MiB             # e.g. "64MiB", "1GiB"
+  max_swap: 0                   # "0" disables swap for this cgroup
 
 restart_policy:
+  # Restart strategy for non-scheduled services. (Must not be present when process.schedule is set.)
   policy: always                # "always" | "never"
-  restart_backoff_ms: 1000      # default 1000
+  restart_backoff_ms: 1000      # delay before restarting; default 1000
   tolerance:
     max_restarts: 3             # default 3
-    duration: 1m                # supports ms/s/m/h
+    duration: 1m                # restart budget window; supports ms/s/m/h
 
 global:
-  enabled: true
+  enabled: true                 # if false: daemon won’t auto-start (but you can still pmctl start --force)
 ```
 
 ### Cron / scheduling
@@ -284,24 +343,6 @@ provisioning:
 Root requirements:
 
 - `ownership` (chown/chgrp) and `add_net_bind_capability` require the daemon to run as root (or equivalent capabilities).
-
-## Rule-driven flags (system/user flags)
-
-Flags are applied via a rules engine defined in:
-
-- `src/pm/flag_rules.default.json`
-
-Key behavior:
-
-- Setting a flag can **also set** other flags (`also_sets`) and **clear** other flags (`clears`)
-- `clears: ["*"]` clears all existing flags **except** those newly introduced in the current apply-chain
-
-Operators can set/clear user flags via:
-
-```bash
-pmctl flag <app> <flag1,flag2> [--ttl 1h]
-pmctl unflag <app> <flag1,flag2>
-```
 
 ## Admin actions
 

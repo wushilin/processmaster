@@ -19,13 +19,6 @@ pub struct MasterConfig {
     #[serde(default = "default_max")]
     pub cgroup_cpu_max: String,
 
-    /// User the master should drop to (if started as root).
-    #[serde(default)]
-    pub user: Option<String>,
-    /// Group the master should drop to (if started as root).
-    #[serde(default)]
-    pub group: Option<String>,
-
     #[serde(default = "default_sock")]
     pub sock: PathBuf,
 
@@ -106,10 +99,6 @@ struct UnixSocketConfigFile {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GlobalConfigFile {
-    #[serde(default)]
-    user: Option<String>,
-    #[serde(default)]
-    group: Option<String>,
     #[serde(default)]
     config_directory: Option<PathBuf>,
     #[serde(default)]
@@ -347,8 +336,6 @@ pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
         cgroup_memory_max: default_max(),
         cgroup_memory_swap_max: default_max(),
         cgroup_cpu_max: default_max(),
-        user: None,
-        group: None,
         sock: default_sock(),
         sock_owner: default_sock_owner(),
         sock_group: default_sock_group(),
@@ -373,8 +360,6 @@ pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
         cfg.sock_mode = us.mode;
     }
     if let Some(gl) = file_cfg.global {
-        cfg.user = gl.user;
-        cfg.group = gl.group;
         anyhow::ensure!(
             gl.config_directory.is_some() || gl.auto_service_directory.is_some(),
             "global must define at least one of: config_directory, auto_service_directory"
