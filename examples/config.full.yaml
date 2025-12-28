@@ -1,0 +1,78 @@
+# Full example master config for processmaster (all supported fields).
+#
+# Notes:
+# - Master config is "grouped" and strict. Unknown fields will be rejected.
+# - You must define at least one of: global.config_directory, global.auto_service_directory
+
+cgroup:
+  # cgroup v2 root
+  root: /sys/fs/cgroup
+  # master cgroup name: /sys/fs/cgroup/<name>
+  name: processmaster
+
+  # limits applied to the master cgroup (the daemon moves itself into it)
+  # Use "MAX" for unlimited. (Strings are written verbatim to cgroup files.)
+  memory_max: MAX
+  memory_swap_max: MAX
+  cpu_max: MAX
+
+unix_socket:
+  # unix socket path used by pmctl + web console JSON-RPC
+  path: /tmp/processmaster.sock
+
+  # Optional. If set, daemon must run as root to apply chown/chgrp.
+  owner: root
+  group: root
+
+  # Socket file permissions (octal). Accepts 660, "660", or "0660".
+  mode: "0660"
+
+global:
+  # Directory containing app YAML definitions (*.yml/*.yaml). Relative paths are resolved against config.yaml dir.
+  config_directory: ./config.d
+
+  # Optional auto-services directory:
+  # - Each direct child directory becomes an app.
+  # - It loads service.yml/service.yaml if present, otherwise uses defaults.
+  # - Relative `process.working_directory` is derived as ${auto_service_directory}/${application} when omitted.
+  # auto_service_directory: ./auto_services
+
+  # If you run the daemon as root, you can ask it to drop privileges after startup:
+  # user: someuser
+  # group: somegroup
+
+web_console:
+  enabled: true
+  bind: 0.0.0.0
+  port: 9001
+
+  # TLS is optional. If you enable TLS:
+  # - with mtls=true: clients must present a client cert signed by ca_pem.
+  tls:
+    enabled: false
+    # ca_pem: ./certs/ca.pem
+    # server_cert_pem: ./certs/server.pem
+    # server_key_pem: ./certs/server.key
+    # Optional extra host to put into SANs when processmaster auto-generates a server cert:
+    # client_host: processmaster.example.com
+    mtls: false
+
+  # Basic auth. If you omit this, processmaster uses a default admin/admin for bootstrapping.
+  auth:
+    basic:
+      users:
+        # htpasswd bcrypt entry. Replace in production.
+        - "admin:$2a$10$jqNWtAzhWEVlPnvJwyI6g.Nwb8YPU5ypCED9lBEhahUSs13ac1MPe"
+
+# Operator-triggered admin commands (run as root, cwd=".", fire-and-forget).
+# - The web UI shows them under the "Admin actions" modal.
+# - Output is appended to ./logs/admin_action_stdout.log and ./logs/admin_action_stderr.log (daemon cwd).
+admin_actions:
+  update-processmaster:
+    label: "Restart ProcessMaster (systemd)"
+    command:
+      - /bin/sh
+      - -lc
+      - systemctl restart processmaster
+
+

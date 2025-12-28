@@ -77,7 +77,12 @@ If you see “pmctl is not co-built with this daemon”, rebuild and deploy `pro
 - **Service definitions**: YAML files under `global.config_directory` (e.g. `config.d/*.yaml`)
 - **Optional auto-services**: `global.auto_service_directory` (each direct child dir is treated as a service)
 
-See `examples/` for working samples.
+See `examples/` for working samples:
+
+- `examples/config.yaml`: minimal master config
+- `examples/config.full.yaml`: full master config with inline documentation
+- `examples/config.d/sleeper.yaml`: minimal service definition
+- `examples/service.full.yaml`: full service definition with inline documentation
 
 ## Master config (`config.yaml`)
 
@@ -137,6 +142,29 @@ The daemon:
 
 If `unix_socket.owner` / `unix_socket.group` are set, the daemon needs to run as root to apply them.
 `unix_socket.mode` is always applied.
+
+## Auto-services (implicit services)
+
+If you set `global.auto_service_directory`, processmaster treats **each direct child directory** as a service.
+
+- **App name**: the directory name (trimmed). Any directory ending with `.disabled` is ignored.
+- **Config file**: inside each app directory it prefers:
+  - `service.yml` (preferred), otherwise
+  - `service.yaml`, otherwise
+  - no config file → processmaster uses built-in defaults (working_directory = that dir, start_command = `./run.sh`, logs under `./logs/`, etc).
+- **Collision rule**: if an app name exists in `config_directory` and `auto_service_directory`, that is a **hard error**.
+
+### Regeneration flow (`.regen_pm_config`)
+
+Auto-services support a one-shot regeneration mechanism for upgrading an existing app directory to the latest default template.
+
+If an auto-service directory contains a file named `.regen_pm_config`:
+
+- processmaster renames any existing `service.yml` / `service.yaml` into `service.yml.bak` (or `service.yml.bak.N`)
+- then writes a freshly generated `service.yml` using canonical defaults
+- then removes `.regen_pm_config` **only if** generation + write succeeded
+
+This is intentionally explicit: you opt-in by creating the marker, and you can diff/inspect the `.bak` files.
 
 ## Service definition YAML (`config.d/<app>.yaml`)
 
@@ -227,6 +255,15 @@ Provisioning is guarded by a marker file: `${working_directory}/.pm_provisioned`
 - The marker is written **only after all provisioning entries succeed**.
 - If provisioning fails, the app is **not loaded**; fix the error and reload definitions to retry.
 - Relative `provisioning[].path` is resolved **under `process.working_directory`**.
+
+### Re-provision (reapply) flow
+
+To re-apply provisioning for a service:
+
+- delete `${working_directory}/.pm_provisioned`
+- then reload definitions (web UI: “Reload Service Definition”, or `pmctl update`)
+
+On the next definition load, provisioning runs again and a new marker is written only on full success.
 
 Example:
 

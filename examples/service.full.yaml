@@ -1,0 +1,116 @@
+# Full example service definition (all supported parameters) for processmaster.
+#
+# Notes:
+# - Service YAML is grouped and strict. Unknown fields will be rejected.
+# - `process.schedule` (cron) and `restart_policy` are mutually exclusive.
+#   This example shows restart_policy enabled; the schedule-related fields are shown but commented out.
+
+# Optional. If omitted, processmaster derives it from the filename.
+application: example-service
+
+global:
+  # If false, processmaster will not auto-start this service on boot/update.
+  enabled: true
+
+process:
+  # Required unless you use global.auto_service_directory (auto-services can omit this and it will default).
+  working_directory: /tmp/processmaster/examples/example-service
+
+  # Command argv list.
+  start_command:
+    - /bin/sh
+    - -lc
+    - |
+      echo "hello from processmaster";
+      exec sleep 1000000
+
+  # Stop behavior: choose exactly one of stop_signal or stop_command.
+  stop_signal: SIGTERM
+  # stop_command:
+  #   - /bin/sh
+  #   - -lc
+  #   - ./stop.sh
+
+  # How long to wait before forcing `cgroup.kill`.
+  stop_grace_period_ms: 5000
+
+  # Optional. Run service as this user/group (daemon must have privileges to setuid/setgid).
+  user: null
+  group: null
+
+  # Environment variables.
+  # Values can be literal strings or indirections like:
+  # - "@file:///path/to/secret"
+  # - "@base64://..."
+  # - "@hex://..."
+  environment:
+    - name: FOO
+      value: bar
+
+  # Cron schedule (mutually exclusive with restart_policy).
+  # schedule: "0 * * * *"        # 5-field cron
+  # not_before: "2025-01-01"      # or "2025-01-01 00:00:00" (local time)
+  # not_after: "2025-12-31"       # or "2025-12-31 23:59:59" (local time)
+  # max_time_per_run: "30s"       # or "never"
+
+logs:
+  # Log paths are absolute or relative to process.working_directory.
+  stdout: ./logs/stdout.log
+  stderr: ./logs/stderr.log
+
+  # Rotation mode:
+  # - "size" (default): rotate when file exceeds rotation_size
+  # - "time": rotate on schedule boundary (daily/hourly/...)
+  rotation_mode: size
+
+  # --- size-mode options ---
+  rotation_size: 10m
+  rotation_backups: 10
+
+  # --- time-mode options (only when rotation_mode=time) ---
+  # rotation_frequency: daily    # minutely|hourly|daily|weekly|monthly|none
+  # rotation_max_age_ms: 2592000000
+
+  # Compress rotated logs (best-effort using gzip)
+  compression_enabled: true
+
+  # Optional: where to redirect stop_command stdout/stderr (if stop_command is used).
+  stop_command_stdout: ./logs/stop_command_stdout.log
+  stop_command_stderr: ./logs/stop_command_stderr.log
+
+  # Optional: additional log files to show in pmctl logs/web UI (absolute or relative to working_directory).
+  hints:
+    - ./logs/app.log
+
+resources:
+  # Optional resource limits (strings parsed by the daemon).
+  max_cpu: 100m
+  max_memory: 64MiB
+  max_swap: 0
+
+# Restart policy (mutually exclusive with process.schedule).
+restart_policy:
+  policy: always          # "always" | "never"
+  restart_backoff_ms: 1000
+  tolerance:
+    max_restarts: 3
+    duration: 1m          # supports ms/s/m/h
+
+# Optional provisioning actions applied once per working_directory (definition-load time).
+# Guarded by ${working_directory}/.pm_provisioned marker.
+provisioning:
+  # Example: ensure workdir exists and apply ownership/mode.
+  - path: .
+    ownership:
+      owner: root          # username or numeric uid as string
+      group: root          # group name or numeric gid as string
+      recursive: true
+    mode: "0770"           # octal string or integer (non-recursive)
+    add_net_bind_capability: false
+
+  # Example: give a binary cap_net_bind_service so it can bind to :80/:443 without running as root.
+  - path: ./bin/myserver
+    mode: "0755"
+    add_net_bind_capability: true
+
+
