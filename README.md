@@ -1,4 +1,5 @@
 # what is processmaster
+Definitive, Determinstic, Modern, Linux only daemon and cronjob master written in Rust. It has to run as root.
 
 `processmaster` is a small supervisor-style process manager built around **cgroup v2**, using Rust.
 It runs on ubuntu 22, ubuntu 24, redhat 8 and any cgroup v2 supported platform.
