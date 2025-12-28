@@ -466,5 +466,8 @@ cgroup:
   cpu_max: MAX
 ```
 
+In this case, you can give root cgroup CPU of 4 cores, and 12G of ram, but partition it into 4 different sub processmaster, give it to different users to launch their processes.
+The resource constraints are all honored in an ancester - descendent way.
+
 That means we will use the parent's CGROUP node as root. And treat it as our root for new cgroups.
 Things should generally work.
