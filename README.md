@@ -318,11 +318,29 @@ If `process.schedule` is set, the app becomes a cron job:
 - Also accepts 6-field cron if you want explicit seconds
 - Scheduled apps **must not** define `restart_policy` (mutually exclusive)
 
+#### Non-overlapping behavior (no concurrent runs)
+
+Cron jobs are **non-overlapping** by design:
+
+- When the cron expression matches, processmaster starts the job **only if it is not already running**.
+- If the previous run is still running, the new scheduled tick is skipped (no queueing).
+
+This prevents “pile-ups” for slow/blocked jobs.
+
+#### Overtime auto-kill (`process.max_time_per_run`)
+
+You can set a maximum runtime per scheduled run:
+
+- `process.max_time_per_run: "30s"` / `"10m"`: if the job runs longer than this, the daemon triggers an overtime stop:
+  - first tries the normal stop mechanism (`stop_command` or `stop_signal`)
+  - then escalates to a force kill (`cgroup.kill`) if it doesn’t exit within the grace window
+- `process.max_time_per_run: "never"` (or unset): no overtime enforcement
+
 Optional scheduling bounds:
 
 - `process.not_before`: `"YYYY-MM-DD"` or `"YYYY-MM-DD HH:MM:SS"` (local time)
 - `process.not_after`: `"YYYY-MM-DD"` or `"YYYY-MM-DD HH:MM:SS"` (local time, end-of-day inclusive for date-only)
-- `process.max_time_per_run`: `"30s"` / `"10m"` / `"never"` (if exceeded, daemon attempts an overtime stop)
+- `process.max_time_per_run`: `"30s"` / `"10m"` / `"never"` (maximum runtime per run; see overtime section above)
 
 ### Running a service as a user
 
