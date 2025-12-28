@@ -42,6 +42,11 @@ It runs on ubuntu 22, ubuntu 24, redhat 8 and any cgroup v2 supported platform.
 ## Cron support
 <img width="1728" height="314" alt="image" src="https://github.com/user-attachments/assets/62a39449-548d-485b-a7d8-6502ce230e3b" />
 
+## Process resource utilization view
+<img width="783" height="539" alt="image" src="https://github.com/user-attachments/assets/4202e751-9842-4591-b64a-1566d0a586e7" />
+
+<img width="786" height="279" alt="image" src="https://github.com/user-attachments/assets/8b81227e-a2ef-4057-9644-e0b49b33cdd0" />
+
 
 ## Quick start (local)
 
@@ -446,3 +451,28 @@ On `SIGTERM`/`SIGINT`, the daemon performs a **best-effort shutdown**:
 - Attempts to stop all services via the normal supervisor stop path.
 - Then does a final sweep to **force-kill** any remaining processes in app cgroups (`cgroup.kill`), and waits briefly for cgroups to become empty.
 - Finally closes the unix socket and exits.
+
+# Nesting
+You can process master in another parent processmaster, child processmaster can further run other processmaster etc. You just need to allow the subtree control.
+
+in master config, there is cgroup.subtree_control_allow, defaults to true. Once enabled, subtree in cgroup can also do exactly the same as parent cgroup.
+
+If you do not like it, you can set it to false (default is true).
+
+In nested processmaster, you need to configure proper parent cgroup node.
+
+For example:
+```yml
+cgroup:
+  root: /sys/fs/cgroup/processmaster/pm-mini_processmaster
+  name: pm1
+  memory_max: MAX
+  memory_swap_max: MAX
+  cpu_max: MAX
+```
+
+In this case, you can give root cgroup CPU of 4 cores, and 12G of ram, but partition it into 4 different sub processmaster, give it to different users to launch their processes.
+The resource constraints are all honored in an ancester - descendent way.
+
+That means we will use the parent's CGROUP node as root. And treat it as our root for new cgroups.
+Things should generally work.
