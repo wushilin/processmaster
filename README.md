@@ -31,6 +31,8 @@ WHy it is better than supervisor?
 <img width="1728" height="630" alt="image" src="https://github.com/user-attachments/assets/7ebc5c8e-a72a-429e-937b-735fdd80667a" />
 ## Online log viewing/tailing
 <img width="1123" height="788" alt="image" src="https://github.com/user-attachments/assets/e6216d51-0d9e-4818-b9cd-2a2ef243f954" />
+## Cron support
+<img width="1728" height="314" alt="image" src="https://github.com/user-attachments/assets/62a39449-548d-485b-a7d8-6502ce230e3b" />
 
 
 
