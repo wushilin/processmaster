@@ -446,3 +446,25 @@ On `SIGTERM`/`SIGINT`, the daemon performs a **best-effort shutdown**:
 - Attempts to stop all services via the normal supervisor stop path.
 - Then does a final sweep to **force-kill** any remaining processes in app cgroups (`cgroup.kill`), and waits briefly for cgroups to become empty.
 - Finally closes the unix socket and exits.
+
+# Nesting
+You can process master in another parent processmaster, child processmaster can further run other processmaster etc. You just need to allow the subtree control.
+
+in master config, there is cgroup.subtree_control_allow, defaults to true. Once enabled, subtree in cgroup can also do exactly the same as parent cgroup.
+
+If you do not like it, you can set it to false (default is true).
+
+In nested processmaster, you need to configure proper parent cgroup node.
+
+For example:
+```yml
+cgroup:
+  root: /sys/fs/cgroup/processmaster/pm-mini_processmaster
+  name: pm1
+  memory_max: MAX
+  memory_swap_max: MAX
+  cpu_max: MAX
+```
+
+That means we will use the parent's CGROUP node as root. And treat it as our root for new cgroups.
+Things should generally work.
