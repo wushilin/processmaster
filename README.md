@@ -5,7 +5,7 @@ It runs on ubuntu 22, ubuntu 24, redhat 8 and any cgroup v2 supported platform.
 
 Why it is better than supervisor? 
 
-1. It uses about 2% of supervisor's memory
+1. It uses about 2% of supervisor's memory. the screenshot shows it uses less than 1M memory.
 <img width="903" height="243" alt="image" src="https://github.com/user-attachments/assets/a8dba0f4-cac2-4e1e-9f1a-36b600862401" />
 
 2. It is blazing fast. Rust runs as close speed of native app
@@ -25,15 +25,18 @@ Why it is better than supervisor?
 - **`web consle: 9001`**: if you have enabled, you can use the web console
 
 # Screenshot
+
 ## CLI Access
 <img width="1547" height="472" alt="image" src="https://github.com/user-attachments/assets/22ef9c8d-773f-4175-9ec6-40c01603bd9a" />
+
 ## Web Access
 <img width="1728" height="630" alt="image" src="https://github.com/user-attachments/assets/7ebc5c8e-a72a-429e-937b-735fdd80667a" />
+
 ## Online log viewing/tailing
 <img width="1123" height="788" alt="image" src="https://github.com/user-attachments/assets/e6216d51-0d9e-4818-b9cd-2a2ef243f954" />
+
 ## Cron support
 <img width="1728" height="314" alt="image" src="https://github.com/user-attachments/assets/62a39449-548d-485b-a7d8-6502ce230e3b" />
-
 
 
 ## Quick start (local)
