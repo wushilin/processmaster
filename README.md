@@ -95,37 +95,38 @@ Example:
 
 ```yaml
 cgroup:
-  root: /sys/fs/cgroup
-  name: processmaster
-  memory_max: MAX
-  memory_swap_max: MAX
-  cpu_max: MAX
+  root: /sys/fs/cgroup        # cgroup v2 root
+  name: processmaster         # master cgroup name -> /sys/fs/cgroup/processmaster
+  memory_max: MAX             # writes memory.max (use MAX for unlimited)
+  memory_swap_max: MAX        # writes memory.swap.max
+  cpu_max: MAX                # writes cpu.max (use MAX for unlimited)
 
 unix_socket:
-  path: /tmp/processmaster.sock
-  owner: root      # requires daemon to run as root to chown
-  group: root      # requires daemon to run as root to chgrp
-  mode: 0660       # accepts 660, "660", or "0660"
+  path: /tmp/processmaster.sock   # pmctl/web UI connect to this socket
+  owner: root                     # chown socket file (requires root)
+  group: root                     # chgrp socket file (requires root)
+  mode: 0660                      # octal; accepts 660, "660", or "0660"
 
 global:
-  config_directory: ./config.d
-  # auto_service_directory: ./auto_services
+  config_directory: ./config.d    # directory of explicit service YAML files (*.yml/*.yaml)
+  # auto_service_directory: ./auto_services  # optional implicit services (one per subdirectory)
 
 web_console:
-  enabled: true
-  bind: 0.0.0.0
-  port: 9001
+  enabled: true                   # serve web UI at http(s)://bind:port/
+  bind: 0.0.0.0                   # listen address
+  port: 9001                      # listen port
   auth:
     basic:
       users:
-        # htpasswd bcrypt entries. Default is admin/admin if you omit this section.
+        # htpasswd bcrypt entries in the form "user:hash".
+        # If you omit the whole web_console.auth section, it defaults to admin/admin (bootstrapping only).
         - "admin:$2a$10$jqNWtAzhWEVlPnvJwyI6g.Nwb8YPU5ypCED9lBEhahUSs13ac1MPe"
 
 # Operator-triggered commands (run as root; cwd="."; fire-and-forget).
 admin_actions:
   update-pm:
-    label: "Update ProcessMaster"
-    command: ["/bin/sh", "-lc", "systemctl restart processmaster"]
+    label: "Update ProcessMaster"  # optional display label; defaults to the id ("update-pm")
+    command: ["/bin/sh", "-lc", "systemctl restart processmaster"]  # argv list
 ```
 
 ### Cgroup behavior
@@ -386,4 +387,8 @@ pmctl logs -f [filename]
 
 ## Graceful daemon shutdown
 
-On `SIGTERM`/`SIGINT`, the daemon leaves services running and exits; on next startup it can reconcile via cgroup state.
+On `SIGTERM`/`SIGINT`, the daemon performs a **best-effort shutdown**:
+
+- Attempts to stop all services via the normal supervisor stop path.
+- Then does a final sweep to **force-kill** any remaining processes in app cgroups (`cgroup.kill`), and waits briefly for cgroups to become empty.
+- Finally closes the unix socket and exits.
