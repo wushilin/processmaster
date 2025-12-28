@@ -5,10 +5,13 @@ use nix::errno::Errno;
 use nix::sys::signal::{kill as kill_pid, Signal};
 use nix::unistd::Pid;
 use nix::unistd::setsid;
+use serde::Serialize;
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::io::Write;
+use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 use std::os::unix::process::CommandExt;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
@@ -26,9 +29,24 @@ fn write_file(path: &Path, content: &str) -> anyhow::Result<()> {
     let mut f = fs::OpenOptions::new()
         .write(true)
         .open(path)
-        .with_context(|| format!("open for write: {}", path.display()))?;
-    f.write_all(content.as_bytes())
-        .with_context(|| format!("write: {}", path.display()))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "open for write {} failed: kind={:?} os_error={:?} err={}",
+                path.display(),
+                e.kind(),
+                e.raw_os_error(),
+                e
+            )
+        })?;
+    f.write_all(content.as_bytes()).map_err(|e| {
+        anyhow::anyhow!(
+            "write {} failed: kind={:?} os_error={:?} err={}",
+            path.display(),
+            e.kind(),
+            e.raw_os_error(),
+            e
+        )
+    })?;
     Ok(())
 }
 
@@ -288,13 +306,17 @@ pub(crate) fn wait_all_cancellable(cgroup_dir: &Path, cancel: &AtomicBool) -> an
             Err(e) => return Err(anyhow::anyhow!("pidfd_open pid={pid} failed: {e}")),
         };
 
-        // Poll in short intervals so we can observe cancellation.
+        // Poll in intervals so we can observe cancellation without burning CPU.
+        // Note: we don't have an eventfd to interrupt poll; cancellation is cooperative on timeout.
+        // Keep this reasonably small, but not 1s (which adds up with many services).
+        const CANCEL_POLL_MS: i32 = 5_000;
         loop {
             if cancel.load(Ordering::Relaxed) {
                 unsafe { let _ = libc::close(fd); }
                 return Ok(false);
             }
-            let ready = wait_pidfd(fd, 1000).with_context(|| format!("wait on pidfd for pid={pid}"))?;
+            let ready = wait_pidfd(fd, CANCEL_POLL_MS)
+                .with_context(|| format!("wait on pidfd for pid={pid}"))?;
             if ready {
                 break;
             }
@@ -318,6 +340,8 @@ pub(crate) struct Resources {
     pub(crate) cpu_weight: Option<u16>,
     /// cgroup v2 `io.weight` default weight (1..=10000). Written as `default <n>`.
     pub(crate) io_weight: Option<u16>,
+    /// cgroup v2 `io.max` lines (one per block device), e.g. `"8:0 rbps=1048576 wbps=1048576"`.
+    pub(crate) io_max: Vec<String>,
 }
 
 impl Default for Resources {
@@ -328,6 +352,7 @@ impl Default for Resources {
             swap_max: None,
             cpu_weight: None,
             io_weight: None,
+            io_max: Vec::new(),
         }
     }
 }
@@ -388,7 +413,36 @@ fn apply_resources(cgroup_dir: &Path, res: &Resources) -> anyhow::Result<()> {
         write_file(&cgroup_dir.join("io.weight"), &format!("default {v}\n"))
             .with_context(|| format!("set io.weight for {}", cgroup_dir.display()))?;
     }
+    if !res.io_max.is_empty() {
+        let mut body = res.io_max.join("\n");
+        body.push('\n');
+        // NOTE: io.max is device-specific and kernel validation can fail with EINVAL/ENODEV.
+        // Include the exact payload in the error chain so operators can reproduce with `echo ... > io.max`.
+        let payload = body.trim_end().to_string();
+        write_file(&cgroup_dir.join("io.max"), &body).with_context(|| {
+            format!(
+                "set io.max for {} (payload={payload:?}). Hint: ensure the device MAJ:MIN exists in io.stat; some kernels/devices may reject riops/wiops with EINVAL.",
+                cgroup_dir.display()
+            )
+        })?;
+    }
     Ok(())
+}
+
+/// Resolve a block-device identifier (major:minor) from a path.
+///
+/// - If `path` is a block device node (e.g. `/dev/sda`), uses `st_rdev`.
+/// - Otherwise (directory/file/mountpoint), uses the filesystem device `st_dev`.
+pub(crate) fn resolve_device_major_minor(path: &Path) -> anyhow::Result<(u32, u32)> {
+    let md = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    let dev: u64 = if md.file_type().is_block_device() {
+        md.rdev()
+    } else {
+        md.dev()
+    };
+    let maj = libc::major(dev) as u32;
+    let min = libc::minor(dev) as u32;
+    Ok((maj, min))
 }
 
 fn decorate_argv0(program: &OsString, group: &str) -> OsString {
@@ -483,6 +537,183 @@ pub(crate) fn launch_process(p: &LaunchParams) -> anyhow::Result<Child> {
     let program = p.argv[0].clone();
     cmd.spawn()
         .with_context(|| format!("spawn program={}", program.to_string_lossy()))
+}
+
+fn read_to_string_opt(path: &Path) -> anyhow::Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn read_trimmed_opt(path: &Path) -> anyhow::Result<Option<String>> {
+    Ok(read_to_string_opt(path)?
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty()))
+}
+
+fn read_u64_opt(path: &Path) -> anyhow::Result<Option<u64>> {
+    let Some(s) = read_trimmed_opt(path)? else {
+        return Ok(None);
+    };
+    let v: u64 = s
+        .trim()
+        .parse()
+        .with_context(|| format!("parse u64 from {}: {s}", path.display()))?;
+    Ok(Some(v))
+}
+
+fn parse_kv_u64_lines(s: &str) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    for line in s.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let mut it = t.split_whitespace();
+        let Some(k) = it.next() else { continue };
+        let Some(vs) = it.next() else { continue };
+        if let Ok(v) = vs.parse::<u64>() {
+            out.insert(k.to_string(), v);
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CgroupPressureLine {
+    pub avg10: Option<f64>,
+    pub avg60: Option<f64>,
+    pub avg300: Option<f64>,
+    pub total: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CgroupPressure {
+    /// `some ...` line, if present (PSI).
+    pub some: Option<CgroupPressureLine>,
+    /// `full ...` line, if present (PSI).
+    pub full: Option<CgroupPressureLine>,
+    /// Raw file contents (trimmed), for debugging.
+    pub raw: Option<String>,
+}
+
+fn parse_pressure_opt(s: Option<String>) -> Option<CgroupPressure> {
+    let raw = s.map(|x| x.trim().to_string()).filter(|x| !x.is_empty())?;
+    let mut some: Option<CgroupPressureLine> = None;
+    let mut full: Option<CgroupPressureLine> = None;
+
+    for line in raw.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let mut parts = t.split_whitespace();
+        let Some(kind) = parts.next() else { continue };
+        let mut pl = CgroupPressureLine {
+            avg10: None,
+            avg60: None,
+            avg300: None,
+            total: None,
+        };
+        for p in parts {
+            let Some((k, v)) = p.split_once('=') else { continue };
+            match k {
+                "avg10" => pl.avg10 = v.parse::<f64>().ok(),
+                "avg60" => pl.avg60 = v.parse::<f64>().ok(),
+                "avg300" => pl.avg300 = v.parse::<f64>().ok(),
+                "total" => pl.total = v.parse::<u64>().ok(),
+                _ => {}
+            }
+        }
+        match kind {
+            "some" => some = Some(pl),
+            "full" => full = Some(pl),
+            _ => {}
+        }
+    }
+
+    Some(CgroupPressure {
+        some,
+        full,
+        raw: Some(raw),
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CgroupResourceSnapshot {
+    pub cgroup_dir: String,
+
+    /// `memory.max` raw (e.g. "max" or bytes).
+    pub memory_max: Option<String>,
+    /// `memory.current` bytes.
+    pub memory_current: Option<u64>,
+
+    /// `memory.swap.max` raw (e.g. "max" or bytes). May be missing if swap controller isn't enabled.
+    pub swap_max: Option<String>,
+    /// `memory.swap.current` bytes. May be missing if swap controller isn't enabled.
+    pub swap_current: Option<u64>,
+
+    /// `cpu.max` raw (e.g. "max 100000" or "20000 100000").
+    pub cpu_max: Option<String>,
+    /// `cpu.stat` parsed key/value map.
+    pub cpu_stat: Option<BTreeMap<String, u64>>,
+    /// `cpu.pressure` PSI (if available).
+    pub cpu_pressure: Option<CgroupPressure>,
+    /// `memory.pressure` PSI (if available).
+    pub memory_pressure: Option<CgroupPressure>,
+
+    /// `io.max` raw (if available). This reflects the current I/O caps for this cgroup.
+    pub io_max: Option<String>,
+    /// `io.stat` raw (if available). Per-device cumulative I/O counters.
+    pub io_stat: Option<String>,
+    /// `io.pressure` PSI (if available).
+    pub io_pressure: Option<CgroupPressure>,
+}
+
+/// Read a lightweight snapshot of resource-related cgroup v2 files for display/debugging.
+///
+/// The values are taken from the provided cgroup directory. For processmaster apps, this should
+/// typically be the *parent* app cgroup (e.g. `.../pm-<app>`), so the stats cover the whole subtree.
+pub(crate) fn read_resource_snapshot(cgroup_dir: &Path) -> anyhow::Result<CgroupResourceSnapshot> {
+    let memory_max = read_trimmed_opt(&cgroup_dir.join("memory.max"))?;
+    let memory_current = read_u64_opt(&cgroup_dir.join("memory.current"))?;
+
+    let swap_max = read_trimmed_opt(&cgroup_dir.join("memory.swap.max"))?;
+    let swap_current = read_u64_opt(&cgroup_dir.join("memory.swap.current"))?;
+
+    let cpu_max = read_trimmed_opt(&cgroup_dir.join("cpu.max"))?;
+    let cpu_stat = read_to_string_opt(&cgroup_dir.join("cpu.stat"))?
+        .map(|s| parse_kv_u64_lines(&s))
+        .or_else(|| None);
+
+    let cpu_pressure = parse_pressure_opt(read_to_string_opt(&cgroup_dir.join("cpu.pressure"))?);
+    let memory_pressure =
+        parse_pressure_opt(read_to_string_opt(&cgroup_dir.join("memory.pressure"))?);
+
+    let io_max = read_to_string_opt(&cgroup_dir.join("io.max"))?
+        .map(|s| s.trim_end().to_string())
+        .filter(|s| !s.trim().is_empty());
+    let io_stat = read_to_string_opt(&cgroup_dir.join("io.stat"))?
+        .map(|s| s.trim_end().to_string())
+        .filter(|s| !s.trim().is_empty());
+    let io_pressure = parse_pressure_opt(read_to_string_opt(&cgroup_dir.join("io.pressure"))?);
+
+    Ok(CgroupResourceSnapshot {
+        cgroup_dir: cgroup_dir.display().to_string(),
+        memory_max,
+        memory_current,
+        swap_max,
+        swap_current,
+        cpu_max,
+        cpu_stat: Some(cpu_stat.unwrap_or_default()),
+        cpu_pressure,
+        memory_pressure,
+        io_max,
+        io_stat,
+        io_pressure,
+    })
 }
 
 

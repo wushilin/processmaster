@@ -285,6 +285,82 @@
   </div>
 </div>
 
+<!-- Service details modal -->
+<div class="modal fade" id="serviceDetailsModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Service details: <span id="svcDetailsApp" class="text-muted"></span></h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <div class="text-muted small">Cgroup: <code id="svcDetailsCgroup">-</code></div>
+          <button id="svcDetailsRefresh" class="btn btn-outline-secondary btn-sm">Refresh</button>
+        </div>
+
+        <div class="row g-3">
+          <div class="col-12 col-lg-6">
+            <div class="fw-semibold mb-1">Memory</div>
+            <div class="border rounded p-2 bg-light">
+              <div>current: <code id="svcMemCurrent">-</code></div>
+              <div>max: <code id="svcMemMax">-</code></div>
+              <div>util: <code id="svcMemPct">-</code></div>
+              <div class="text-muted small mt-1">pressure (avg10): <code id="svcMemPsi">-</code></div>
+            </div>
+          </div>
+          <div class="col-12 col-lg-6">
+            <div class="fw-semibold mb-1">Swap</div>
+            <div class="border rounded p-2 bg-light">
+              <div>current: <code id="svcSwapCurrent">-</code></div>
+              <div>max: <code id="svcSwapMax">-</code></div>
+              <div>util: <code id="svcSwapPct">-</code></div>
+            </div>
+          </div>
+          <div class="col-12">
+            <div class="fw-semibold mb-1">CPU</div>
+            <div class="border rounded p-2 bg-light">
+              <div>cpu.max: <code id="svcCpuMaxRaw">-</code></div>
+              <div class="mt-1">
+                util (sampled): <code id="svcCpuUtil1Core">-</code> of 1 core
+                <span class="text-muted">/</span>
+                <code id="svcCpuUtilQuota">-</code> of quota
+                <span class="text-muted small">(window <span id="svcCpuSampleMs">-</span>ms)</span>
+              </div>
+              <div class="mt-1">throttled (sampled): <code id="svcCpuThrPct">-</code> of wall time</div>
+              <div class="row g-2 mt-1">
+                <div class="col-12 col-md-6">usage (total): <code id="svcCpuUsage">-</code></div>
+                <div class="col-12 col-md-6">throttled (total): <code id="svcCpuThrottled">-</code></div>
+                <div class="col-12 col-md-6">nr_throttled: <code id="svcCpuNrThrottled">-</code></div>
+                <div class="col-12 col-md-6">nr_periods: <code id="svcCpuNrPeriods">-</code></div>
+              </div>
+              <div class="text-muted small mt-1">pressure (avg10): <code id="svcCpuPsi">-</code></div>
+              <div class="text-muted small mt-1">Note: CPU “usage” is cumulative (µs since cgroup creation). For “current load” you’d typically look at pressure/throttling trends.</div>
+            </div>
+          </div>
+          <div class="col-12">
+            <div class="fw-semibold mb-1">IO</div>
+            <div class="border rounded p-2 bg-light">
+              <div>io.max: <code id="svcIoMax">-</code></div>
+              <div class="text-muted small mt-1">pressure (avg10): <code id="svcIoPsi">-</code></div>
+              <div class="mt-1">throughput (sampled): <code id="svcIoSampleMs">-</code>ms window</div>
+              <div class="mt-2">
+                <div class="text-muted small mb-1">io.stat (per-device sampled deltas):</div>
+                <pre id="svcIoStatDelta" class="bg-white border rounded p-2 mb-2" style="max-height: 14em; overflow: auto;"></pre>
+                <div class="text-muted small mb-1">io.stat (per-device cumulative):</div>
+                <pre id="svcIoStat" class="bg-white border rounded p-2 mb-0" style="max-height: 10em; overflow: auto;"></pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Confirm action modal -->
 <div class="modal fade" id="confirmModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog">
@@ -630,6 +706,7 @@
       const ups = (s.pid_uptimes_ms || []);
       const pidLines = pids.length ? pids.map((pid) => `<div><code>${esc(pid.toString())}</code></div>`).join("") : `<div class="text-muted">-</div>`;
       const upLines = pids.length ? pids.map((_, i) => `<div>${esc(fmtUptimeMs(ups[i] ?? -1))}</div>`).join("") : `<div class="text-muted">-</div>`;
+      const appBtn = `<button type="button" class="btn btn-link btn-sm p-0 text-decoration-none" data-action="details" data-app="${esc(app)}" title="Show service details"><code>${esc(app)}</code></button>`;
       const actions = [
         iconButton("play", "Start", "start", app),
         iconButton("stop", "Stop", "stop", app),
@@ -639,7 +716,7 @@
       ].join("");
       const actionsGroup = `<div class="btn-group btn-group-sm pm-actions" role="group" aria-label="Actions">${actions}</div>`;
       return `<tr>
-        <td class="pm-truncate col-app" title="${esc(app)}"><code>${esc(app)}</code></td>
+        <td class="pm-truncate col-app" title="${esc(app)}">${appBtn}</td>
         <td class="col-status"><span class="${badgeForState(s)}">${esc(phase)}</span></td>
         <td class="col-crashes_10m">${esc(crashes)}</td>
         <td class="text-nowrap col-pid">${pidLines}</td>
@@ -661,6 +738,7 @@
       const ups = (s.pid_uptimes_ms || []);
       const pidLines = pids.length ? pids.map((pid) => `<div><code>${esc(pid.toString())}</code></div>`).join("") : `<div class="text-muted">-</div>`;
       const upLines = pids.length ? pids.map((_, i) => `<div>${esc(fmtUptimeMs(ups[i] ?? -1))}</div>`).join("") : `<div class="text-muted">-</div>`;
+      const appBtn = `<button type="button" class="btn btn-link btn-sm p-0 text-decoration-none" data-action="details" data-app="${esc(app)}" title="Show service details"><code>${esc(app)}</code></button>`;
       const scheduleBtn = `<button type="button" class="btn btn-sm btn-outline-info" data-action="schedule" data-app="${esc(app)}"><code>${esc(expr)}</code></button>`;
       const actions = [
         iconButton("play", "Run now", "start", app),
@@ -671,7 +749,7 @@
       ].join("");
       const actionsGroup = `<div class="btn-group btn-group-sm pm-actions" role="group" aria-label="Actions">${actions}</div>`;
       return `<tr>
-        <td class="pm-truncate col-app" title="${esc(app)}"><code>${esc(app)}</code></td>
+        <td class="pm-truncate col-app" title="${esc(app)}">${appBtn}</td>
         <td class="pm-truncate col-schedule">${scheduleBtn}</td>
         <td class="col-status"><span class="${badgeForState(s)}">${esc(phase)}</span></td>
         <td class="text-nowrap col-pid">${pidLines}</td>
@@ -834,6 +912,364 @@
       } finally {
         await loadAdminActionPids();
       }
+    });
+  }
+
+  // -------- service details modal (cgroup resources) --------
+  const svcDetailsModalEl = document.getElementById("serviceDetailsModal");
+  const svcDetailsModal = svcDetailsModalEl ? new bootstrap.Modal(svcDetailsModalEl) : null;
+  const svcDetailsAppEl = document.getElementById("svcDetailsApp");
+  const svcDetailsCgroupEl = document.getElementById("svcDetailsCgroup");
+  const svcDetailsRefreshBtn = document.getElementById("svcDetailsRefresh");
+  const svcMemCurrentEl = document.getElementById("svcMemCurrent");
+  const svcMemMaxEl = document.getElementById("svcMemMax");
+  const svcMemPctEl = document.getElementById("svcMemPct");
+  const svcMemPsiEl = document.getElementById("svcMemPsi");
+  const svcSwapCurrentEl = document.getElementById("svcSwapCurrent");
+  const svcSwapMaxEl = document.getElementById("svcSwapMax");
+  const svcSwapPctEl = document.getElementById("svcSwapPct");
+  const svcCpuMaxRawEl = document.getElementById("svcCpuMaxRaw");
+  const svcCpuUtil1CoreEl = document.getElementById("svcCpuUtil1Core");
+  const svcCpuUtilQuotaEl = document.getElementById("svcCpuUtilQuota");
+  const svcCpuThrPctEl = document.getElementById("svcCpuThrPct");
+  const svcCpuSampleMsEl = document.getElementById("svcCpuSampleMs");
+  const svcCpuUsageEl = document.getElementById("svcCpuUsage");
+  const svcCpuThrottledEl = document.getElementById("svcCpuThrottled");
+  const svcCpuNrThrottledEl = document.getElementById("svcCpuNrThrottled");
+  const svcCpuNrPeriodsEl = document.getElementById("svcCpuNrPeriods");
+  const svcCpuPsiEl = document.getElementById("svcCpuPsi");
+  const svcIoMaxEl = document.getElementById("svcIoMax");
+  const svcIoPsiEl = document.getElementById("svcIoPsi");
+  const svcIoStatEl = document.getElementById("svcIoStat");
+  const svcIoStatDeltaEl = document.getElementById("svcIoStatDelta");
+  const svcIoSampleMsEl = document.getElementById("svcIoSampleMs");
+  let svcDetailsApp = null;
+
+  function fmtBytes(n) {
+    if (n === null || n === undefined) return "-";
+    const x = Number(n);
+    if (!isFinite(x)) return "-";
+    const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let v = x;
+    let i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    const digits = (i === 0) ? 0 : (v >= 10 ? 1 : 2);
+    return v.toFixed(digits) + " " + units[i];
+  }
+
+  function parseLimitBytes(raw) {
+    if (!raw) return null;
+    const t = ("" + raw).trim();
+    if (!t || t === "max") return null;
+    const n = parseInt(t, 10);
+    return isFinite(n) ? n : null;
+  }
+
+  function fmtLimit(raw) {
+    if (!raw) return "-";
+    const t = ("" + raw).trim();
+    if (!t) return "-";
+    if (t === "max") return "unlimited";
+    const n = parseLimitBytes(t);
+    return (n !== null) ? fmtBytes(n) : t;
+  }
+
+  function fmtPct(curBytes, maxRaw) {
+    if (curBytes === null || curBytes === undefined) return "-";
+    const maxB = parseLimitBytes(maxRaw);
+    if (!maxB || maxB <= 0) return "-";
+    const pct = (Number(curBytes) / Number(maxB)) * 100;
+    if (!isFinite(pct)) return "-";
+    return pct.toFixed(1) + "%";
+  }
+
+  function fmtPsiAvg10(psi) {
+    // psi: { some: {avg10,...}, full: {...}, raw: ... }
+    if (!psi) return "-";
+    const s = psi.some || null;
+    if (!s || s.avg10 === null || s.avg10 === undefined) return "-";
+    const x = Number(s.avg10);
+    return isFinite(x) ? x.toFixed(2) : "-";
+  }
+
+  function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+  function parseCpuMax(raw) {
+    // returns { quota_us: number|null, period_us: number|null }
+    const t = (raw || "").trim();
+    if (!t) return { quota_us: null, period_us: null };
+    const parts = t.split(/\s+/);
+    const a = parts[0] || "";
+    const b = parts[1] || "";
+    const period = b ? parseInt(b, 10) : NaN;
+    const period_us = isFinite(period) ? period : null;
+    if (a === "max") return { quota_us: null, period_us };
+    const quota = parseInt(a, 10);
+    const quota_us = isFinite(quota) ? quota : null;
+    return { quota_us, period_us };
+  }
+
+  function fmtCpuMaxPretty(raw) {
+    const t = (raw || "").trim();
+    if (!t) return "-";
+    const { quota_us, period_us } = parseCpuMax(t);
+    if (quota_us === null) {
+      if (period_us !== null) return `unlimited (period=${(period_us/1000).toFixed(0)}ms)`;
+      return "unlimited";
+    }
+    if (period_us === null || period_us <= 0) return t;
+    const qms = quota_us / 1000;
+    const pms = period_us / 1000;
+    const millicores = Math.round((quota_us / period_us) * 1000);
+    return `${qms.toFixed(3)}ms/${pms.toFixed(3)}ms (~${millicores}m)`;
+  }
+
+  function statGet(st, k) {
+    if (!st) return null;
+    const v = st[k];
+    if (v === null || v === undefined) return null;
+    const n = Number(v);
+    return isFinite(n) ? n : null;
+  }
+
+  function fmtPctNum(x) {
+    if (x === null || x === undefined) return "-";
+    const n = Number(x);
+    if (!isFinite(n)) return "-";
+    return n.toFixed(1) + "%";
+  }
+
+  function parseIoStat(raw) {
+    // cgroup v2 io.stat lines look like:
+    //   "8:0 rbytes=123 wbytes=456 rios=7 wios=8 dbytes=0 dios=0"
+    // Return map { "8:0": {rbytes, wbytes, rios, wios, dbytes, dios, ...} }
+    const out = {};
+    const lines = (raw || "").split("\n").map(s => s.trim()).filter(s => s.length);
+    for (const line of lines) {
+      const parts = line.split(/\s+/);
+      const dev = parts[0];
+      if (!dev || !dev.includes(":")) continue;
+      const m = out[dev] || {};
+      for (const p of parts.slice(1)) {
+        const kv = p.split("=");
+        if (kv.length !== 2) continue;
+        const k = kv[0];
+        const v = Number(kv[1]);
+        if (!k) continue;
+        if (isFinite(v)) m[k] = v;
+      }
+      out[dev] = m;
+    }
+    return out;
+  }
+
+  function fmtBytesPerSec(bytes, dtMs) {
+    if (bytes === null || bytes === undefined) return "-";
+    const dt = Number(dtMs);
+    if (!isFinite(dt) || dt <= 0) return "-";
+    const bps = (Number(bytes) * 1000) / dt;
+    if (!isFinite(bps)) return "-";
+    // reuse fmtBytes but show "/s"
+    return fmtBytes(bps) + "/s";
+  }
+
+  function fmtIops(ops, dtMs) {
+    if (ops === null || ops === undefined) return "-";
+    const dt = Number(dtMs);
+    if (!isFinite(dt) || dt <= 0) return "-";
+    const iops = (Number(ops) * 1000) / dt;
+    if (!isFinite(iops)) return "-";
+    return iops.toFixed(iops >= 100 ? 0 : 1) + " iops";
+  }
+
+  async function loadServiceDetails(app) {
+    svcDetailsApp = app;
+    if (svcDetailsAppEl) svcDetailsAppEl.textContent = app || "";
+    const setTxt = (el, txt) => { if (el) el.textContent = (txt === null || txt === undefined) ? "-" : ("" + txt); };
+    setTxt(svcDetailsCgroupEl, "Loading…");
+    setTxt(svcMemCurrentEl, "Loading…");
+    setTxt(svcMemMaxEl, "Loading…");
+    setTxt(svcMemPctEl, "Loading…");
+    setTxt(svcMemPsiEl, "Loading…");
+    setTxt(svcSwapCurrentEl, "Loading…");
+    setTxt(svcSwapMaxEl, "Loading…");
+    setTxt(svcSwapPctEl, "Loading…");
+    setTxt(svcCpuMaxRawEl, "Loading…");
+    setTxt(svcCpuUtil1CoreEl, "Loading…");
+    setTxt(svcCpuUtilQuotaEl, "Loading…");
+    setTxt(svcCpuThrPctEl, "Loading…");
+    setTxt(svcCpuSampleMsEl, "Loading…");
+    setTxt(svcCpuUsageEl, "Loading…");
+    setTxt(svcCpuThrottledEl, "Loading…");
+    setTxt(svcCpuNrThrottledEl, "Loading…");
+    setTxt(svcCpuNrPeriodsEl, "Loading…");
+    setTxt(svcCpuPsiEl, "Loading…");
+    setTxt(svcIoMaxEl, "Loading…");
+    setTxt(svcIoPsiEl, "Loading…");
+    setTxt(svcIoSampleMsEl, "Loading…");
+    if (svcIoStatDeltaEl) svcIoStatDeltaEl.textContent = "Loading…";
+    if (svcIoStatEl) svcIoStatEl.textContent = "Loading…";
+
+    // Take 2 samples so we can compute CPU utilization from cumulative counters.
+    const t0 = performance.now();
+    const resp1 = await rpc("service_details", { app }, { busy: false });
+    if (!resp1.ok) {
+      setTxt(svcDetailsCgroupEl, "-");
+      setTxt(svcMemCurrentEl, "-");
+      setTxt(svcMemMaxEl, "-");
+      setTxt(svcMemPctEl, "-");
+      setTxt(svcMemPsiEl, "-");
+      setTxt(svcSwapCurrentEl, "-");
+      setTxt(svcSwapMaxEl, "-");
+      setTxt(svcSwapPctEl, "-");
+      setTxt(svcCpuMaxRawEl, "-");
+      setTxt(svcCpuUtil1CoreEl, "-");
+      setTxt(svcCpuUtilQuotaEl, "-");
+      setTxt(svcCpuThrPctEl, "-");
+      setTxt(svcCpuSampleMsEl, "-");
+      setTxt(svcCpuUsageEl, "-");
+      setTxt(svcCpuThrottledEl, "-");
+      setTxt(svcCpuNrThrottledEl, "-");
+      setTxt(svcCpuNrPeriodsEl, "-");
+      setTxt(svcCpuPsiEl, "-");
+      setTxt(svcIoMaxEl, "-");
+      setTxt(svcIoPsiEl, "-");
+      setTxt(svcIoSampleMsEl, "-");
+      if (svcIoStatDeltaEl) svcIoStatDeltaEl.textContent = "-";
+      if (svcIoStatEl) svcIoStatEl.textContent = "-";
+      showAlert("danger", resp1.message || "failed to load service details");
+      return;
+    }
+
+    // Small delay to form a measurement window; match pmctl default (1s).
+    await sleep(1000);
+    const t1 = performance.now();
+    const resp2 = await rpc("service_details", { app }, { busy: false });
+    const snap1 = resp1.snapshot || {};
+    const snap2 = (resp2 && resp2.ok) ? (resp2.snapshot || {}) : snap1;
+    const dt_ms = Math.max(1, Math.round((t1 - t0)));
+
+    const snap = snap2;
+    setTxt(svcDetailsCgroupEl, snap.cgroup_dir || "-");
+
+    const memCur = snap.memory_current;
+    const memMaxRaw = snap.memory_max;
+    setTxt(svcMemCurrentEl, fmtBytes(memCur));
+    setTxt(svcMemMaxEl, fmtLimit(memMaxRaw));
+    setTxt(svcMemPctEl, fmtPct(memCur, memMaxRaw));
+    setTxt(svcMemPsiEl, fmtPsiAvg10(snap.memory_pressure));
+
+    const swCur = snap.swap_current;
+    const swMaxRaw = snap.swap_max;
+    setTxt(svcSwapCurrentEl, fmtBytes(swCur));
+    setTxt(svcSwapMaxEl, fmtLimit(swMaxRaw));
+    setTxt(svcSwapPctEl, fmtPct(swCur, swMaxRaw));
+
+    setTxt(svcCpuMaxRawEl, fmtCpuMaxPretty(snap.cpu_max || "-"));
+    const st = (snap.cpu_stat || {});
+    setTxt(svcCpuUsageEl, (st.usage_usec !== undefined) ? (st.usage_usec + " µs") : "-");
+    setTxt(svcCpuThrottledEl, (st.throttled_usec !== undefined) ? (st.throttled_usec + " µs") : "-");
+    setTxt(svcCpuNrThrottledEl, (st.nr_throttled !== undefined) ? st.nr_throttled : "-");
+    setTxt(svcCpuNrPeriodsEl, (st.nr_periods !== undefined) ? st.nr_periods : "-");
+    setTxt(svcCpuPsiEl, fmtPsiAvg10(snap.cpu_pressure));
+
+    // IO snapshot
+    setTxt(svcIoMaxEl, (snap.io_max && ("" + snap.io_max).trim().length) ? ("" + snap.io_max).trim() : "-");
+    setTxt(svcIoPsiEl, fmtPsiAvg10(snap.io_pressure));
+    setTxt(svcIoSampleMsEl, dt_ms.toString());
+
+    // IO sampled deltas (per device)
+    if (svcIoStatDeltaEl) {
+      try {
+        const a = parseIoStat(snap1.io_stat || "");
+        const b = parseIoStat(snap2.io_stat || "");
+        const devices = Array.from(new Set(Object.keys(a).concat(Object.keys(b)))).sort();
+        if (!devices.length) {
+          svcIoStatDeltaEl.textContent = "(none)";
+        } else {
+          const lines = [];
+          for (const dev of devices) {
+            const va = a[dev] || {};
+            const vb = b[dev] || {};
+            const drb = (vb.rbytes !== undefined && va.rbytes !== undefined && vb.rbytes >= va.rbytes) ? (vb.rbytes - va.rbytes) : null;
+            const dwb = (vb.wbytes !== undefined && va.wbytes !== undefined && vb.wbytes >= va.wbytes) ? (vb.wbytes - va.wbytes) : null;
+            const dri = (vb.rios !== undefined && va.rios !== undefined && vb.rios >= va.rios) ? (vb.rios - va.rios) : null;
+            const dwi = (vb.wios !== undefined && va.wios !== undefined && vb.wios >= va.wios) ? (vb.wios - va.wios) : null;
+            const r = fmtBytesPerSec(drb, dt_ms);
+            const w = fmtBytesPerSec(dwb, dt_ms);
+            const ri = fmtIops(dri, dt_ms);
+            const wi = fmtIops(dwi, dt_ms);
+            lines.push(`${dev}  read=${r} (${ri})  write=${w} (${wi})`);
+          }
+          const cap = 20;
+          const shown = lines.slice(0, cap);
+          const more = (lines.length > cap) ? `\n… (+${lines.length - cap} more devices)` : "";
+          svcIoStatDeltaEl.textContent = shown.join("\n") + more;
+        }
+      } catch (e) {
+        svcIoStatDeltaEl.textContent = e.toString();
+      }
+    }
+
+    if (svcIoStatEl) {
+      const raw = (snap.io_stat || "");
+      const lines = raw.split("\n").map(s => s.trim()).filter(s => s.length);
+      const cap = 20;
+      const shown = lines.slice(0, cap);
+      const more = (lines.length > cap) ? `\n… (+${lines.length - cap} more lines)` : "";
+      svcIoStatEl.textContent = shown.length ? (shown.join("\n") + more) : "(none)";
+    }
+
+    // Sampled CPU util
+    setTxt(svcCpuSampleMsEl, dt_ms.toString());
+    const stA = (snap1.cpu_stat || {});
+    const stB = (snap2.cpu_stat || {});
+    const u1 = statGet(stA, "usage_usec");
+    const u2 = statGet(stB, "usage_usec");
+    const th1 = statGet(stA, "throttled_usec");
+    const th2 = statGet(stB, "throttled_usec");
+
+    if (u1 !== null && u2 !== null && u2 >= u1) {
+      const du = u2 - u1;
+      const pct1core = (du / (dt_ms * 1000)) * 100;
+      setTxt(svcCpuUtil1CoreEl, fmtPctNum(pct1core));
+
+      const { quota_us, period_us } = parseCpuMax(snap2.cpu_max || "");
+      if (quota_us !== null && period_us !== null && period_us > 0) {
+        const effectiveCores = quota_us / period_us; // cores
+        if (effectiveCores > 0) {
+          const pctQuota = (du / ((dt_ms * 1000) * effectiveCores)) * 100;
+          setTxt(svcCpuUtilQuotaEl, fmtPctNum(pctQuota));
+        } else {
+          setTxt(svcCpuUtilQuotaEl, "-");
+        }
+      } else {
+        setTxt(svcCpuUtilQuotaEl, "-");
+      }
+    } else {
+      setTxt(svcCpuUtil1CoreEl, "-");
+      setTxt(svcCpuUtilQuotaEl, "-");
+    }
+
+    if (th1 !== null && th2 !== null && th2 >= th1) {
+      const dth = th2 - th1;
+      const pctThr = (dth / (dt_ms * 1000)) * 100;
+      setTxt(svcCpuThrPctEl, fmtPctNum(pctThr));
+    } else {
+      setTxt(svcCpuThrPctEl, "-");
+    }
+  }
+
+  async function openServiceDetailsFor(app) {
+    if (!svcDetailsModal) return;
+    svcDetailsModal.show();
+    try { await loadServiceDetails(app); } catch (e) { showAlert("danger", e.toString()); }
+  }
+
+  if (svcDetailsRefreshBtn) {
+    svcDetailsRefreshBtn.addEventListener("click", async () => {
+      if (!svcDetailsApp) return;
+      try { await loadServiceDetails(svcDetailsApp); } catch (e) { showAlert("danger", e.toString()); }
     });
   }
 
@@ -1495,6 +1931,7 @@
     const action = el.getAttribute("data-action");
     const app = el.getAttribute("data-app");
     if (!action || !app) return;
+    if (action === "details") { openServiceDetailsFor(app); return; }
     if (action === "logs") { openLogsFor(app); return; }
     if (action === "flags") { openFlagsFor(app); return; }
     if (action === "schedule") { openScheduleFor(app); return; }

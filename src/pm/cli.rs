@@ -83,6 +83,17 @@ pub enum Cmd {
     Version,
     /// Print server build info (requires daemon socket)
     ServerVersion,
+    /// Show per-app performance/resource metrics from cgroup (memory/swap/cpu + pressure/throttling)
+    PerfMetrics {
+        name: String,
+        /// Sampling interval used to compute CPU utilization from cumulative cpu.stat counters.
+        /// If you pass `--once`, no utilization is computed and this is ignored.
+        #[arg(long = "interval-ms", default_value_t = 1000)]
+        interval_ms: u64,
+        /// Only print a single snapshot (no sleep; no utilization %).
+        #[arg(long = "once")]
+        once: bool,
+    },
 
     /// List configured admin actions (name + label)
     AdminList,
@@ -114,6 +125,26 @@ pub fn run() -> anyhow::Result<()> {
             let resp = rpc::client_call(&cfg.sock, rpc::Request::ServerVersion)?;
             if !resp.message.trim().is_empty() {
                 println!("{}", resp.message.trim_end());
+            }
+            Ok(())
+        }
+        Some(Cmd::PerfMetrics { name, .. }) => {
+            let resp = rpc::client_call(&cfg.sock, rpc::Request::PerfMetrics { name })?;
+            if let Some(m) = resp.perf_metrics {
+                println!("app: {}", m.app);
+                println!("cgroup: {}", m.cgroup_dir);
+                println!("memory.current: {:?}", m.memory_current);
+                println!("memory.max: {:?}", m.memory_max);
+                println!("swap.current: {:?}", m.swap_current);
+                println!("swap.max: {:?}", m.swap_max);
+                println!("cpu.max: {:?}", m.cpu_max);
+                if let Some(st) = m.cpu_stat {
+                    println!("cpu.stat: {:?}", st);
+                }
+            } else if !resp.message.trim().is_empty() {
+                println!("{}", resp.message.trim_end());
+            } else {
+                println!("(no metrics)");
             }
             Ok(())
         }

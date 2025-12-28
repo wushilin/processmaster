@@ -258,6 +258,22 @@ pub struct AppDefinition {
     #[serde(default)]
     pub max_swap: Option<String>,
 
+    /// Optional: cgroup v2 io.weight (1..=10000). Proportional I/O share under contention.
+    #[serde(default)]
+    pub io_weight: Option<u16>,
+
+    /// Optional: cgroup v2 io.max bandwidth cap (per block device).
+    ///
+    /// Example:
+    ///   io_bandwidth:
+    ///     - device: "253:8"
+    ///       max_read_bytes_per_second: 75MiB   # rbps
+    ///       max_write_bytes_per_second: 75MiB  # wbps
+    ///       max_read_iops: 5000                # riops (optional)
+    ///       max_write_iops: 2000               # wiops (optional)
+    #[serde(default)]
+    pub io_bandwidth: Option<IoBandwidthConfig>,
+
     #[serde(default)]
     pub user: Option<String>,
     #[serde(default)]
@@ -313,6 +329,31 @@ pub struct AppDefinition {
     /// Used for "update defs then restart modified services" semantics.
     #[serde(skip)]
     pub source_mtime_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct IoBandwidthConfig(pub Vec<IoBandwidthRule>);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IoBandwidthRule {
+    /// Block device identifier (major:minor), e.g. "253:8".
+    ///
+    /// This is written into cgroup v2 `io.max` exactly as provided.
+    pub device: String,
+    /// Optional cap for reads (rbps). Human size allowed (e.g. 75MiB, 10MB).
+    #[serde(default)]
+    pub max_read_bytes_per_second: Option<String>,
+    /// Optional cap for writes (wbps). Human size allowed (e.g. 75MiB, 10MB).
+    #[serde(default)]
+    pub max_write_bytes_per_second: Option<String>,
+    /// Optional cap for read IOPS (riops).
+    #[serde(default)]
+    pub max_read_iops: Option<u64>,
+    /// Optional cap for write IOPS (wiops).
+    #[serde(default)]
+    pub max_write_iops: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -477,6 +518,12 @@ pub(crate) struct ResourcesSection {
     max_memory: Option<String>,
     #[serde(default)]
     max_swap: Option<String>,
+    /// Optional: cgroup v2 io.weight (1..=10000).
+    #[serde(default)]
+    io_weight: Option<u16>,
+    /// Optional: cgroup v2 io.max bandwidth cap (see `AppDefinition.io_bandwidth`).
+    #[serde(default)]
+    io_bandwidth: Option<IoBandwidthConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -634,6 +681,8 @@ impl AppConfigFile {
             max_cpu: default_max_str(),
             max_memory: default_max_str(),
             max_swap: default_max_str(),
+            io_weight: None,
+            io_bandwidth: None,
         });
         // Derive working directory if omitted: ${auto_service_directory}/${application}
         let working_directory = match self.process.working_directory {
@@ -759,6 +808,8 @@ impl AppConfigFile {
             max_cpu: resources.max_cpu,
             max_memory: resources.max_memory,
             max_swap: resources.max_swap,
+            io_weight: resources.io_weight,
+            io_bandwidth: resources.io_bandwidth,
             user: self.process.user,
             group: self.process.group,
             rotation_mode,

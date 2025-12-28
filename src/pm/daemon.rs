@@ -438,6 +438,16 @@ fn default_flag_rules_compiled() -> FlagRulesCompiled {
             also_sets: vec![],
         },
     );
+    m.insert(
+        SystemFlag::SystemStart,
+        FlagRuleCompiled {
+            clear_all_except_fresh: false,
+            // Treat a successful system-triggered start (e.g. boot or config reload) as clearing stale suppression.
+            // Do NOT clear UserStop here; callers must respect operator intent separately.
+            clears: vec![SystemFlag::Failed, SystemFlag::Backoff, SystemFlag::OtKilled],
+            also_sets: vec![],
+        },
+    );
     m
 }
 
@@ -1350,6 +1360,7 @@ fn start_flag_maintenance_thread(state: Arc<Mutex<DaemonState>>) {
 
             let mut expired_pairs: Vec<(String, String)> = vec![];
             let mut expired_user_any = false;
+            let mut next_deadline_ms: Option<i64> = None;
             {
                 let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
                 for (app, info) in ri.iter_mut() {
@@ -1359,6 +1370,11 @@ fn start_flag_maintenance_thread(state: Arc<Mutex<DaemonState>>) {
                         if let Some(deadline) = v {
                             if now_ms >= *deadline {
                                 to_remove_sys.push(*k);
+                            } else {
+                                next_deadline_ms = Some(match next_deadline_ms {
+                                    None => *deadline,
+                                    Some(cur) => cur.min(*deadline),
+                                });
                             }
                         }
                     }
@@ -1372,6 +1388,11 @@ fn start_flag_maintenance_thread(state: Arc<Mutex<DaemonState>>) {
                         if let Some(deadline) = v {
                             if now_ms >= *deadline {
                                 to_remove.push(k.clone());
+                            } else {
+                                next_deadline_ms = Some(match next_deadline_ms {
+                                    None => *deadline,
+                                    Some(cur) => cur.min(*deadline),
+                                });
                             }
                         }
                     }
@@ -1396,7 +1417,16 @@ fn start_flag_maintenance_thread(state: Arc<Mutex<DaemonState>>) {
                 dirty.store(true, Ordering::Relaxed);
             }
 
-            tokio_time::sleep(Duration::from_millis(250)).await;
+            // Sleep until the next known expiry (clamped), or back off when nothing has TTL.
+            let sleep_ms: u64 = match next_deadline_ms {
+                None => 5_000,
+                Some(d) => {
+                    let dt = (d - now_ms).max(1) as u64;
+                    // Clamp: avoid ultra-tight loops and avoid sleeping too long if clocks jump.
+                    dt.clamp(50, 5_000)
+                }
+            };
+            tokio_time::sleep(Duration::from_millis(sleep_ms)).await;
         }
     });
 }
@@ -2226,7 +2256,9 @@ To use cgroups as a non-root user, run the following as root:\n\
 }
 
 fn start_child_reaper_thread() {
-    std::thread::spawn(move || loop {
+    let _ = std::thread::Builder::new()
+        .name("pm-child-reaper".to_string())
+        .spawn(move || loop {
         // Reap all exited children without blocking.
         loop {
             match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
@@ -2298,6 +2330,7 @@ Fix: use the `pmctl` binary built from the same build/release as the running dae
             statuses: vec![],
             events: vec![],
             admin_actions: vec![],
+            perf_metrics: None,
         };
         let resp_line = serde_json::to_string(&resp)? + "\n";
         stream.write_all(resp_line.as_bytes()).await?;
@@ -2327,6 +2360,7 @@ Fix: use the `pmctl` binary built from the same build/release as the running dae
                     statuses: vec![],
                     events: vec![],
                     admin_actions: vec![],
+                    perf_metrics: None,
                 },
             };
             let resp_line = serde_json::to_string(&resp)? + "\n";
@@ -2345,6 +2379,15 @@ pub(crate) async fn dispatch_async(state: Arc<Mutex<DaemonState>>, req: Request)
         Request::AdminKill => do_admin_kill(&state),
         Request::AdminPs => do_admin_ps(&state),
         Request::ServerVersion => do_server_version(),
+        Request::PerfMetrics { name } => {
+            tasks()
+                .spawn_blocking({
+                    let st = Arc::clone(&state);
+                    move || do_perf_metrics(&st, &name)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("join error: {e}"))?
+        }
         Request::Start { name, force } => do_start_async(&state, &name, force).await,
         Request::Stop { name } => do_stop_async(&state, &name).await,
         Request::Restart { name, force } => do_restart_async(&state, &name, force).await,
@@ -2411,6 +2454,85 @@ fn do_server_version() -> anyhow::Result<Response> {
         statuses: vec![],
         events: vec![],
         admin_actions: vec![],
+        perf_metrics: None,
+    })
+}
+
+fn do_perf_metrics(state: &Arc<Mutex<DaemonState>>, name: &str) -> anyhow::Result<Response> {
+    let (cfg, app) = {
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        (st.cfg.clone(), name.trim().to_string())
+    };
+    anyhow::ensure!(!app.is_empty(), "missing/empty app name");
+
+    let cg_dir = app_cgroup_dir(&cfg, &app);
+    let snap = crate::pm::cgroup::read_resource_snapshot(&cg_dir)?;
+
+    let cpu_pressure = snap.cpu_pressure.map(|p| crate::pm::rpc::PerfPressure {
+        some: p.some.map(|l| crate::pm::rpc::PerfPressureLine {
+            avg10: l.avg10,
+            avg60: l.avg60,
+            avg300: l.avg300,
+            total: l.total,
+        }),
+        full: p.full.map(|l| crate::pm::rpc::PerfPressureLine {
+            avg10: l.avg10,
+            avg60: l.avg60,
+            avg300: l.avg300,
+            total: l.total,
+        }),
+    });
+    let memory_pressure = snap.memory_pressure.map(|p| crate::pm::rpc::PerfPressure {
+        some: p.some.map(|l| crate::pm::rpc::PerfPressureLine {
+            avg10: l.avg10,
+            avg60: l.avg60,
+            avg300: l.avg300,
+            total: l.total,
+        }),
+        full: p.full.map(|l| crate::pm::rpc::PerfPressureLine {
+            avg10: l.avg10,
+            avg60: l.avg60,
+            avg300: l.avg300,
+            total: l.total,
+        }),
+    });
+    let io_pressure = snap.io_pressure.map(|p| crate::pm::rpc::PerfPressure {
+        some: p.some.map(|l| crate::pm::rpc::PerfPressureLine {
+            avg10: l.avg10,
+            avg60: l.avg60,
+            avg300: l.avg300,
+            total: l.total,
+        }),
+        full: p.full.map(|l| crate::pm::rpc::PerfPressureLine {
+            avg10: l.avg10,
+            avg60: l.avg60,
+            avg300: l.avg300,
+            total: l.total,
+        }),
+    });
+
+    Ok(Response {
+        ok: true,
+        message: "".to_string(),
+        restarted: vec![],
+        statuses: vec![],
+        events: vec![],
+        admin_actions: vec![],
+        perf_metrics: Some(crate::pm::rpc::PerfMetricsSnapshot {
+            app,
+            cgroup_dir: snap.cgroup_dir,
+            memory_max: snap.memory_max,
+            memory_current: snap.memory_current,
+            swap_max: snap.swap_max,
+            swap_current: snap.swap_current,
+            cpu_max: snap.cpu_max,
+            cpu_stat: snap.cpu_stat,
+            cpu_pressure,
+            memory_pressure,
+            io_max: snap.io_max,
+            io_stat: snap.io_stat,
+            io_pressure,
+        }),
     })
 }
 
@@ -2438,6 +2560,7 @@ fn do_admin_ps(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Response> {
         statuses: vec![],
         events: vec![],
         admin_actions: vec![],
+        perf_metrics: None,
     })
 }
 
@@ -2460,6 +2583,7 @@ fn do_admin_list(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Response> {
         statuses: vec![],
         events: vec![],
         admin_actions: actions,
+        perf_metrics: None,
     })
 }
 
@@ -2484,6 +2608,7 @@ fn do_admin_kill(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Response> {
         statuses: vec![],
         events: vec![],
         admin_actions: vec![],
+        perf_metrics: None,
     })
 }
 
@@ -2496,6 +2621,7 @@ async fn do_admin_action_async(state: &Arc<Mutex<DaemonState>>, name: &str) -> a
             statuses: vec![],
             events: vec![],
             admin_actions: vec![],
+            perf_metrics: None,
         });
     }
 
@@ -2515,6 +2641,7 @@ async fn do_admin_action_async(state: &Arc<Mutex<DaemonState>>, name: &str) -> a
                     statuses: vec![],
                     events: vec![],
                     admin_actions: vec![],
+                    perf_metrics: None,
                 });
             }
         }
@@ -2528,6 +2655,7 @@ async fn do_admin_action_async(state: &Arc<Mutex<DaemonState>>, name: &str) -> a
             statuses: vec![],
             events: vec![],
             admin_actions: vec![],
+            perf_metrics: None,
         });
     }
 
@@ -2596,6 +2724,7 @@ async fn do_admin_action_async(state: &Arc<Mutex<DaemonState>>, name: &str) -> a
         statuses: vec![],
         events: vec![],
         admin_actions: vec![],
+        perf_metrics: None,
     })
 }
 
@@ -2623,6 +2752,7 @@ fn do_events(state: &Arc<Mutex<DaemonState>>, name: Option<&str>, n: usize) -> a
         statuses: vec![],
         events: v,
         admin_actions: vec![],
+        perf_metrics: None,
     })
 }
 
@@ -2654,6 +2784,7 @@ async fn do_set_enabled_async(state: &Arc<Mutex<DaemonState>>, name: &str, enabl
         statuses: vec![],
         events: vec![],
         admin_actions: vec![],
+        perf_metrics: None,
     })
 }
 
@@ -2733,6 +2864,7 @@ fn do_logs(state: &Arc<Mutex<DaemonState>>, name: &str, n: usize) -> anyhow::Res
         statuses: vec![],
         events: vec![],
         admin_actions: vec![],
+        perf_metrics: None,
     })
 }
 
@@ -2769,6 +2901,7 @@ fn handle_logs_follow(
         statuses: vec![],
         events: vec![],
         admin_actions: vec![],
+        perf_metrics: None,
     };
     let resp_line = serde_json::to_string(&resp)? + "\n";
     stream.write_all(resp_line.as_bytes())?;
@@ -3021,6 +3154,7 @@ async fn do_update_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Resp
                 statuses: vec![],
                 events: vec![],
                 admin_actions: vec![],
+                perf_metrics: None,
             });
         }
     };
@@ -3156,8 +3290,8 @@ async fn do_update_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Resp
             continue;
         }
 
-        pm_event_state(state, "reconcile", Some(name), "decision=apply_modified_def intent=manual_start");
-        if let Err(e) = manual_start_via_supervisor_async(state, name, false).await {
+        pm_event_state(state, "reconcile", Some(name), "decision=apply_modified_def intent=reload_start");
+        if let Err(e) = reload_start_via_supervisor_async(state, name, false).await {
             // Keep this log line single-line, but preserve the full anyhow chain.
             let chain = format!("{e:#}").replace('\n', "\\n");
             pm_event_state(
@@ -3172,7 +3306,7 @@ async fn do_update_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Resp
         // If it's running, force a restart by stopping it now; desired remains RUNNING so it will come back.
         if cgroup_running_async(&cfg, name).await.unwrap_or(false) {
             pm_event_state(state, "reconcile", Some(name), "decision=restart reason=definition_modified");
-            match manual_restart_via_supervisor_async(state, name, false).await {
+            match reload_restart_via_supervisor_async(state, name, false).await {
                 Ok(()) => {
                     restarted.push(name.clone());
                     pm_event_state(state, "reconcile", Some(name), "outcome=accepted restart=true");
@@ -3220,6 +3354,7 @@ async fn do_update_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Resp
         statuses: vec![],
         events: vec![],
         admin_actions: vec![],
+        perf_metrics: None,
     })
 }
 
@@ -3465,14 +3600,18 @@ async fn do_start_async(state: &Arc<Mutex<DaemonState>>, name: &str, force: bool
 
     out.sort_by(|a, b| a.0.cmp(&b.0));
     let mut lines: Vec<String> = vec![];
+    let mut any_err = false;
     for (_t, r) in out {
         match r {
             Ok(line) => lines.push(line),
-            Err(e) => lines.push(format!("error: {e}")),
+            Err(e) => {
+                any_err = true;
+                lines.push(format!("error: {e:#}"))
+            }
         }
     }
 
-    Ok(Response { ok: true, message: lines.join("\n"), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![] })
+    Ok(Response { ok: !any_err, message: lines.join("\n"), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![], perf_metrics: None })
 }
 
 async fn do_stop_async(state: &Arc<Mutex<DaemonState>>, name: &str) -> anyhow::Result<Response> {
@@ -3533,7 +3672,7 @@ async fn do_stop_async(state: &Arc<Mutex<DaemonState>>, name: &str) -> anyhow::R
         }
     }
 
-    Ok(Response { ok: true, message: lines.join("\n"), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![] })
+    Ok(Response { ok: true, message: lines.join("\n"), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![], perf_metrics: None })
 }
 
 async fn do_restart_async(state: &Arc<Mutex<DaemonState>>, name: &str, force: bool) -> anyhow::Result<Response> {
@@ -3597,7 +3736,7 @@ async fn do_restart_async(state: &Arc<Mutex<DaemonState>>, name: &str, force: bo
         }
     }
 
-    Ok(Response { ok: true, message: lines.join("\n"), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![] })
+    Ok(Response { ok: true, message: lines.join("\n"), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![], perf_metrics: None })
 }
 
 async fn do_start_all_async(state: &Arc<Mutex<DaemonState>>, force: bool) -> anyhow::Result<Response> {
@@ -3614,7 +3753,7 @@ async fn do_start_all_async(state: &Arc<Mutex<DaemonState>>, force: bool) -> any
         v
     };
     if names.is_empty() {
-        return Ok(Response { ok: true, message: "no enabled services to start".to_string(), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![] });
+        return Ok(Response { ok: true, message: "no enabled services to start".to_string(), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![], perf_metrics: None });
     }
 
     let mut js: JoinSet<(String, bool, String)> = JoinSet::new();
@@ -3663,7 +3802,7 @@ async fn do_start_all_async(state: &Arc<Mutex<DaemonState>>, force: bool) -> any
         message.push_str(&shown);
         message.push_str(&more);
     }
-    Ok(Response { ok: fail == 0, message, restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![] })
+    Ok(Response { ok: fail == 0, message, restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![], perf_metrics: None })
 }
 
 async fn do_stop_all_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Response> {
@@ -3681,7 +3820,7 @@ async fn do_stop_all_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Re
         (st.cfg.clone(), v)
     };
     if names.is_empty() {
-        return Ok(Response { ok: true, message: "no services".to_string(), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![] });
+        return Ok(Response { ok: true, message: "no services".to_string(), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![], perf_metrics: None });
     }
 
     // First: only target apps that are actually running right now.
@@ -3726,6 +3865,7 @@ async fn do_stop_all_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Re
             statuses: vec![],
             events: vec![],
             admin_actions: vec![],
+            perf_metrics: None,
         });
     }
 
@@ -3805,7 +3945,7 @@ async fn do_stop_all_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Re
         message.push_str(&shown);
         message.push_str(&more);
     }
-    Ok(Response { ok: fail == 0, message, restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![] })
+    Ok(Response { ok: fail == 0, message, restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![], perf_metrics: None })
 }
 
 async fn do_restart_all_async(state: &Arc<Mutex<DaemonState>>, force: bool) -> anyhow::Result<Response> {
@@ -3822,7 +3962,7 @@ async fn do_restart_all_async(state: &Arc<Mutex<DaemonState>>, force: bool) -> a
         v
     };
     if names.is_empty() {
-        return Ok(Response { ok: true, message: "no enabled services to restart".to_string(), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![] });
+        return Ok(Response { ok: true, message: "no enabled services to restart".to_string(), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![], perf_metrics: None });
     }
 
     let mut js: JoinSet<(String, bool, String)> = JoinSet::new();
@@ -3871,7 +4011,7 @@ async fn do_restart_all_async(state: &Arc<Mutex<DaemonState>>, force: bool) -> a
         message.push_str(&shown);
         message.push_str(&more);
     }
-    Ok(Response { ok: fail == 0, message, restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![] })
+    Ok(Response { ok: fail == 0, message, restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![], perf_metrics: None })
 }
 
 fn parse_flag_ttl_ms(spec: &str) -> anyhow::Result<u64> {
@@ -4038,6 +4178,7 @@ fn do_flag(state: &Arc<Mutex<DaemonState>>, name: &str, flags: &[String], ttl: O
         statuses: vec![],
         events: vec![],
         admin_actions: vec![],
+        perf_metrics: None,
     })
 }
 
@@ -4090,6 +4231,7 @@ fn do_unflag(state: &Arc<Mutex<DaemonState>>, name: &str, flags: &[String]) -> a
         statuses: vec![],
         events: vec![],
         admin_actions: vec![],
+        perf_metrics: None,
     })
 }
 
@@ -4128,6 +4270,30 @@ async fn manual_restart_via_supervisor_async(state: &Arc<Mutex<DaemonState>>, na
     .ok_or_else(|| anyhow::anyhow!("no controller for service: {name}"))?;
     let (resp_tx, resp_rx) = oneshot::channel();
     tx.send(SupervisorCmd::ManualRestart { force, resp: resp_tx })
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    resp_rx.await.map_err(|e| anyhow::anyhow!("{e}"))?
+}
+
+async fn reload_start_via_supervisor_async(state: &Arc<Mutex<DaemonState>>, name: &str, force: bool) -> anyhow::Result<()> {
+    let tx = {
+        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        st.supervisors.get(name).map(|h| h.tx.clone())
+    }
+    .ok_or_else(|| anyhow::anyhow!("no controller for service: {name}"))?;
+    let (resp_tx, resp_rx) = oneshot::channel();
+    tx.send(SupervisorCmd::ReloadStart { force, resp: resp_tx })
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    resp_rx.await.map_err(|e| anyhow::anyhow!("{e}"))?
+}
+
+async fn reload_restart_via_supervisor_async(state: &Arc<Mutex<DaemonState>>, name: &str, force: bool) -> anyhow::Result<()> {
+    let tx = {
+        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        st.supervisors.get(name).map(|h| h.tx.clone())
+    }
+    .ok_or_else(|| anyhow::anyhow!("no controller for service: {name}"))?;
+    let (resp_tx, resp_rx) = oneshot::channel();
+    tx.send(SupervisorCmd::ReloadRestart { force, resp: resp_tx })
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     resp_rx.await.map_err(|e| anyhow::anyhow!("{e}"))?
 }
@@ -4402,6 +4568,7 @@ fn do_status(state: &Arc<Mutex<DaemonState>>, name: Option<&str>) -> anyhow::Res
         statuses: entries,
         events: vec![],
         admin_actions: vec![],
+        perf_metrics: None,
     })
 }
 
@@ -5253,6 +5420,85 @@ fn resources_for_app(def: &AppDefinition) -> anyhow::Result<cgroup::Resources> {
     }
     let v = to_mem_max_string(&normalize_swap_string(def.max_swap.as_deref())?)?;
     r.swap_max = Some(v.trim().to_string());
+
+    if let Some(w) = def.io_weight {
+        anyhow::ensure!((1..=10_000).contains(&w), "io_weight must be in 1..=10000");
+        r.io_weight = Some(w);
+    }
+
+    if let Some(cfg) = &def.io_bandwidth {
+        let mk_line = |dev_mm: &str, rbps: Option<u64>, wbps: Option<u64>, riops: Option<u64>, wiops: Option<u64>| -> anyhow::Result<String> {
+            let t = dev_mm.trim();
+            anyhow::ensure!(!t.is_empty(), "io_bandwidth.device is empty");
+            let (maj_s, min_s) = t
+                .split_once(':')
+                .ok_or_else(|| anyhow::anyhow!("io_bandwidth.device must be MAJ:MIN (got {t:?})"))?;
+            let maj: u32 = maj_s.trim().parse().map_err(|_| anyhow::anyhow!("invalid device major in {t:?}"))?;
+            let min: u32 = min_s.trim().parse().map_err(|_| anyhow::anyhow!("invalid device minor in {t:?}"))?;
+            let mut parts = vec![format!("{maj}:{min}")];
+            if let Some(v) = rbps { parts.push(format!("rbps={v}")); }
+            if let Some(v) = wbps { parts.push(format!("wbps={v}")); }
+            if let Some(v) = riops { parts.push(format!("riops={v}")); }
+            if let Some(v) = wiops { parts.push(format!("wiops={v}")); }
+            anyhow::ensure!(
+                parts.len() > 1,
+                "io_bandwidth rule for {t:?} must set at least one of rbps/wbps/riops/wiops"
+            );
+            Ok(parts.join(" "))
+        };
+
+        for rule in &cfg.0 {
+            let rbps = match rule.max_read_bytes_per_second.as_deref() {
+                None => None,
+                Some(s) => {
+                    let v = parse_size_spec_bytes(s)?;
+                    anyhow::ensure!(
+                        v >= 1024,
+                        "io_bandwidth device={} max_read_bytes_per_second too small: {s:?} (bytes={v}). Minimum is 1024 bytes/s.",
+                        rule.device
+                    );
+                    Some(v)
+                }
+            };
+            let wbps = match rule.max_write_bytes_per_second.as_deref() {
+                None => None,
+                Some(s) => {
+                    let v = parse_size_spec_bytes(s)?;
+                    anyhow::ensure!(
+                        v >= 1024,
+                        "io_bandwidth device={} max_write_bytes_per_second too small: {s:?} (bytes={v}). Minimum is 1024 bytes/s.",
+                        rule.device
+                    );
+                    Some(v)
+                }
+            };
+            let riops = rule.max_read_iops;
+            let wiops = rule.max_write_iops;
+            if let Some(v) = riops {
+                anyhow::ensure!(
+                    v >= 5,
+                    "io_bandwidth device={} max_read_iops too small: {}. Minimum is 5.",
+                    rule.device,
+                    v
+                );
+            }
+            if let Some(v) = wiops {
+                anyhow::ensure!(
+                    v >= 5,
+                    "io_bandwidth device={} max_write_iops too small: {}. Minimum is 5.",
+                    rule.device,
+                    v
+                );
+            }
+            anyhow::ensure!(
+                rbps.is_some() || wbps.is_some() || riops.is_some() || wiops.is_some(),
+                "io_bandwidth rule for {:?} must set at least one cap",
+                rule.device
+            );
+            let line = mk_line(&rule.device, rbps, wbps, riops, wiops)?;
+            r.io_max.push(line);
+        }
+    }
     Ok(r)
 }
 
@@ -5359,6 +5605,18 @@ enum SupervisorCmd {
         resp: oneshot::Sender<anyhow::Result<()>>,
     },
     ManualRestart {
+        force: bool,
+        resp: oneshot::Sender<anyhow::Result<()>>,
+    },
+    /// Start due to a service definition reload (system-triggered). Behaves like manual start
+    /// (clears suppression/history) but records `system_start` as the reason flag.
+    ReloadStart {
+        force: bool,
+        resp: oneshot::Sender<anyhow::Result<()>>,
+    },
+    /// Restart due to a service definition reload (system-triggered). Behaves like manual restart
+    /// but records `system_start` as the reason flag.
+    ReloadRestart {
         force: bool,
         resp: oneshot::Sender<anyhow::Result<()>>,
     },
@@ -5514,6 +5772,88 @@ fn spawn_supervisor_thread(
                 SupervisorCmd::Update { def: new_def } => {
                     def = new_def;
                 }
+                SupervisorCmd::ReloadStart { force, resp } => {
+                    // Track "last start attempt" for reload starts too.
+                    record_start_attempt_in_store(&run_info, &app);
+                    // Reload start should behave like a manual intervention: clear suppression/history.
+                    restart_times.clear();
+                    pending_failure_restart_at = None;
+
+                    if !force && !def.enabled {
+                        let _ = resp.send(Err(anyhow::anyhow!("service {app} is disabled")));
+                        continue;
+                    }
+                    if def.schedule.is_some() {
+                        let _ = resp.send(Err(anyhow::anyhow!("{app}: scheduled jobs do not support reload start")));
+                        continue;
+                    }
+
+                    // If already running, do not change markers (same as manual start).
+                    if cgroup_running_async(&cfg, &app).await.unwrap_or(false) {
+                        ensure_waiter_attached(
+                            &cfg,
+                            &app,
+                            &tx_self,
+                            &mut waiter_running,
+                            &mut waiter_epoch,
+                            &mut waiter_cancel,
+                            &events,
+                        )
+                        .await;
+                        let _ = resp.send(Ok(()));
+                        continue;
+                    }
+
+                    // Not running: clear crash history, and start now.
+                    {
+                        let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+                        let e = ri.entry(app.clone()).or_default();
+                        e.recent_system_crashes_ms.clear();
+                    }
+
+                    set_phase_and_emit(&run_info, &events, &app, Phase::Starting, "reload_start");
+                    let cfg2 = cfg.clone();
+                    let def2 = def.clone();
+                    let spawn_r = tasks()
+                        .spawn_blocking(move || spawn_launcher_child(&cfg2, &def2))
+                        .await
+                        .map_err(|e| anyhow::anyhow!("join error: {e}"));
+                    let child_r = match spawn_r {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = resp.send(Err(e));
+                            continue;
+                        }
+                    };
+                    if let Err(e) = child_r {
+                        let _ = resp.send(Err(e));
+                        continue;
+                    }
+
+                    if !wait_for_cgroup_nonempty(&cfg, &app, Duration::from_secs(3)).await {
+                        {
+                            let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+                            let e = ri.entry(app.clone()).or_default();
+                            sysflag_set_with_rules(&app, &mut e.system_flags, SystemFlag::Failed, None);
+                        }
+                        set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "reload_start_timeout");
+                        let _ = resp.send(Err(anyhow::anyhow!("{app}: start timeout (cgroup stayed empty)")));
+                        continue;
+                    }
+                    record_started_in_store(&run_info, &app, StartKind::Start, SystemFlag::SystemStart);
+                    ensure_waiter_attached(
+                        &cfg,
+                        &app,
+                        &tx_self,
+                        &mut waiter_running,
+                        &mut waiter_epoch,
+                        &mut waiter_cancel,
+                        &events,
+                    )
+                    .await;
+                    set_phase_and_emit(&run_info, &events, &app, Phase::Running, "reload_start_completed");
+                    let _ = resp.send(Ok(()));
+                }
                 SupervisorCmd::ManualStart { force, resp } => {
                     // Track "last start attempt" for any accepted start command (even if already running).
                     record_start_attempt_in_store(&run_info, &app);
@@ -5581,7 +5921,7 @@ fn spawn_supervisor_thread(
                         }
                         waiter_running = true;
                         waiter_cancel = None;
-                        let _ = spawn_process_waiter(child, &tx_self, waiter_epoch);
+                        let _ = spawn_process_waiter(child, &tx_self, &app, waiter_epoch);
                     } else if let Err(e) = child_r {
                         let _ = resp.send(Err(e));
                         continue;
@@ -5775,7 +6115,7 @@ fn spawn_supervisor_thread(
                         }
                         waiter_running = true;
                         waiter_cancel = None;
-                        let _ = spawn_process_waiter(child, &tx_self, waiter_epoch);
+                        let _ = spawn_process_waiter(child, &tx_self, &app, waiter_epoch);
                     } else if let Err(e) = child_r {
                         let _ = resp.send(Err(e));
                         continue;
@@ -5814,6 +6154,94 @@ fn spawn_supervisor_thread(
                         e.recent_system_crashes_ms.clear();
                     }
                     set_phase_and_emit(&run_info, &events, &app, Phase::Running, "manual_restart_completed");
+                    let _ = resp.send(Ok(()));
+                }
+                SupervisorCmd::ReloadRestart { force, resp } => {
+                    // Similar to manual restart, but records `system_start` as the reason flag.
+                    record_start_attempt_in_store(&run_info, &app);
+                    restart_times.clear();
+                    pending_failure_restart_at = None;
+                    if !force && !def.enabled {
+                        let _ = resp.send(Err(anyhow::anyhow!("service {app} is disabled")));
+                        continue;
+                    }
+                    if def.schedule.is_some() {
+                        let _ = resp.send(Err(anyhow::anyhow!("{app}: scheduled jobs do not support reload restart")));
+                        continue;
+                    }
+                    {
+                        let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+                        let e = ri.entry(app.clone()).or_default();
+                        e.recent_system_crashes_ms.clear();
+                    }
+                    // Stop step (same invalidation as manual restart).
+                    if cgroup_running_async(&cfg, &app).await.unwrap_or(false) {
+                        waiter_epoch = waiter_epoch.wrapping_add(1);
+                        cancel_waiter(&mut waiter_running, &mut waiter_cancel);
+                        set_phase_and_emit(&run_info, &events, &app, Phase::Stopping, "reload_restart_stop");
+                        if let Err(e) = exec_stop_blocking(cfg.clone(), def.clone(), app.clone(), Arc::clone(&events)).await {
+                            set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "reload_restart_stop_error");
+                            let _ = resp.send(Err(e));
+                            continue;
+                        }
+                    }
+                    // Start step
+                    if cgroup_running_async(&cfg, &app).await.unwrap_or(false) {
+                        ensure_waiter_attached(
+                            &cfg,
+                            &app,
+                            &tx_self,
+                            &mut waiter_running,
+                            &mut waiter_epoch,
+                            &mut waiter_cancel,
+                            &events,
+                        )
+                        .await;
+                        record_started_in_store(&run_info, &app, StartKind::Restart, SystemFlag::SystemStart);
+                        set_phase_and_emit(&run_info, &events, &app, Phase::Running, "reload_restart_completed");
+                        let _ = resp.send(Ok(()));
+                        continue;
+                    }
+                    set_phase_and_emit(&run_info, &events, &app, Phase::Starting, "reload_restart_start");
+                    let cfg2 = cfg.clone();
+                    let def2 = def.clone();
+                    let spawn_r = tasks()
+                        .spawn_blocking(move || spawn_launcher_child(&cfg2, &def2))
+                        .await
+                        .map_err(|e| anyhow::anyhow!("join error: {e}"));
+                    let child_r = match spawn_r {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = resp.send(Err(e));
+                            continue;
+                        }
+                    };
+                    if let Err(e) = child_r {
+                        let _ = resp.send(Err(e));
+                        continue;
+                    }
+                    if !wait_for_cgroup_nonempty(&cfg, &app, Duration::from_secs(3)).await {
+                        {
+                            let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+                            let e = ri.entry(app.clone()).or_default();
+                            sysflag_set_with_rules(&app, &mut e.system_flags, SystemFlag::Failed, None);
+                        }
+                        set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "reload_restart_timeout");
+                        let _ = resp.send(Err(anyhow::anyhow!("{app}: restart timeout (cgroup stayed empty)")));
+                        continue;
+                    }
+                    record_started_in_store(&run_info, &app, StartKind::Restart, SystemFlag::SystemStart);
+                    ensure_waiter_attached(
+                        &cfg,
+                        &app,
+                        &tx_self,
+                        &mut waiter_running,
+                        &mut waiter_epoch,
+                        &mut waiter_cancel,
+                        &events,
+                    )
+                    .await;
+                    set_phase_and_emit(&run_info, &events, &app, Phase::Running, "reload_restart_completed");
                     let _ = resp.send(Ok(()));
                 }
                 SupervisorCmd::BootStart { resp } => {
@@ -5937,7 +6365,7 @@ fn spawn_supervisor_thread(
                     }
                     waiter_running = true;
                     waiter_cancel = None;
-                    let _ = spawn_process_waiter(child, &tx_self, waiter_epoch);
+                    let _ = spawn_process_waiter(child, &tx_self, &app, waiter_epoch);
                     if !wait_for_cgroup_nonempty(&cfg, &app, Duration::from_secs(3)).await {
                         let _ = resp.send(Err(anyhow::anyhow!("{app}: start timeout (cgroup stayed empty)")));
                         continue;
@@ -6262,7 +6690,8 @@ fn spawn_cgroup_waiter(
     let app_s = app.to_string();
     let tx2 = tx.clone();
     let cg_dir = app_cgroup_dir(cfg, &app_s);
-    std::thread::spawn(move || {
+    let tname = format!("pm-waiter-{}", app_s);
+    let _ = std::thread::Builder::new().name(tname).spawn(move || {
         match cgroup::wait_all_cancellable(&cg_dir, &cancel) {
             Ok(true) => {
                 let _ = tx2.send(SupervisorCmd::WaiterExited { epoch, code: None });
@@ -6274,23 +6703,25 @@ fn spawn_cgroup_waiter(
                 let _ = tx2.send(SupervisorCmd::WaiterExited { epoch, code: Some(1) });
             }
         }
-    });
+    })?;
     Ok(())
 }
 
 fn spawn_process_waiter(
     mut child: std::process::Child,
     tx: &tokio_mpsc::UnboundedSender<SupervisorCmd>,
+    app: &str,
     epoch: u64,
 ) -> anyhow::Result<()> {
     let tx2 = tx.clone();
-    std::thread::spawn(move || {
+    let tname = format!("pm-procwait-{}", app);
+    let _ = std::thread::Builder::new().name(tname).spawn(move || {
         let code = match child.wait() {
             Ok(st) => st.code().unwrap_or(1),
             Err(_) => 1,
         };
         let _ = tx2.send(SupervisorCmd::WaiterExited { epoch, code: Some(code) });
-    });
+    })?;
     Ok(())
 }
 
@@ -6591,6 +7022,8 @@ fn build_auto_service_def(app: &str, workdir: &Path, source_file: PathBuf) -> an
         max_cpu: Some("MAX".to_string()),
         max_memory: Some("MAX".to_string()),
         max_swap: Some("MAX".to_string()),
+        io_weight: None,
+        io_bandwidth: None,
         user: None,
         group: None,
         rotation_mode: LogRotationMode::Size,

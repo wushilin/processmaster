@@ -15,6 +15,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use rand::RngCore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -27,7 +28,50 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 struct WebState {
     daemon: Arc<Mutex<DaemonState>>,
     users: Arc<HashMap<String, String>>, // username -> bcrypt hash
+    auth_cache: Arc<Mutex<AuthCache>>,
     tls_enabled: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct AuthCacheKey {
+    user: String,
+    expected_hash: String,
+    pass: String,
+}
+
+struct AuthCache {
+    // Cache bcrypt verification result. Key includes the current stored hash, so when the password
+    // changes (hash changes), cached results stop matching automatically.
+    //
+    // NOTE: This key includes the plaintext password (bounded cache). User explicitly accepted this tradeoff.
+    entries: HashMap<AuthCacheKey, bool>,
+    order: VecDeque<AuthCacheKey>,
+}
+
+impl AuthCache {
+    const MAX_ENTRIES: usize = 1024;
+
+    fn new() -> Self {
+        Self { entries: HashMap::new(), order: VecDeque::new() }
+    }
+
+    fn get(&mut self, key: &AuthCacheKey) -> Option<bool> {
+        self.entries.get(key).copied()
+    }
+
+    fn put(&mut self, key: AuthCacheKey, val: bool) {
+        if !self.entries.contains_key(&key) {
+            self.order.push_back(key.clone());
+        }
+        self.entries.insert(key, val);
+        while self.entries.len() > Self::MAX_ENTRIES {
+            if let Some(k) = self.order.pop_front() {
+                self.entries.remove(&k);
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 pub(super) fn start_web_console(state: Arc<Mutex<DaemonState>>) {
@@ -67,6 +111,7 @@ pub(super) fn start_web_console(state: Arc<Mutex<DaemonState>>) {
     let st = WebState {
         daemon: Arc::clone(&state),
         users: Arc::new(users),
+        auth_cache: Arc::new(Mutex::new(AuthCache::new())),
         tls_enabled: cfg.tls.enabled,
     };
 
@@ -92,7 +137,9 @@ fn parse_htpasswd_users(cfg: &WebConsoleConfig) -> anyhow::Result<HashMap<String
         let hash = hash.trim();
         anyhow::ensure!(!user.is_empty(), "invalid htpasswd entry (empty username): {t:?}");
         anyhow::ensure!(!hash.is_empty(), "invalid htpasswd entry (empty hash): {t:?}");
-        out.insert(user.to_string(), hash.to_string());
+        // htpasswd -B often emits $2y$...; normalize once so we don't allocate per request.
+        let normalized = hash.replace("$2y$", "$2b$");
+        out.insert(user.to_string(), normalized);
     }
     anyhow::ensure!(
         !out.is_empty(),
@@ -180,7 +227,7 @@ async fn basic_auth_middleware(
     next: middleware::Next,
 ) -> impl IntoResponse {
     let headers = req.headers();
-    match check_basic_auth(&st.users, headers) {
+    match check_basic_auth(&st.users, &st.auth_cache, headers) {
         Ok(()) => next.run(req).await,
         Err(msg) => (
             StatusCode::UNAUTHORIZED,
@@ -191,7 +238,11 @@ async fn basic_auth_middleware(
     }
 }
 
-fn check_basic_auth(users: &HashMap<String, String>, headers: &axum::http::HeaderMap) -> Result<(), String> {
+fn check_basic_auth(
+    users: &HashMap<String, String>,
+    auth_cache: &Arc<Mutex<AuthCache>>,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), String> {
     let Some(v) = headers.get(header::AUTHORIZATION) else {
         return Err("missing Authorization header".to_string());
     };
@@ -213,9 +264,23 @@ fn check_basic_auth(users: &HashMap<String, String>, headers: &axum::http::Heade
         return Err("invalid credentials".to_string());
     };
 
-    // htpasswd -B emits $2y$...; the bcrypt crate expects $2b$ in many environments.
-    let normalized = expected_hash.replace("$2y$", "$2b$");
-    bcrypt::verify(pass, &normalized)
+    let key = AuthCacheKey {
+        user: user.to_string(),
+        expected_hash: expected_hash.clone(),
+        pass: pass.to_string(),
+    };
+    // Cache lookup/insert around bcrypt to avoid repeated work. Cache is bounded; no TTL.
+    if let Ok(mut c) = auth_cache.lock() {
+        if let Some(cached) = c.get(&key) {
+            return if cached { Ok(()) } else { Err("invalid credentials".to_string()) };
+        }
+        let ok = bcrypt::verify(pass, expected_hash).map_err(|_| "invalid credentials".to_string())?;
+        c.put(key, ok);
+        return ok.then_some(()).ok_or_else(|| "invalid credentials".to_string());
+    }
+
+    // If cache lock is poisoned/unavailable, fall back to a direct verify.
+    bcrypt::verify(pass, expected_hash)
         .map_err(|_| "invalid credentials".to_string())?
         .then_some(())
         .ok_or_else(|| "invalid credentials".to_string())
@@ -377,6 +442,103 @@ async fn jsonrpc(State(st): State<WebState>, Json(req): Json<JsonRpcRequest>) ->
     // Web-console specific methods (not routed through daemon::dispatch_async), used for UX features.
     // These return lightweight objects (ok/message/...) and can directly inspect daemon config/state.
     match req.method.as_str() {
+        "service_details" => {
+            let app = req
+                .params
+                .get("app")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if app.is_empty() {
+                let v = serde_json::json!({ "ok": false, "message": "missing/empty param: app" });
+                return (
+                    StatusCode::OK,
+                    Json(JsonRpcResponse::<serde_json::Value> {
+                        jsonrpc: "2.0",
+                        id: req.id,
+                        result: Some(v),
+                        error: None,
+                    }),
+                );
+            }
+
+            let cfg = {
+                let st = st.daemon.lock().unwrap_or_else(|p| p.into_inner());
+                st.cfg.clone()
+            };
+
+            let cg_dir = match service_cgroup_dir(&cfg, &app) {
+                Ok(p) => p,
+                Err(e) => {
+                    let v = serde_json::json!({ "ok": false, "message": e.to_string() });
+                    return (
+                        StatusCode::OK,
+                        Json(JsonRpcResponse::<serde_json::Value> {
+                            jsonrpc: "2.0",
+                            id: req.id,
+                            result: Some(v),
+                            error: None,
+                        }),
+                    );
+                }
+            };
+
+            if let Err(e) = std::fs::metadata(&cg_dir) {
+                let v = serde_json::json!({
+                    "ok": false,
+                    "message": format!("cgroup dir not found: {}: {e}", cg_dir.display()),
+                    "app": app,
+                    "cgroup_dir": cg_dir.display().to_string(),
+                });
+                return (
+                    StatusCode::OK,
+                    Json(JsonRpcResponse::<serde_json::Value> {
+                        jsonrpc: "2.0",
+                        id: req.id,
+                        result: Some(v),
+                        error: None,
+                    }),
+                );
+            }
+
+            let snap = match cgroup::read_resource_snapshot(&cg_dir) {
+                Ok(s) => s,
+                Err(e) => {
+                    let v = serde_json::json!({
+                        "ok": false,
+                        "message": e.to_string(),
+                        "app": app,
+                        "cgroup_dir": cg_dir.display().to_string(),
+                    });
+                    return (
+                        StatusCode::OK,
+                        Json(JsonRpcResponse::<serde_json::Value> {
+                            jsonrpc: "2.0",
+                            id: req.id,
+                            result: Some(v),
+                            error: None,
+                        }),
+                    );
+                }
+            };
+
+            let v = serde_json::json!({
+                "ok": true,
+                "message": "",
+                "app": app,
+                "snapshot": snap,
+            });
+            return (
+                StatusCode::OK,
+                Json(JsonRpcResponse::<serde_json::Value> {
+                    jsonrpc: "2.0",
+                    id: req.id,
+                    result: Some(v),
+                    error: None,
+                }),
+            );
+        }
         "admin_actions_pids" => {
             let cfg = {
                 let st = st.daemon.lock().unwrap_or_else(|p| p.into_inner());
@@ -530,6 +692,23 @@ fn admin_actions_cgroup_dir(cfg: &crate::pm::config::MasterConfig) -> anyhow::Re
     );
     let master = PathBuf::from(&cfg.cgroup_root).join(name.trim_start_matches('/'));
     Ok(master.join("admin_actions"))
+}
+
+fn service_cgroup_dir(cfg: &crate::pm::config::MasterConfig, app: &str) -> anyhow::Result<PathBuf> {
+    let name = cfg.cgroup_name.trim();
+    anyhow::ensure!(!name.is_empty(), "cgroup.name is empty");
+    anyhow::ensure!(
+        !name.split('/').any(|seg| seg == ".."),
+        "cgroup.name must not contain '..'"
+    );
+    let app = app.trim();
+    anyhow::ensure!(!app.is_empty(), "app name is empty");
+    anyhow::ensure!(
+        !app.split('/').any(|seg| seg == ".." || seg.is_empty()),
+        "app name must not contain '/' or '..'"
+    );
+    let master = PathBuf::from(&cfg.cgroup_root).join(name.trim_start_matches('/'));
+    Ok(master.join(format!("pm-{app}")))
 }
 
 fn map_method_to_request(method: &str, params: &serde_json::Value) -> Result<Request, String> {

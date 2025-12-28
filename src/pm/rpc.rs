@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use chrono::{Local, TimeZone};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientBuildInfo {
@@ -43,6 +44,8 @@ pub enum Request {
     AdminPs,
     /// Return server build info (build_host/build_time).
     ServerVersion,
+    /// Read per-app performance metrics from cgroup (same snapshot as the web UI modal).
+    PerfMetrics { name: String },
     Start { name: String, #[serde(default)] force: bool },
     Stop { name: String },
     Restart { name: String, #[serde(default)] force: bool },
@@ -163,6 +166,65 @@ pub struct Response {
     /// Admin actions (for `AdminList`).
     #[serde(default)]
     pub admin_actions: Vec<AdminActionInfo>,
+    /// Per-app cgroup resource snapshot (for `PerfMetrics`).
+    #[serde(default)]
+    pub perf_metrics: Option<PerfMetricsSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfPressureLine {
+    #[serde(default)]
+    pub avg10: Option<f64>,
+    #[serde(default)]
+    pub avg60: Option<f64>,
+    #[serde(default)]
+    pub avg300: Option<f64>,
+    #[serde(default)]
+    pub total: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfPressure {
+    #[serde(default)]
+    pub some: Option<PerfPressureLine>,
+    #[serde(default)]
+    pub full: Option<PerfPressureLine>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfMetricsSnapshot {
+    pub app: String,
+    pub cgroup_dir: String,
+
+    #[serde(default)]
+    pub memory_max: Option<String>,
+    #[serde(default)]
+    pub memory_current: Option<u64>,
+
+    #[serde(default)]
+    pub swap_max: Option<String>,
+    #[serde(default)]
+    pub swap_current: Option<u64>,
+
+    #[serde(default)]
+    pub cpu_max: Option<String>,
+    #[serde(default)]
+    pub cpu_stat: Option<BTreeMap<String, u64>>,
+
+    #[serde(default)]
+    pub cpu_pressure: Option<PerfPressure>,
+    #[serde(default)]
+    pub memory_pressure: Option<PerfPressure>,
+
+    /// Raw `io.max` contents for this cgroup (if available).
+    #[serde(default)]
+    pub io_max: Option<String>,
+    /// Raw `io.stat` contents for this cgroup (if available).
+    #[serde(default)]
+    pub io_stat: Option<String>,
+    /// `io.pressure` PSI (if available).
+    #[serde(default)]
+    pub io_pressure: Option<PerfPressure>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
