@@ -1,9 +1,38 @@
-# processmaster
+# what is processmaster
 
-`processmaster` is a small supervisor-style process manager built around **cgroup v2**.
+`processmaster` is a small supervisor-style process manager built around **cgroup v2**, using Rust.
+It runs on ubuntu 22, ubuntu 24, redhat 8 and any cgroup v2 supported platform.
 
+WHy it is better than supervisor?
+
+1. It uses about 2% of supervisor's memory
+<img width="903" height="243" alt="image" src="https://github.com/user-attachments/assets/a8dba0f4-cac2-4e1e-9f1a-36b600862401" />
+
+2. It is blazing fast. Rust runs as close speed of native app
+
+3. It supports more features. Including but not limited to:
+
+- It uses cgroup, you can set each service CPU, RAM, SWAP usage
+- It allows you spawn your process in any way. You can spawn 20 background process, and main process exists, it can still track what processes under it
+- The stop is deterministic. When you stop a service on the web UI, it is **DEFINITELY** not running!
+- Supports cronjob  as well!
+- Supports one time setup required as root. like allowing your CADDY to bind on port 443
+- Modern, well maintained
+
+# How you would interact with processmaster
 - **`processmaster`**: the daemon (supervisor + web console + JSON-RPC server over a unix socket)
 - **`pmctl`**: the CLI client (talks JSON-RPC over the unix socket)
+- **`web consle: 9001`**: if you have enabled, you can use the web console
+
+# Screenshot
+## CLI Access
+<img width="1547" height="472" alt="image" src="https://github.com/user-attachments/assets/22ef9c8d-773f-4175-9ec6-40c01603bd9a" />
+## Web Access
+<img width="1728" height="630" alt="image" src="https://github.com/user-attachments/assets/7ebc5c8e-a72a-429e-937b-735fdd80667a" />
+## Online log viewing/tailing
+<img width="1123" height="788" alt="image" src="https://github.com/user-attachments/assets/e6216d51-0d9e-4818-b9cd-2a2ef243f954" />
+
+
 
 ## Quick start (local)
 
