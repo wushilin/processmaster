@@ -42,6 +42,11 @@ It runs on ubuntu 22, ubuntu 24, redhat 8 and any cgroup v2 supported platform.
 ## Cron support
 <img width="1728" height="314" alt="image" src="https://github.com/user-attachments/assets/62a39449-548d-485b-a7d8-6502ce230e3b" />
 
+## Process resource utilization view
+<img width="783" height="539" alt="image" src="https://github.com/user-attachments/assets/4202e751-9842-4591-b64a-1566d0a586e7" />
+
+<img width="786" height="279" alt="image" src="https://github.com/user-attachments/assets/8b81227e-a2ef-4057-9644-e0b49b33cdd0" />
+
 
 ## Quick start (local)
 
