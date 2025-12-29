@@ -48,7 +48,8 @@ process:
       value: bar
 
   # Cron schedule (mutually exclusive with restart_policy).
-  # schedule: "0 * * * *"        # 5-field cron
+  # schedule: "0 * * * *"        # 5-field cron (min hour dom mon dow), minute-resolution only (no seconds field)
+  #                              # Supported syntax: *, lists (1,2), ranges (1-5), steps (*/15), month/day names (JAN, MON)
   # not_before: "2025-01-01"      # or "2025-01-01 00:00:00" (local time)
   # not_after: "2025-12-31"       # or "2025-12-31 23:59:59" (local time)
   # max_time_per_run: "30s"       # or "never"

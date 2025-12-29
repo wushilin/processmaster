@@ -1195,7 +1195,18 @@ fn start_scheduler_thread(state: Arc<Mutex<DaemonState>>) {
                     continue;
                 }
 
-                let normalized = normalize_cron_expr(expr);
+                let normalized = match normalize_cron_expr(expr) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        pm_event_state(
+                            &state,
+                            "schedule",
+                            Some(&name),
+                            format!("parse_error schedule={expr:?} err={e}"),
+                        );
+                        continue;
+                    }
+                };
                 let schedule = match Schedule::from_str(&normalized) {
                     Ok(s) => s,
                     Err(e) => {
@@ -1303,14 +1314,31 @@ fn start_overtime_scheduler_thread(state: Arc<Mutex<DaemonState>>) {
     });
 }
 
-fn normalize_cron_expr(expr: &str) -> String {
-    // Accept standard 5-field cron ("m h dom mon dow") by prepending seconds=0.
-    // If user already provided 6+ fields, pass through unchanged.
+fn normalize_cron_expr(expr: &str) -> Result<String, String> {
+    // processmaster evaluates cron schedules on minute boundaries.
+    // We therefore only support 5-field cron ("min hour dom mon dow") and we normalize it to the
+    // `cron` crate's longhand by prepending seconds=0.
+    //
+    // Note: the upstream `cron` crate supports 6/7-field expressions (sec ... [year]) and @daily-like
+    // shorthands, but seconds-level precision is not supported by our scheduler loop.
+    let expr = expr.trim();
+    if expr.is_empty() {
+        return Err("schedule is empty".to_string());
+    }
+
+    // Keep compatibility with upstream cron shorthands like "@hourly" (they are minute-resolution here).
+    if expr.starts_with('@') {
+        return Ok(expr.to_string());
+    }
+
     let parts: Vec<&str> = expr.split_whitespace().collect();
     if parts.len() == 5 {
-        format!("0 {expr}")
+        Ok(format!("0 {expr}"))
     } else {
-        expr.to_string()
+        Err(format!(
+            "unsupported schedule format (expected 5 fields: min hour day-of-month month day-of-week; got {} fields)",
+            parts.len()
+        ))
     }
 }
 
@@ -3515,6 +3543,35 @@ fn record_system_crash_in_store(run_info: &Arc<Mutex<HashMap<String, RunInfo>>>,
     while e.recent_system_crashes_ms.len() > 500 {
         e.recent_system_crashes_ms.pop_front();
     }
+}
+
+fn record_cron_failed_start_in_store(
+    run_info: &Arc<Mutex<HashMap<String, RunInfo>>>,
+    events: &Arc<Mutex<VecDeque<EventEntry>>>,
+    name: &str,
+    reason: &str,
+    err: &str,
+    code: i32,
+) {
+    // Cron jobs have no restart/backoff semantics, but we still want clear visibility in UI:
+    // - `last_exit_code` populated
+    // - `exit_err` flag set (mutually exclusive with `exit_ok` via flag rules)
+    // - crash recorded (for recent crash counters/telemetry)
+    {
+        let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+        let e = ri.entry(name.to_string()).or_default();
+        e.last_exit_code = Some(code);
+        sysflag_set_with_rules(name, &mut e.system_flags, SystemFlag::ExitErr, None);
+    }
+    record_system_crash_in_store(run_info, name);
+    push_event(
+        events,
+        "schedule",
+        Some(name),
+        format!("event=start_failed reason={reason} code={code} err={err}"),
+    );
+    // Cron jobs return to stopped between runs.
+    set_phase_and_emit(run_info, events, name, Phase::Stopped, reason);
 }
 
 // record_started removed: controller uses `record_started_in_store` directly after spawning.
@@ -5911,6 +5968,14 @@ fn spawn_supervisor_thread(
                         let child = match child_r {
                             Ok(c) => c,
                             Err(e) => {
+                                record_cron_failed_start_in_store(
+                                    &run_info,
+                                    &events,
+                                    &app,
+                                    "manual_start_spawn_error",
+                                    &e.to_string(),
+                                    1,
+                                );
                                 let _ = resp.send(Err(e));
                                 continue;
                             }
@@ -5928,12 +5993,25 @@ fn spawn_supervisor_thread(
                     }
 
                     if !wait_for_cgroup_nonempty(&cfg, &app, Duration::from_secs(3)).await {
-                        {
-                            let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
-                            let e = ri.entry(app.clone()).or_default();
-                            sysflag_set_with_rules(&app, &mut e.system_flags, SystemFlag::Failed, None);
+                        if def.schedule.is_some() {
+                            // NOTE: cron jobs may start+exit too quickly for the cgroup poll loop to observe
+                            // a non-empty cgroup (50ms polling). We already attached a process waiter above,
+                            // so do NOT mark exit_err here; let the actual exit code decide.
+                            push_event(
+                                &events,
+                                "schedule",
+                                Some(&app),
+                                "event=start_timeout scope=cron detail=cgroup_stayed_empty",
+                            );
+                            set_phase_and_emit(&run_info, &events, &app, Phase::Stopped, "manual_start_timeout");
+                        } else {
+                            {
+                                let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+                                let e = ri.entry(app.clone()).or_default();
+                                sysflag_set_with_rules(&app, &mut e.system_flags, SystemFlag::Failed, None);
+                            }
+                            set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "manual_start_timeout");
                         }
-                        set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "manual_start_timeout");
                         let _ = resp.send(Err(anyhow::anyhow!("{app}: start timeout (cgroup stayed empty)")));
                         continue;
                     }
@@ -6349,10 +6427,26 @@ fn spawn_supervisor_thread(
                     let child = match spawn_r {
                         Ok(Ok(c)) => c,
                         Ok(Err(e)) => {
+                            record_cron_failed_start_in_store(
+                                &run_info,
+                                &events,
+                                &app,
+                                "scheduled_start_spawn_error",
+                                &e.to_string(),
+                                1,
+                            );
                             let _ = resp.send(Err(e));
                             continue;
                         }
                         Err(e) => {
+                            record_cron_failed_start_in_store(
+                                &run_info,
+                                &events,
+                                &app,
+                                "scheduled_start_join_error",
+                                &e.to_string(),
+                                1,
+                            );
                             let _ = resp.send(Err(e));
                             continue;
                         }
@@ -6367,6 +6461,14 @@ fn spawn_supervisor_thread(
                     waiter_cancel = None;
                     let _ = spawn_process_waiter(child, &tx_self, &app, waiter_epoch);
                     if !wait_for_cgroup_nonempty(&cfg, &app, Duration::from_secs(3)).await {
+                        // Same reasoning as manual_start_timeout: don't guess failure for cron jobs here.
+                        push_event(
+                            &events,
+                            "schedule",
+                            Some(&app),
+                            "event=start_timeout scope=cron detail=cgroup_stayed_empty",
+                        );
+                        set_phase_and_emit(&run_info, &events, &app, Phase::Stopped, "scheduled_start_timeout");
                         let _ = resp.send(Err(anyhow::anyhow!("{app}: start timeout (cgroup stayed empty)")));
                         continue;
                     }

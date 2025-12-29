@@ -320,8 +320,11 @@ global:
 
 If `process.schedule` is set, the app becomes a cron job:
 
-- Standard **5-field cron** (`min hour day-of-month month day-of-week`, seconds assumed `0`)
-- Also accepts 6-field cron if you want explicit seconds
+- **Supported format**: standard **5-field cron** (`min hour day-of-month month day-of-week`)
+- **Minimum resolution**: **1 minute** (scheduler only evaluates schedules on minute boundaries)
+- **Not supported**: a seconds field (6-field cron) or a year field (7-field cron)
+- **Supported operators (per field)**: `*` (all), `,` (list), `-` (range), `/` (step, e.g. `*/15`)
+- **Supported names**: month and weekday names (e.g. `JAN`, `January`, `MON`, `Monday`; case-insensitive)
 - Scheduled apps **must not** define `restart_policy` (mutually exclusive)
 
 #### Non-overlapping behavior (no concurrent runs)

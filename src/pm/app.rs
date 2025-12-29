@@ -302,7 +302,8 @@ pub struct AppDefinition {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
-    /// Cron expression (future).
+    /// Cron schedule (5-field: `min hour day-of-month month day-of-week`).
+    /// Minimum resolution is one minute (processmaster evaluates schedules on minute boundaries).
     #[serde(default)]
     pub schedule: Option<String>,
     /// Optional: do not trigger scheduled runs before this local time.
