@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use time::{Duration as TimeDuration, OffsetDateTime};
+use tokio::process::Command;
 
 #[derive(Clone)]
 struct WebState {
@@ -532,6 +533,143 @@ async fn jsonrpc(State(st): State<WebState>, Json(req): Json<JsonRpcRequest>) ->
                 }),
             );
         }
+        "systemd_list" => {
+            let resp = match systemd_list_services().await {
+                Ok(v) => serde_json::json!({ "ok": true, "message": "", "services": v }),
+                Err(e) => serde_json::json!({ "ok": false, "message": e.to_string(), "services": [] }),
+            };
+            return (
+                StatusCode::OK,
+                Json(JsonRpcResponse::<serde_json::Value> {
+                    jsonrpc: "2.0",
+                    id: req.id,
+                    result: Some(resp),
+                    error: None,
+                }),
+            );
+        }
+        "systemd_action" => {
+            let unit = req
+                .params
+                .get("unit")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let action = req
+                .params
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if unit.is_empty() || action.is_empty() {
+                let v = serde_json::json!({ "ok": false, "message": "missing/empty params: unit/action" });
+                return (
+                    StatusCode::OK,
+                    Json(JsonRpcResponse::<serde_json::Value> {
+                        jsonrpc: "2.0",
+                        id: req.id,
+                        result: Some(v),
+                        error: None,
+                    }),
+                );
+            }
+            let resp = match systemd_action(&unit, &action).await {
+                Ok(msg) => serde_json::json!({ "ok": true, "message": msg }),
+                Err(e) => serde_json::json!({ "ok": false, "message": e.to_string() }),
+            };
+            return (
+                StatusCode::OK,
+                Json(JsonRpcResponse::<serde_json::Value> {
+                    jsonrpc: "2.0",
+                    id: req.id,
+                    result: Some(resp),
+                    error: None,
+                }),
+            );
+        }
+        "systemd_logs" => {
+            let unit = req
+                .params
+                .get("unit")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let n = req
+                .params
+                .get("n")
+                .and_then(|v| v.as_u64())
+                .map(|x| x as usize)
+                .unwrap_or(200);
+            if unit.is_empty() {
+                let v = serde_json::json!({ "ok": false, "message": "missing/empty param: unit" });
+                return (
+                    StatusCode::OK,
+                    Json(JsonRpcResponse::<serde_json::Value> {
+                        jsonrpc: "2.0",
+                        id: req.id,
+                        result: Some(v),
+                        error: None,
+                    }),
+                );
+            }
+            let resp = match systemd_logs(&unit, n).await {
+                Ok(text) => serde_json::json!({ "ok": true, "message": text }),
+                Err(e) => serde_json::json!({ "ok": false, "message": e.to_string() }),
+            };
+            return (
+                StatusCode::OK,
+                Json(JsonRpcResponse::<serde_json::Value> {
+                    jsonrpc: "2.0",
+                    id: req.id,
+                    result: Some(resp),
+                    error: None,
+                }),
+            );
+        }
+        "systemd_service_details" => {
+            let unit = req
+                .params
+                .get("unit")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if unit.is_empty() {
+                let v = serde_json::json!({ "ok": false, "message": "missing/empty param: unit" });
+                return (
+                    StatusCode::OK,
+                    Json(JsonRpcResponse::<serde_json::Value> {
+                        jsonrpc: "2.0",
+                        id: req.id,
+                        result: Some(v),
+                        error: None,
+                    }),
+                );
+            }
+            let unit_ok = unit.clone();
+            let resp = match systemd_service_details(&unit).await {
+                Ok((cg, snap)) => serde_json::json!({
+                    "ok": true,
+                    "message": "",
+                    "unit": unit_ok,
+                    "cgroup_dir": cg.display().to_string(),
+                    "snapshot": snap,
+                }),
+                Err(e) => serde_json::json!({ "ok": false, "message": e.to_string(), "unit": unit }),
+            };
+            return (
+                StatusCode::OK,
+                Json(JsonRpcResponse::<serde_json::Value> {
+                    jsonrpc: "2.0",
+                    id: req.id,
+                    result: Some(resp),
+                    error: None,
+                }),
+            );
+        }
         "admin_actions_pids" => {
             let cfg = {
                 let st = st.daemon.lock().unwrap_or_else(|p| p.into_inner());
@@ -702,6 +840,297 @@ fn service_cgroup_dir(cfg: &crate::pm::config::MasterConfig, app: &str) -> anyho
     );
     let master = PathBuf::from(&cfg.cgroup_root).join(name.trim_start_matches('/'));
     Ok(master.join(format!("pm-{app}")))
+}
+
+// ---------------- systemd helpers (web console) ----------------
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SystemdServiceStatus {
+    unit: String,
+    phase: String, // RUNNING/STOPPED
+    enabled: bool,
+    unit_file_state: String,
+    fragment_path: String,
+    exec_start_path: String,
+    main_pid: i32,
+    cgroup_dir: String,
+    pids: Vec<u32>,
+    pid_uptimes_ms: Vec<i64>,
+}
+
+fn validate_systemd_unit(unit: &str) -> anyhow::Result<()> {
+    let t = unit.trim();
+    anyhow::ensure!(!t.is_empty(), "unit is empty");
+    anyhow::ensure!(t.ends_with(".service"), "only .service units are supported (got {t:?})");
+    anyhow::ensure!(
+        t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@' | ':' | '\\')),
+        "invalid unit name (unsupported characters): {t:?}"
+    );
+    Ok(())
+}
+
+fn validate_systemd_action(action: &str) -> anyhow::Result<&'static str> {
+    match action {
+        "start" => Ok("start"),
+        "stop" => Ok("stop"),
+        "restart" => Ok("restart"),
+        _ => anyhow::bail!("unsupported action: {action:?} (allowed: start|stop|restart)"),
+    }
+}
+
+async fn run_cmd_timeout(mut cmd: Command, ms: u64) -> anyhow::Result<std::process::Output> {
+    let fut = cmd.output();
+    let out = tokio::time::timeout(std::time::Duration::from_millis(ms), fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("command timed out after {ms}ms"))??;
+    Ok(out)
+}
+
+fn sysfs_cgroup_dir_from_control_group(control_group: &str) -> Option<PathBuf> {
+    let cg = control_group.trim();
+    if cg.is_empty() {
+        return None;
+    }
+    // systemctl show ControlGroup is typically like "/system.slice/sshd.service"
+    let rel = cg.trim_start_matches('/');
+    if rel.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from("/sys/fs/cgroup").join(rel))
+}
+
+fn clock_ticks_per_second() -> Option<f64> {
+    let v = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if v <= 0 { None } else { Some(v as f64) }
+}
+
+fn read_system_uptime_seconds() -> Option<f64> {
+    let s = std::fs::read_to_string("/proc/uptime").ok()?;
+    let first = s.split_whitespace().next()?;
+    first.parse::<f64>().ok()
+}
+
+fn compute_pid_uptimes_ms_u32(pids: &[u32], sys_uptime_s: Option<f64>, hz: Option<f64>) -> Vec<i64> {
+    let mut out = Vec::with_capacity(pids.len());
+    for &pid in pids {
+        let ms = pid_uptime_ms_u32(pid, sys_uptime_s, hz);
+        out.push(ms.unwrap_or(-1));
+    }
+    out
+}
+
+fn pid_uptime_ms_u32(pid: u32, sys_uptime_s: Option<f64>, hz: Option<f64>) -> Option<i64> {
+    let sys_uptime_s = sys_uptime_s?;
+    let hz = hz?;
+    let start_ticks = read_pid_starttime_ticks_u32(pid)?;
+    let started_s = (start_ticks as f64) / hz;
+    let up_s = (sys_uptime_s - started_s).max(0.0);
+    Some((up_s * 1000.0).round() as i64)
+}
+
+fn read_pid_starttime_ticks_u32(pid: u32) -> Option<u64> {
+    let path = format!("/proc/{pid}/stat");
+    let stat = std::fs::read_to_string(path).ok()?;
+    let rparen = stat.rfind(')')?;
+    let after = stat.get(rparen + 2..)?; // skip ") "
+    let fields: Vec<&str> = after.split_whitespace().collect();
+    // fields[0] is original field 3 (state). starttime is original field 22 => index 22-3 = 19
+    let start = *fields.get(19)?;
+    start.parse::<u64>().ok()
+}
+
+async fn systemd_list_services() -> anyhow::Result<Vec<SystemdServiceStatus>> {
+    // Bulk query for all service units. This is dramatically faster than per-unit `systemctl show`.
+    let mut cmd = Command::new("systemctl");
+    cmd.arg("show")
+        .arg("--type=service")
+        .arg("--all")
+        .arg("--no-pager")
+        .arg("--property=Id,ActiveState,SubState,MainPID,ControlGroup,UnitFileState,FragmentPath,ExecStart");
+    let out = run_cmd_timeout(cmd, 3000).await?;
+
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        anyhow::bail!("systemctl show failed: {}", if err.is_empty() { out.status.to_string() } else { err });
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let sys_uptime_s = read_system_uptime_seconds();
+    let hz = clock_ticks_per_second();
+
+    let mut services = vec![];
+    for block in text.split("\n\n") {
+        let mut id: Option<String> = None;
+        let mut active: Option<String> = None;
+        let mut sub: Option<String> = None;
+        let mut main_pid: Option<i32> = None;
+        let mut cg: Option<String> = None;
+        let mut ufs: Option<String> = None;
+        let mut frag: Option<String> = None;
+        let mut exec_start: Option<String> = None;
+
+        for line in block.lines() {
+            let (k, v) = match line.split_once('=') {
+                Some(kv) => kv,
+                None => continue,
+            };
+            let v = v.trim().to_string();
+            match k.trim() {
+                "Id" => id = Some(v),
+                "ActiveState" => active = Some(v),
+                "SubState" => sub = Some(v),
+                "MainPID" => {
+                    let p = v.parse::<i32>().unwrap_or(0);
+                    main_pid = Some(p);
+                }
+                "ControlGroup" => cg = Some(v),
+                "UnitFileState" => ufs = Some(v),
+                "FragmentPath" => frag = Some(v),
+                "ExecStart" => exec_start = Some(v),
+                _ => {}
+            }
+        }
+
+        let Some(unit) = id else { continue };
+        if !unit.ends_with(".service") {
+            continue;
+        }
+        // Avoid odd corner cases: only list units we can later act on.
+        if validate_systemd_unit(&unit).is_err() {
+            continue;
+        }
+
+        let active_state = active.unwrap_or_else(|| "unknown".to_string());
+        let sub_state = sub.unwrap_or_else(|| "".to_string());
+        let mpid = main_pid.unwrap_or(0);
+        let unit_file_state = ufs.unwrap_or_else(|| "unknown".to_string());
+        let fragment_path = frag.unwrap_or_default();
+        let exec_start_path = exec_start
+            .as_deref()
+            .and_then(parse_systemd_execstart_path)
+            .unwrap_or_default();
+        let enabled = unit_file_state.starts_with("enabled");
+        let phase = if active_state == "active" && sub_state == "exited" {
+            "EXITED"
+        } else if active_state == "active" {
+            "RUNNING"
+        } else if active_state == "failed" {
+            "FAILED"
+        } else {
+            "STOPPED"
+        }
+        .to_string();
+
+        let cgroup_dir = cg.clone().unwrap_or_default();
+        let sysfs_dir = cg.as_deref().and_then(sysfs_cgroup_dir_from_control_group);
+        let pids = match sysfs_dir.as_deref() {
+            Some(dir) if std::fs::metadata(dir).is_ok() => cgroup::list_pids(dir).unwrap_or_default(),
+            _ => vec![],
+        };
+        let pid_uptimes_ms = compute_pid_uptimes_ms_u32(&pids, sys_uptime_s, hz);
+
+        services.push(SystemdServiceStatus {
+            unit,
+            phase,
+            enabled,
+            unit_file_state,
+            fragment_path,
+            exec_start_path,
+            main_pid: mpid,
+            cgroup_dir,
+            pids,
+            pid_uptimes_ms,
+        });
+    }
+
+    services.sort_by(|a, b| a.unit.cmp(&b.unit));
+    Ok(services)
+}
+
+fn parse_systemd_execstart_path(raw: &str) -> Option<String> {
+    // `systemctl show -p ExecStart` commonly yields strings like:
+    //   ExecStart={ path=/usr/sbin/sshd ; argv[]=/usr/sbin/sshd -D ... ; ... }
+    // There may be multiple `{...}{...}` entries; we just take the first `path=...`.
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let idx = t.find("path=")?;
+    let rest = &t[idx + "path=".len()..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == ';' || c == '}' || c == ',' )
+        .unwrap_or(rest.len());
+    let p = rest[..end].trim().trim_matches('"').to_string();
+    if p.is_empty() { None } else { Some(p) }
+}
+
+async fn systemd_action(unit: &str, action: &str) -> anyhow::Result<String> {
+    validate_systemd_unit(unit)?;
+    let action = validate_systemd_action(action)?;
+    let mut cmd = Command::new("systemctl");
+    cmd.arg("--no-pager").arg(action).arg(unit);
+    let out = run_cmd_timeout(cmd, 10_000).await?;
+    if out.status.success() {
+        return Ok(format!("{action} {unit}: ok"));
+    }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    anyhow::bail!(
+        "systemctl {} {} failed: {}",
+        action,
+        unit,
+        if err.is_empty() { out.status.to_string() } else { err }
+    );
+}
+
+async fn systemd_logs(unit: &str, n: usize) -> anyhow::Result<String> {
+    validate_systemd_unit(unit)?;
+    let n = n.clamp(1, 5000);
+    let mut cmd = Command::new("journalctl");
+    cmd.arg("-u")
+        .arg(unit)
+        .arg("-n")
+        .arg(n.to_string())
+        .arg("--no-pager")
+        .arg("--output=short-iso");
+    let out = run_cmd_timeout(cmd, 5000).await?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        anyhow::bail!(
+            "journalctl -u {unit} failed: {}",
+            if err.is_empty() { out.status.to_string() } else { err }
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+async fn systemd_service_details(unit: &str) -> anyhow::Result<(PathBuf, cgroup::CgroupResourceSnapshot)> {
+    validate_systemd_unit(unit)?;
+    let mut cmd = Command::new("systemctl");
+    cmd.arg("show")
+        .arg(unit)
+        .arg("--no-pager")
+        .arg("--property=ControlGroup");
+    let out = run_cmd_timeout(cmd, 3000).await?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        anyhow::bail!(
+            "systemctl show {unit} failed: {}",
+            if err.is_empty() { out.status.to_string() } else { err }
+        );
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let cg = text
+        .lines()
+        .find_map(|line| line.strip_prefix("ControlGroup="))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let dir = sysfs_cgroup_dir_from_control_group(&cg)
+        .ok_or_else(|| anyhow::anyhow!("systemd unit has no ControlGroup: {unit}"))?;
+    if let Err(e) = std::fs::metadata(&dir) {
+        anyhow::bail!("cgroup dir not found for {unit}: {}: {e}", dir.display());
+    }
+    let snap = cgroup::read_resource_snapshot(&dir)?;
+    Ok((dir, snap))
 }
 
 fn map_method_to_request(method: &str, params: &serde_json::Value) -> Result<Request, String> {

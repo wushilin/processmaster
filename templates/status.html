@@ -10,6 +10,10 @@
           <input class="form-check-input" type="checkbox" role="switch" id="autoRefreshToggle" checked>
           <label class="form-check-label" for="autoRefreshToggle">Auto refresh</label>
         </div>
+        <div class="form-check form-switch align-self-center me-2" title="Hidden by default to avoid accidentally stopping critical services (e.g. ssh).">
+          <input class="form-check-input" type="checkbox" role="switch" id="showSystemdSystemServices">
+          <label class="form-check-label" for="showSystemdSystemServices">Show system services</label>
+        </div>
         <button id="btn-refresh" class="btn btn-outline-secondary btn-sm">Refresh</button>
         <button id="btn-update" class="btn btn-primary btn-sm">Reload Service Definition</button>
         <button id="btn-admin-actions" class="btn btn-warning btn-sm">Admin actions</button>
@@ -38,6 +42,11 @@
           <li class="nav-item" role="presentation">
             <button class="nav-link" id="tab-cron" data-bs-toggle="tab" data-bs-target="#pane-cron" type="button" role="tab">
               Cron
+            </button>
+          </li>
+          <li class="nav-item" role="presentation">
+            <button class="nav-link" id="tab-systemd" data-bs-toggle="tab" data-bs-target="#pane-systemd" type="button" role="tab">
+              Systemd Services
             </button>
           </li>
         </ul>
@@ -221,6 +230,24 @@
                 </thead>
                 <tbody id="status-body-cron">
                   <tr><td colspan="9" class="text-muted">Loading…</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="tab-pane fade" id="pane-systemd" role="tabpanel">
+              <table class="table table-sm table-striped table-hover align-middle mb-0 pm-status-table">
+                <thead>
+                  <tr>
+                    <th class="col-app">Application</th>
+                    <th class="col-status">Status</th>
+                    <th class="col-pid">PID</th>
+                    <th class="col-uptime">Uptime</th>
+                    <th class="col-enabled">Enabled</th>
+                    <th class="col-actions text-end">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="status-body-systemd">
+                  <tr><td colspan="6" class="text-muted">Loading…</td></tr>
                 </tbody>
               </table>
             </div>
@@ -565,6 +592,7 @@
   }
 
   let lastStatuses = [];
+  let lastSystemd = [];
   let sortKey = "app";
   let sortDir = "asc"; // asc|desc
 
@@ -630,6 +658,13 @@
     }[kind] || "";
 
     return `<button type="button" class="${cls}" title="${esc(title)}" aria-label="${esc(title)}" data-action="${esc(action)}" data-app="${esc(app)}">${svg}</button>`;
+  }
+
+  function iconButtonExtra(kind, title, action, app, extraAttrs) {
+    // `extraAttrs` should be a string like `data-kind="systemd" data-unit="..."`.
+    const base = iconButton(kind, title, action, app);
+    if (!extraAttrs) return base;
+    return base.replace("<button ", `<button ${extraAttrs} `);
   }
 
   function enabledIconFor(s) {
@@ -797,6 +832,148 @@
     }
   }
 
+  // -------- systemd status refresh (only when the Systemd tab is active) --------
+  let refreshSystemdInFlight = false;
+  function systemdTabActive() {
+    const tab = document.getElementById("tab-systemd");
+    return !!(tab && tab.classList.contains("active"));
+  }
+
+  // Systemd filtering: hide distro/system units by default to prevent accidents (e.g. ssh.service).
+  // Heuristic: packaged units usually live under /lib/systemd/system or /usr/lib/systemd/system.
+  const SYSTEMD_SHOW_SYSTEM_COOKIE = "pm_show_systemd_system_services";
+  const showSystemdSystemServicesToggle = document.getElementById("showSystemdSystemServices");
+  function showSystemdSystemServicesEnabled() {
+    const raw = getCookie(SYSTEMD_SHOW_SYSTEM_COOKIE);
+    if (raw === null) return false; // default: OFF
+    return raw === "1";
+  }
+  function setShowSystemdSystemServices(enabled) {
+    setCookie(SYSTEMD_SHOW_SYSTEM_COOKIE, enabled ? "1" : "0");
+    if (showSystemdSystemServicesToggle) showSystemdSystemServicesToggle.checked = !!enabled;
+    renderSystemdTable();
+  }
+  function isSystemdSystemService(s) {
+    const fp = (s && s.fragment_path) ? ("" + s.fragment_path).trim() : "";
+    // Safer default: if unknown, treat as system (hide when toggle is off).
+    if (!fp) return true;
+    const p = fp.replace(/\\/g, "/");
+    // Explicitly treat custom/system overrides as NOT "system services" (even if they run /usr/bin).
+    // This keeps user-managed units visible by default.
+    if (p.startsWith("/etc/systemd/system/") || p.startsWith("/run/systemd/system/")) {
+      return false;
+    }
+    return (
+      p.startsWith("/lib/systemd/system/") ||
+      p.startsWith("/usr/lib/systemd/system/") ||
+      p.startsWith("/usr/local/lib/systemd/system/")
+    );
+  }
+
+  function isProbablyInterpreterBinary(execPath) {
+    const x = (execPath || "").trim().replace(/\\/g, "/");
+    const base = x.split("/").pop() || "";
+    const b = base.toLowerCase();
+    return (
+      b === "python" || b.startsWith("python") ||
+      b === "perl" ||
+      b === "ruby" ||
+      b === "node" || b === "nodejs" ||
+      b === "bash" || b === "sh" || b === "dash" || b === "zsh" || b === "fish" ||
+      b === "env"
+    );
+  }
+
+  function isSystemBinaryPath(execPath) {
+    const x = (execPath || "").trim().replace(/\\/g, "/");
+    return (
+      x.startsWith("/usr/bin/") ||
+      x.startsWith("/usr/sbin/") ||
+      x.startsWith("/bin/") ||
+      x.startsWith("/sbin/")
+    );
+  }
+
+  function isSystemdSystemServiceHeuristic(s) {
+    // Primary: unit file location
+    if (isSystemdSystemService(s)) return true;
+
+    // Secondary: if it's not clearly a custom unit, and ExecStart is a system bin, assume system-ish.
+    const fp = (s && s.fragment_path) ? ("" + s.fragment_path).trim() : "";
+    const p = fp.replace(/\\/g, "/");
+    const isCustom = p.startsWith("/etc/systemd/system/") || p.startsWith("/run/systemd/system/");
+    if (isCustom) return false;
+
+    const exe = (s && s.exec_start_path) ? ("" + s.exec_start_path).trim() : "";
+    if (!exe) return true; // unknown -> safer default
+    if (isSystemBinaryPath(exe) && !isProbablyInterpreterBinary(exe)) return true;
+    return false;
+  }
+  async function refreshSystemd() {
+    if (refreshSystemdInFlight) return;
+    refreshSystemdInFlight = true;
+    try {
+      const resp = await rpc("systemd_list", {}, { busy: false });
+      if (!resp.ok) throw new Error(resp.message || "systemd_list failed");
+      lastSystemd = resp.services || [];
+      renderSystemdTable();
+    } catch (e) {
+      showAlert("danger", e.toString());
+    } finally {
+      refreshSystemdInFlight = false;
+    }
+  }
+
+  function renderSystemdTable() {
+    const body = document.getElementById("status-body-systemd");
+    if (!body) return;
+    const rowsAll = lastSystemd || [];
+    const showSystem = showSystemdSystemServicesEnabled();
+    const rows = showSystem ? rowsAll : rowsAll.filter((s) => !isSystemdSystemServiceHeuristic(s));
+    if (!rows.length) {
+      if (!showSystem && rowsAll.length) {
+        body.innerHTML = '<tr><td colspan="6" class="text-muted">(all system services are hidden — enable “Show system services” to display them)</td></tr>';
+      } else {
+        body.innerHTML = '<tr><td colspan="6" class="text-muted">(no systemd services)</td></tr>';
+      }
+      return;
+    }
+
+    function renderRow(s) {
+      const unit = s.unit || "";
+      const phase = s.phase || "STOPPED";
+      const pids = (s.pids || []);
+      const ups = (s.pid_uptimes_ms || []);
+      const pidLines = pids.length ? pids.map((pid) => `<div><code>${esc(pid.toString())}</code></div>`).join("") : `<div class="text-muted">-</div>`;
+      const upLines = pids.length ? pids.map((_, i) => `<div>${esc(fmtUptimeMs(ups[i] ?? -1))}</div>`).join("") : `<div class="text-muted">-</div>`;
+      const appBtn = `<button type="button" class="btn btn-link btn-sm p-0 text-decoration-none" data-kind="systemd" data-action="details" data-unit="${esc(unit)}" title="Show systemd service details"><code>${esc(unit)}</code></button>`;
+      const actions = [
+        iconButtonExtra("play", "Start", "start", unit, `data-kind="systemd" data-unit="${esc(unit)}"`),
+        iconButtonExtra("stop", "Stop", "stop", unit, `data-kind="systemd" data-unit="${esc(unit)}"`),
+        iconButtonExtra("restart", "Restart", "restart", unit, `data-kind="systemd" data-unit="${esc(unit)}"`),
+        iconButtonExtra("logs", "Logs", "logs", unit, `data-kind="systemd" data-unit="${esc(unit)}"`),
+      ].join("");
+      const actionsGroup = `<div class="btn-group btn-group-sm pm-actions" role="group" aria-label="Actions">${actions}</div>`;
+      const enabled = !!s.enabled;
+      const ph = ("" + phase).toUpperCase();
+      const badge =
+        ph.includes("RUN") ? "badge bg-success" :
+        ph.includes("EXIT") ? "badge bg-warning text-dark" :
+        ph.includes("FAIL") ? "badge bg-danger" :
+        "badge bg-secondary";
+      return `<tr>
+        <td class="pm-truncate col-app" title="${esc(unit)}">${appBtn}</td>
+        <td class="col-status"><span class="${badge}">${esc(phase)}</span></td>
+        <td class="text-nowrap col-pid">${pidLines}</td>
+        <td class="text-nowrap col-uptime">${upLines}</td>
+        <td class="text-center col-enabled">${enabledIconFor({ enabled })}</td>
+        <td class="text-end col-actions">${actionsGroup}</td>
+      </tr>`;
+    }
+
+    body.innerHTML = rows.map(renderRow).join("");
+  }
+
   const AUTO_REFRESH_KEY = "pm:autoRefresh";
   const autoRefreshToggle = document.getElementById("autoRefreshToggle");
   let refreshTimer = null;
@@ -805,6 +982,9 @@
     if (refreshTimer) return;
     refreshTimer = window.setInterval(() => {
       refresh().catch(() => {});
+      if (systemdTabActive()) {
+        refreshSystemd().catch(() => {});
+      }
     }, 2000);
   }
 
@@ -828,6 +1008,15 @@
   autoRefreshToggle.addEventListener("change", () => {
     setAutoRefreshEnabled(autoRefreshToggle.checked);
   });
+
+  // init "show systemd system services" toggle from cookie (default: off)
+  if (showSystemdSystemServicesToggle) {
+    showSystemdSystemServicesToggle.checked = showSystemdSystemServicesEnabled();
+    showSystemdSystemServicesToggle.addEventListener("change", () => {
+      setShowSystemdSystemServices(showSystemdSystemServicesToggle.checked);
+      if (systemdTabActive()) refreshSystemd().catch(() => {});
+    });
+  }
 
   document.getElementById("btn-refresh").addEventListener("click", async () => {
     try { await refresh(); } catch (e) { showAlert("danger", e.toString()); }
@@ -944,6 +1133,7 @@
   const svcIoStatDeltaEl = document.getElementById("svcIoStatDelta");
   const svcIoSampleMsEl = document.getElementById("svcIoSampleMs");
   let svcDetailsApp = null;
+  let svcDetailsKind = "pm"; // pm|systemd
 
   function fmtBytes(n) {
     if (n === null || n === undefined) return "-";
@@ -1082,9 +1272,10 @@
     return iops.toFixed(iops >= 100 ? 0 : 1) + " iops";
   }
 
-  async function loadServiceDetails(app) {
-    svcDetailsApp = app;
-    if (svcDetailsAppEl) svcDetailsAppEl.textContent = app || "";
+  async function loadServiceDetails(kind, name) {
+    svcDetailsKind = kind || "pm";
+    svcDetailsApp = name;
+    if (svcDetailsAppEl) svcDetailsAppEl.textContent = name || "";
     const setTxt = (el, txt) => { if (el) el.textContent = (txt === null || txt === undefined) ? "-" : ("" + txt); };
     setTxt(svcDetailsCgroupEl, "Loading…");
     setTxt(svcMemCurrentEl, "Loading…");
@@ -1112,7 +1303,9 @@
 
     // Take 2 samples so we can compute CPU utilization from cumulative counters.
     const t0 = performance.now();
-    const resp1 = await rpc("service_details", { app }, { busy: false });
+    const method = (svcDetailsKind === "systemd") ? "systemd_service_details" : "service_details";
+    const params = (svcDetailsKind === "systemd") ? { unit: name } : { app: name };
+    const resp1 = await rpc(method, params, { busy: false });
     if (!resp1.ok) {
       setTxt(svcDetailsCgroupEl, "-");
       setTxt(svcMemCurrentEl, "-");
@@ -1144,7 +1337,7 @@
     // Small delay to form a measurement window; match pmctl default (1s).
     await sleep(1000);
     const t1 = performance.now();
-    const resp2 = await rpc("service_details", { app }, { busy: false });
+    const resp2 = await rpc(method, params, { busy: false });
     const snap1 = resp1.snapshot || {};
     const snap2 = (resp2 && resp2.ok) ? (resp2.snapshot || {}) : snap1;
     const dt_ms = Math.max(1, Math.round((t1 - t0)));
@@ -1260,16 +1453,16 @@
     }
   }
 
-  async function openServiceDetailsFor(app) {
+  async function openServiceDetailsFor(kind, name) {
     if (!svcDetailsModal) return;
     svcDetailsModal.show();
-    try { await loadServiceDetails(app); } catch (e) { showAlert("danger", e.toString()); }
+    try { await loadServiceDetails(kind, name); } catch (e) { showAlert("danger", e.toString()); }
   }
 
   if (svcDetailsRefreshBtn) {
     svcDetailsRefreshBtn.addEventListener("click", async () => {
       if (!svcDetailsApp) return;
-      try { await loadServiceDetails(svcDetailsApp); } catch (e) { showAlert("danger", e.toString()); }
+      try { await loadServiceDetails(svcDetailsKind, svcDetailsApp); } catch (e) { showAlert("danger", e.toString()); }
     });
   }
 
@@ -1457,6 +1650,7 @@
   const logsTail = document.getElementById("logsTail");
   const logsLines = document.getElementById("logsLines");
   let logsApp = null;
+  let logsKind = "pm"; // pm|systemd
   let logsTimer = null;
   const LOGS_MAX_CHARS = 1_000_000; // hard cap to keep UI responsive
 
@@ -1570,9 +1764,11 @@
   async function loadLogs(opts) {
     if (!logsApp) return;
     const n = parseInt(logsLines.value || "200", 10);
-    const resp = await rpc("logs", { name: logsApp, n }, opts);
-    // daemon returns logs in resp.message (pmctl format); keep as-is.
-    const trimmed = trimLogsForUi(resp.message || "", n);
+    const method = (logsKind === "systemd") ? "systemd_logs" : "logs";
+    const params = (logsKind === "systemd") ? { unit: logsApp, n } : { name: logsApp, n };
+    const resp = await rpc(method, params, opts);
+    const txt = resp.message || "";
+    const trimmed = trimLogsForUi(txt, n);
     logsPre.innerHTML = ansiToHtml(trimmed);
     // When tailing, keep scrolled to bottom.
     if (logsTail.checked) {
@@ -1612,6 +1808,7 @@
     stopLogsTail();
     logsTail.checked = false;
     logsApp = null;
+    logsKind = "pm";
     logsAppEl.textContent = "";
     logsPre.textContent = "";
   });
@@ -1723,9 +1920,10 @@
     }
   });
 
-  function openLogsFor(app) {
-    logsApp = app;
-    logsAppEl.textContent = app;
+  function openLogsFor(kind, name) {
+    logsKind = kind || "pm";
+    logsApp = name;
+    logsAppEl.textContent = name;
     logsPre.textContent = "Loading…";
     logsModal.show();
     loadLogs().catch(e => showAlert("danger", e.toString()));
@@ -1931,8 +2129,8 @@
     const action = el.getAttribute("data-action");
     const app = el.getAttribute("data-app");
     if (!action || !app) return;
-    if (action === "details") { openServiceDetailsFor(app); return; }
-    if (action === "logs") { openLogsFor(app); return; }
+    if (action === "details") { openServiceDetailsFor("pm", app); return; }
+    if (action === "logs") { openLogsFor("pm", app); return; }
     if (action === "flags") { openFlagsFor(app); return; }
     if (action === "schedule") { openScheduleFor(app); return; }
     if (action === "start") { askConfirm("start", app); return; }
@@ -1942,7 +2140,38 @@
   document.getElementById("status-body-services").addEventListener("click", onActionClick);
   document.getElementById("status-body-cron").addEventListener("click", onActionClick);
 
+  function onSystemdActionClick(ev) {
+    const el = ev.target.closest("[data-action]");
+    if (!el) return;
+    const kind = el.getAttribute("data-kind");
+    if (kind !== "systemd") return;
+    const action = el.getAttribute("data-action");
+    const unit = el.getAttribute("data-unit") || el.getAttribute("data-app");
+    if (!action || !unit) return;
+    if (action === "details") { openServiceDetailsFor("systemd", unit); return; }
+    if (action === "logs") { openLogsFor("systemd", unit); return; }
+    if (action === "start" || action === "stop" || action === "restart") {
+      if (!confirm(`${action} ${unit}?`)) return;
+      rpc("systemd_action", { unit, action })
+        .then((resp) => { if (resp.message) showAlert(resp.ok ? "success" : "danger", resp.message); })
+        .then(() => refreshSystemd())
+        .catch((e) => showAlert("danger", e.toString()));
+      return;
+    }
+  }
+  document.getElementById("status-body-systemd").addEventListener("click", onSystemdActionClick);
+
+  // When switching to the systemd tab, refresh once.
+  const tabSystemd = document.getElementById("tab-systemd");
+  if (tabSystemd) {
+    tabSystemd.addEventListener("shown.bs.tab", () => {
+      refreshSystemd().catch(() => {});
+    });
+  }
+
   refresh().catch(e => showAlert("danger", e.toString()));
+  // Preload systemd list in the background (no spinner).
+  refreshSystemd().catch(() => {});
 </script>
 {% endblock %}
 
