@@ -71,7 +71,8 @@
             th.col-crashes_10m, td.col-crashes_10m { width: 15ch; max-width: 15ch; }
             th.col-crashes_10m { white-space: nowrap; }
             th.col-pid, td.col-pid { width: 8ch; max-width: 8ch; }
-            th.col-uptime, td.col-uptime { width: 7ch; max-width: 7ch; }
+            /* Uptime can legitimately be very long (e.g. 42323d11h10m4s). */
+            th.col-uptime, td.col-uptime { width: 14ch; max-width: 14ch; }
             th.col-enabled, td.col-enabled { width: 8ch; max-width: 8ch; }
             th.col-last_run, td.col-last_run { width: 20ch; max-width: 20ch; }
             th.col-actions, td.col-actions { width: 20ch; max-width: 20ch; }
@@ -571,10 +572,18 @@
     const hours = Math.floor(s / 3600); s = s % 3600;
     const mins = Math.floor(s / 60); s = s % 60;
     const secs = s;
-    if (days > 0) return `${days}d${hours}h${mins}m${secs}s`;
-    if (hours > 0) return `${hours}h${mins}m${secs}s`;
-    if (mins > 0) return `${mins}m${secs}s`;
-    return `${secs}s`;
+    // Display rules:
+    // - < 1 day: 23h14m3s (always show h/m/s)
+    // - >= 1 day: 2d3h (days + hours)
+    // - >= 10 days: 78d (days only)
+    // - >= 100 days: N/30 months, one decimal: 4.3mth
+    if (days >= 100) {
+      const mth = (days / 30.0);
+      return `${mth.toFixed(1)}mth`;
+    }
+    if (days >= 10) return `${days}d`;
+    if (days >= 1) return `${days}d${hours}h`;
+    return `${hours}h${mins}m${secs}s`;
   }
 
   function fmtLastRun(ms) {
