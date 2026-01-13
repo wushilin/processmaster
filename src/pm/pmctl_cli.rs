@@ -1,5 +1,6 @@
 use crate::pm::{cli, rpc};
 use clap::Parser;
+use std::io::BufRead;
 use std::path::PathBuf;
 use std::{env, fmt};
 
@@ -59,6 +60,71 @@ pub fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Local-only utilities (no daemon socket required).
+    if let Some(cli::Cmd::Password { cmd }) = &args.cmd {
+        fn read_password_if_stdin(s: &str) -> anyhow::Result<String> {
+            let t = s.trim();
+            if t != "-" {
+                return Ok(s.to_string());
+            }
+            // Read a single line from stdin; allow trailing newline.
+            let mut buf = String::new();
+            let stdin = std::io::stdin();
+            let mut stdin = stdin.lock();
+            stdin.read_line(&mut buf)?;
+            let pw = buf.trim_end_matches(&['\r', '\n'][..]).to_string();
+            anyhow::ensure!(!pw.is_empty(), "password read from stdin is empty");
+            Ok(pw)
+        }
+
+        match cmd {
+            cli::PasswordCmd::Generate { user, password } => {
+                let user = user.trim();
+                anyhow::ensure!(!user.is_empty(), "user must not be empty");
+                anyhow::ensure!(!user.contains(':'), "user must not contain ':'");
+                let pass = read_password_if_stdin(password)?;
+                let hash = bcrypt::hash(pass, bcrypt::DEFAULT_COST)?;
+                println!("{user}:{hash}");
+                return Ok(());
+            }
+            cli::PasswordCmd::Verify {
+                secure,
+                user,
+                password,
+            } => {
+                let pass = read_password_if_stdin(password)?;
+                let t = secure.trim();
+                let (secure_user, secure_hash) = t
+                    .split_once(':')
+                    .ok_or_else(|| anyhow::anyhow!("invalid --secure entry (missing ':'): {t:?}"))?;
+                let secure_user = secure_user.trim();
+                let secure_hash = secure_hash.trim();
+                anyhow::ensure!(!secure_user.is_empty(), "invalid --secure entry (empty username)");
+                anyhow::ensure!(!secure_hash.is_empty(), "invalid --secure entry (empty hash)");
+
+                let user_t = user.trim();
+                anyhow::ensure!(!user_t.is_empty(), "--user must not be empty");
+
+                // Match username first; if mismatch, treat as failed verification.
+                if user_t != secure_user {
+                    eprintln!("FAIL");
+                    std::process::exit(1);
+                }
+
+                // htpasswd -B may emit $2y$...; normalize to bcrypt crate accepted prefix.
+                let normalized_hash = secure_hash.replace("$2y$", "$2b$");
+                let ok = bcrypt::verify(pass, &normalized_hash)
+                    .map_err(|_| anyhow::anyhow!("invalid credentials"))?;
+                if ok {
+                    println!("OK");
+                    return Ok(());
+                }
+                eprintln!("FAIL");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let sock = resolve_sock(&args)?;
 
     let cmd = args.cmd.unwrap_or(cli::Cmd::Status {
@@ -74,6 +140,7 @@ pub fn run() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        cli::Cmd::Password { .. } => unreachable!("handled before sock resolution"),
         cli::Cmd::PerfMetrics {
             name,
             interval_ms,

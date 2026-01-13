@@ -103,6 +103,45 @@ pub enum Cmd {
     AdminRun { id: String },
     /// Show PIDs currently running in the admin_actions cgroup
     AdminPs,
+
+    /// Utilities for generating/verifying htpasswd-style bcrypt entries (local; no daemon needed)
+    Password {
+        #[command(subcommand)]
+        cmd: PasswordCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PasswordCmd {
+    /// Generate an htpasswd-style entry: `user:$2b$...`
+    Generate {
+        /// Username to embed before the hash (left side of `user:hash`)
+        #[arg(long = "user")]
+        user: String,
+
+        /// Password to hash.
+        ///
+        /// If you pass `--password` with no value, pmctl reads the password from stdin.
+        #[arg(long = "password", num_args = 0..=1, default_missing_value = "-")]
+        password: String,
+    },
+
+    /// Verify a username+password against a `user:$2x$...` entry (exit 0 on success, 1 on failure).
+    Verify {
+        /// The full htpasswd-style entry (username + bcrypt hash), e.g. `hello:$2b$10$...`
+        #[arg(long = "secure")]
+        secure: String,
+
+        /// Username to verify
+        #[arg(long = "user")]
+        user: String,
+
+        /// Password to verify.
+        ///
+        /// If you pass `--password` with no value, pmctl reads the password from stdin.
+        #[arg(long = "password", num_args = 0..=1, default_missing_value = "-")]
+        password: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -294,6 +333,11 @@ pub fn run() -> anyhow::Result<()> {
                 println!("{}", resp.message.trim_end());
             }
             Ok(())
+        }
+        Some(Cmd::Password { .. }) => {
+            // `pm` is the daemon binary and always expects a config+socket; password helpers are intended
+            // for `pmctl` (client) so we keep them there to avoid any confusion.
+            anyhow::bail!("use `pmctl password ...` (password utilities are client-side)");
         }
         Some(Cmd::Version) => unreachable!("handled before config load"),
     }
