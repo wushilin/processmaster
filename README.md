@@ -123,6 +123,8 @@ unix_socket:
 global:
   config_directory: ./config.d    # directory of explicit service YAML files (*.yml/*.yaml). all service yamls in this folder will be loaded.
   # auto_service_directory: ./auto_services  # optional implicit services. all folders in this directory will be auto recognized as a service using defaults, but customizable later.
+  default_service_user: root # auto generated service will run as this user
+  default_service_group: root # auto generated service will run as this group
 
 web_console:
   enabled: true                   # serve web UI at http(s)://bind:port/. Default is not enabled
