@@ -137,6 +137,26 @@ web_console:
         # If you omit the whole web_console.auth section, it defaults to admin/admin (bootstrapping only). Please change it
         - "admin:$2a$10$jqNWtAzhWEVlPnvJwyI6g.Nwb8YPU5ypCED9lBEhahUSs13ac1MPe"
 
+# Generating/Verifying bcrypt htpasswd entries (`pmctl password`)
+`pmctl` includes local helpers for generating and verifying the `user:<bcrypt>` strings used by `web_console.auth.basic.users`.
+
+Generate:
+
+```bash
+pmctl password generate --user hello --password xyz
+# -> prints: hello:$2b$...
+```
+
+Verify (exit 0 on success, 1 on failure):
+
+```bash
+SECURE="$(pmctl password generate --user hello --password xyz)"
+echo xyz | pmctl password verify --secure "$SECURE" --user hello --password
+# -> prints: OK
+```
+
+Tip: if you pass `--password` with no value, pmctl reads the password from stdin (one line).
+
 # Operator-triggered commands (run as root; cwd="."; fire-and-forget). You can use this mechanism update processmaster binary even!
 # if you did not define any, then there is extra "admin action" admin can trigger remotely on the web UI. By default no action possible.
 admin_actions:
