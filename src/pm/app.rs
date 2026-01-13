@@ -853,7 +853,12 @@ pub fn parse_app_definition_yaml(
 ///
 /// This is intentionally centralized in `app.rs` so future config additions don’t require
 /// remembering to update generation logic in `daemon.rs`.
-pub(crate) fn render_auto_service_yaml(app: &str, working_directory: &Path) -> anyhow::Result<String> {
+pub(crate) fn render_auto_service_yaml(
+    app: &str,
+    working_directory: &Path,
+    default_service_user: &str,
+    default_service_group: &str,
+) -> anyhow::Result<String> {
     #[derive(Debug, Clone, Serialize)]
     #[serde(deny_unknown_fields)]
     struct YamlFile {
@@ -998,6 +1003,8 @@ pub(crate) fn render_auto_service_yaml(app: &str, working_directory: &Path) -> a
 
     let mut process = YamlProcess::default();
     process.working_directory = working_directory.display().to_string();
+    process.user = Some(default_service_user.to_string());
+    process.group = Some(default_service_group.to_string());
 
     let out = YamlFile {
         application: app.to_string(),

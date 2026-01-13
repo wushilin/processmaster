@@ -3160,12 +3160,16 @@ async fn do_update_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Resp
 
     let cfg_dir = cfg.config_directory.clone();
     let auto_dir = cfg.auto_service_directory.clone();
+    let default_service_user = cfg.default_service_user.clone();
+    let default_service_group = cfg.default_service_group.clone();
     let old_defs_for_load = old_defs.clone();
     let (new_defs, warnings, outdated) = match tasks().spawn_blocking(move || {
         load_app_definitions_best_effort(
             &cfg_dir,
             &old_defs_for_load,
             auto_dir.as_deref(),
+            &default_service_user,
+            &default_service_group,
         )
     })
         .await
@@ -6856,6 +6860,8 @@ fn preflight_validate_and_load_defs(cfg: &MasterConfig) -> anyhow::Result<HashMa
         &cfg.config_directory,
         &empty,
         cfg.auto_service_directory.as_deref(),
+        &cfg.default_service_user,
+        &cfg.default_service_group,
     )?;
     for w in warnings {
         pm_event("config", None, format!("load_warning {w}"));
@@ -6867,6 +6873,8 @@ fn load_app_definitions_best_effort(
     dir: &Path,
     old_defs: &HashMap<String, AppDefinition>,
     auto_service_directory: Option<&Path>,
+    default_service_user: &str,
+    default_service_group: &str,
 ) -> anyhow::Result<(HashMap<String, AppDefinition>, Vec<String>, Vec<String>)> {
     if !dir.exists() {
         return Ok((
@@ -7052,6 +7060,8 @@ fn load_app_definitions_best_effort(
         &mut defs,
         old_defs,
         auto_service_directory,
+        default_service_user,
+        default_service_group,
         warnings.as_mut(),
         &mut outdated,
     )?;
@@ -7095,7 +7105,13 @@ fn load_app_definitions_best_effort(
     Ok((defs, warnings, outdated))
 }
 
-fn build_auto_service_def(app: &str, workdir: &Path, source_file: PathBuf) -> anyhow::Result<AppDefinition> {
+fn build_auto_service_def(
+    app: &str,
+    workdir: &Path,
+    source_file: PathBuf,
+    default_service_user: &str,
+    default_service_group: &str,
+) -> anyhow::Result<AppDefinition> {
     let rotation_size_bytes = parse_size_spec_bytes("10m").ok();
     let source_mtime_ms = source_file
         .metadata()
@@ -7126,8 +7142,8 @@ fn build_auto_service_def(app: &str, workdir: &Path, source_file: PathBuf) -> an
         max_swap: Some("MAX".to_string()),
         io_weight: None,
         io_bandwidth: None,
-        user: None,
-        group: None,
+        user: Some(default_service_user.to_string()),
+        group: Some(default_service_group.to_string()),
         rotation_mode: LogRotationMode::Size,
         rotation_frequency: LogRotation::Daily,
         rotation_max_age_ms: 30 * 24 * 60 * 60 * 1000,
@@ -7149,6 +7165,8 @@ fn merge_auto_services_best_effort(
     defs: &mut HashMap<String, AppDefinition>,
     old_defs: &HashMap<String, AppDefinition>,
     auto_service_directory: Option<&Path>,
+    default_service_user: &str,
+    default_service_group: &str,
     warnings: &mut Vec<String>,
     outdated: &mut Vec<String>,
 ) -> anyhow::Result<()> {
@@ -7254,7 +7272,12 @@ fn merge_auto_services_best_effort(
             }
 
             // Generate a fresh service.yml.
-            let yaml_text = match crate::pm::app::render_auto_service_yaml(app, &path) {
+            let yaml_text = match crate::pm::app::render_auto_service_yaml(
+                app,
+                &path,
+                default_service_user,
+                default_service_group,
+            ) {
                 Ok(s) => s,
                 Err(e) => {
                     warnings.push(format!(
@@ -7415,7 +7438,12 @@ fn merge_auto_services_best_effort(
             // We only create the file if missing; we never overwrite.
             let target = path.join("service.yml");
 
-            let yaml_text = match crate::pm::app::render_auto_service_yaml(app, &path) {
+            let yaml_text = match crate::pm::app::render_auto_service_yaml(
+                app,
+                &path,
+                default_service_user,
+                default_service_group,
+            ) {
                 Ok(s) => Some(s),
                 Err(e) => {
                     warnings.push(format!(
@@ -7472,12 +7500,12 @@ fn merge_auto_services_best_effort(
                             app,
                             target.display()
                         ));
-                        build_auto_service_def(app, &path, target)?
+                        build_auto_service_def(app, &path, target, default_service_user, default_service_group)?
                     }
                 }
             } else {
                 // Still load defaults in-memory if we couldn't generate YAML.
-                build_auto_service_def(app, &path, target)?
+                build_auto_service_def(app, &path, target, default_service_user, default_service_group)?
             }
         };
 

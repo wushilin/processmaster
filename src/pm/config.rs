@@ -48,6 +48,22 @@ pub struct MasterConfig {
     #[serde(default)]
     pub auto_service_directory: Option<PathBuf>,
 
+    /// Default user for newly auto-generated `service.yml` under `global.auto_service_directory`.
+    ///
+    /// Semantics:
+    /// - missing: "root"
+    /// - null: "root"
+    /// - non-empty string: used as-is (trimmed)
+    pub default_service_user: String,
+
+    /// Default group for newly auto-generated `service.yml` under `global.auto_service_directory`.
+    ///
+    /// Semantics:
+    /// - missing: "root"
+    /// - null: "root"
+    /// - non-empty string: used as-is (trimmed)
+    pub default_service_group: String,
+
     /// Optional embedded web console (axum) configuration.
     #[serde(default)]
     pub web_console: WebConsoleConfig,
@@ -110,6 +126,10 @@ struct GlobalConfigFile {
     config_directory: Option<PathBuf>,
     #[serde(default)]
     auto_service_directory: Option<PathBuf>,
+    #[serde(default)]
+    default_service_user: Option<String>,
+    #[serde(default)]
+    default_service_group: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -353,6 +373,8 @@ pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
         sock_mode: default_sock_mode(),
         config_directory: default_config_directory(),
         auto_service_directory: None,
+        default_service_user: "root".to_string(),
+        default_service_group: "root".to_string(),
         web_console: WebConsoleConfig::default(),
         admin_actions: BTreeMap::new(),
     };
@@ -377,6 +399,19 @@ pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
             "global must define at least one of: config_directory, auto_service_directory"
         );
         cfg.auto_service_directory = gl.auto_service_directory;
+        cfg.default_service_user = gl.default_service_user.unwrap_or_else(|| "root".to_string());
+        cfg.default_service_group = gl.default_service_group.unwrap_or_else(|| "root".to_string());
+
+        cfg.default_service_user = cfg.default_service_user.trim().to_string();
+        cfg.default_service_group = cfg.default_service_group.trim().to_string();
+        anyhow::ensure!(
+            !cfg.default_service_user.is_empty(),
+            "global.default_service_user must not be empty (use null for default \"root\")"
+        );
+        anyhow::ensure!(
+            !cfg.default_service_group.is_empty(),
+            "global.default_service_group must not be empty (use null for default \"root\")"
+        );
         if let Some(cd) = gl.config_directory {
             cfg.config_directory = cd;
         }

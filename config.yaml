@@ -21,10 +21,16 @@ global:
   # - application: directory name
   # - working_directory: that directory
   # - start_command: ./run.sh
+  # - user/group: global.default_service_user / global.default_service_group (defaults to root/root)
   #
   # This also serves as the default base directory for app configs that omit
   # `process.working_directory`: `${auto_service_directory}/${application}`.
   auto_service_directory: ./services
+
+  # Default user/group for auto-generated service.yml under auto_service_directory.
+  # If omitted or null, they default to "root".
+  default_service_user: root
+  default_service_group: root
 
   # If you start processmaster as root and want it to drop privileges after binding the socket:
   # user: someuser
