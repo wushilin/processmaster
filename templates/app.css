@@ -1,0 +1,588 @@
+/* processmaster web console — theme layer.
+ *
+ * Sits on top of Bootstrap 5.3 and mostly works by re-tuning Bootstrap's own CSS
+ * variables rather than overriding rules, so component markup stays idiomatic and
+ * upgrades stay cheap.
+ *
+ * Both colour schemes are first-class: Bootstrap's `data-bs-theme` attribute on
+ * <html> drives everything below, and the console follows the OS preference until
+ * the operator picks a side explicitly.
+ */
+
+/* ---------------------------------------------------------------- tokens --- */
+
+:root {
+  /* Type. A supervisor is a dense, numeric UI: a real UI face for prose and a
+     proper mono stack for anything the operator compares column-to-column. */
+  --pm-font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, "Noto Sans", sans-serif;
+  --pm-font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  /* Spacing / shape. One radius scale, used everywhere. */
+  --pm-radius-sm: 6px;
+  --pm-radius: 10px;
+  --pm-radius-lg: 14px;
+
+  /* Motion. Short enough to feel instant, long enough to read as intentional. */
+  --pm-transition: 140ms cubic-bezier(0.2, 0, 0.2, 1);
+}
+
+/* Light ------------------------------------------------------------------- */
+
+[data-bs-theme="light"] {
+  --pm-canvas: #f4f6f9;
+  --pm-surface: #ffffff;
+  --pm-surface-sunken: #f8fafc;
+  --pm-border: #e2e8f0;
+  --pm-border-strong: #cbd5e1;
+  --pm-text-muted: #64748b;
+
+  --pm-shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
+  --pm-shadow: 0 1px 3px rgba(15, 23, 42, 0.08), 0 8px 24px -12px rgba(15, 23, 42, 0.18);
+
+  --pm-accent: #2563eb;
+  --pm-ok: #15803d;
+  --pm-ok-soft: #dcfce7;
+  --pm-warn: #b45309;
+  --pm-warn-soft: #fef3c7;
+  --pm-bad: #b91c1c;
+  --pm-bad-soft: #fee2e2;
+  --pm-idle: #475569;
+  --pm-idle-soft: #e2e8f0;
+
+  --pm-nav-bg: #0f172a;
+  --pm-log-bg: #0f172a;
+  --pm-log-fg: #e2e8f0;
+}
+
+/* Dark -------------------------------------------------------------------- */
+
+[data-bs-theme="dark"] {
+  --pm-canvas: #0b1120;
+  --pm-surface: #131c2e;
+  --pm-surface-sunken: #0f1728;
+  --pm-border: #253248;
+  --pm-border-strong: #33415c;
+  --pm-text-muted: #94a3b8;
+
+  --pm-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --pm-shadow: 0 1px 3px rgba(0, 0, 0, 0.5), 0 8px 24px -12px rgba(0, 0, 0, 0.7);
+
+  --pm-accent: #60a5fa;
+  --pm-ok: #4ade80;
+  --pm-ok-soft: rgba(74, 222, 128, 0.14);
+  --pm-warn: #fbbf24;
+  --pm-warn-soft: rgba(251, 191, 36, 0.14);
+  --pm-bad: #f87171;
+  --pm-bad-soft: rgba(248, 113, 113, 0.14);
+  --pm-idle: #94a3b8;
+  --pm-idle-soft: rgba(148, 163, 184, 0.14);
+
+  --pm-nav-bg: #0a1020;
+  --pm-log-bg: #080d18;
+  --pm-log-fg: #dbe4f0;
+
+  /* Hand the tokens back to Bootstrap so stock components inherit the palette. */
+  --bs-body-bg: var(--pm-canvas);
+  --bs-body-color: #e2e8f0;
+  --bs-border-color: var(--pm-border);
+  --bs-secondary-color: var(--pm-text-muted);
+  --bs-emphasis-color: #f1f5f9;
+}
+
+/* ------------------------------------------------------------------ base --- */
+
+body {
+  background: var(--pm-canvas);
+  font-family: var(--pm-font-sans);
+  /* Slightly tighter than Bootstrap's default: this is a dashboard, not an article. */
+  font-size: 0.9375rem;
+  -webkit-font-smoothing: antialiased;
+}
+
+code, kbd, pre, samp, .pm-mono {
+  font-family: var(--pm-font-mono);
+}
+
+/* Numbers that refresh in place must not reflow. Tabular figures keep pids,
+   uptimes and counters from jittering every poll. */
+.pm-status-table td,
+.pm-status-table th,
+.pm-num {
+  font-variant-numeric: tabular-nums;
+}
+
+:focus-visible {
+  outline: 2px solid var(--pm-accent);
+  outline-offset: 2px;
+  border-radius: var(--pm-radius-sm);
+}
+
+/* ---------------------------------------------------------------- navbar --- */
+
+.navbar.pm-navbar {
+  background: var(--pm-nav-bg) !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  padding-block: 0.6rem;
+}
+
+.pm-navbar .navbar-brand {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  gap: 0.625rem;
+}
+
+.pm-brand-name {
+  font-size: 1rem;
+  line-height: 1.1;
+  color: #f8fafc;
+}
+
+/* Build metadata is reference material, not the page title. Demote it. */
+.pm-brand-meta {
+  display: block;
+  font-size: 0.6875rem;
+  font-weight: 400;
+  line-height: 1.3;
+  color: #94a3b8;
+  font-family: var(--pm-font-mono);
+}
+
+.pm-theme-toggle {
+  --bs-btn-color: #cbd5e1;
+  --bs-btn-border-color: rgba(255, 255, 255, 0.16);
+  --bs-btn-hover-color: #fff;
+  --bs-btn-hover-bg: rgba(255, 255, 255, 0.1);
+  --bs-btn-hover-border-color: rgba(255, 255, 255, 0.28);
+  --bs-btn-active-bg: rgba(255, 255, 255, 0.16);
+  --bs-btn-active-border-color: rgba(255, 255, 255, 0.28);
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--pm-radius-sm);
+}
+
+/* Show exactly one glyph per theme. */
+[data-bs-theme="light"] .pm-theme-toggle .pm-icon-moon { display: none; }
+[data-bs-theme="dark"] .pm-theme-toggle .pm-icon-sun { display: none; }
+
+/* ------------------------------------------------------------ page header --- */
+
+.pm-page-title {
+  font-size: 1.0625rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+
+/* The toolbar used to be seven buttons in six different colours, which made
+   everything look equally urgent. Hierarchy now carries the meaning: one filled
+   primary action, quiet outlines for the rest, and destructive verbs separated
+   into their own group. */
+.pm-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.pm-toolbar .btn {
+  --bs-btn-padding-y: 0.3rem;
+  --bs-btn-padding-x: 0.7rem;
+  --bs-btn-font-size: 0.8125rem;
+  --bs-btn-font-weight: 500;
+  --bs-btn-border-radius: var(--pm-radius-sm);
+  transition: background-color var(--pm-transition), border-color var(--pm-transition),
+    color var(--pm-transition);
+}
+
+.pm-toolbar-sep {
+  width: 1px;
+  align-self: stretch;
+  min-height: 1.5rem;
+  background: var(--pm-border-strong);
+  margin-inline: 0.125rem;
+}
+
+/* Quiet by default; colour only appears on hover, where it confirms intent. */
+.pm-btn-quiet {
+  --bs-btn-color: var(--pm-text-muted);
+  --bs-btn-border-color: var(--pm-border-strong);
+  --bs-btn-bg: var(--pm-surface);
+  --bs-btn-hover-color: var(--bs-emphasis-color, #0f172a);
+  --bs-btn-hover-bg: var(--pm-surface-sunken);
+  --bs-btn-hover-border-color: var(--pm-text-muted);
+}
+
+.pm-switch {
+  font-size: 0.8125rem;
+  color: var(--pm-text-muted);
+  white-space: nowrap;
+  margin: 0;
+}
+
+.pm-switch .form-check-input {
+  cursor: pointer;
+}
+
+.pm-switch .form-check-input:checked {
+  background-color: var(--pm-accent);
+  border-color: var(--pm-accent);
+}
+
+/* ----------------------------------------------------------------- cards --- */
+
+.card {
+  --bs-card-bg: var(--pm-surface);
+  --bs-card-border-color: var(--pm-border);
+  --bs-card-border-radius: var(--pm-radius-lg);
+  --bs-card-inner-border-radius: var(--pm-radius-lg);
+  box-shadow: var(--pm-shadow);
+}
+
+/* Bootstrap's own utility; keep it from stacking a second, heavier shadow. */
+.card.shadow-sm {
+  box-shadow: var(--pm-shadow) !important;
+}
+
+.modal-content {
+  border-radius: var(--pm-radius-lg);
+  border-color: var(--pm-border);
+  background: var(--pm-surface);
+}
+
+/* ------------------------------------------------------------------ tabs --- */
+
+/* Underline tabs read as navigation; boxed tabs read as a filing cabinet. */
+.nav-tabs {
+  --bs-nav-tabs-border-width: 0;
+  gap: 0.25rem;
+  border-bottom: 1px solid var(--pm-border);
+}
+
+.nav-tabs .nav-link {
+  --bs-nav-link-color: var(--pm-text-muted);
+  --bs-nav-link-hover-color: var(--pm-accent);
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 0.5rem 0.875rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  margin-bottom: -1px;
+  transition: color var(--pm-transition), border-color var(--pm-transition);
+}
+
+.nav-tabs .nav-link:hover {
+  border-bottom-color: var(--pm-border-strong);
+  background: transparent;
+}
+
+.nav-tabs .nav-link.active {
+  color: var(--pm-accent);
+  background: transparent;
+  border-bottom-color: var(--pm-accent);
+}
+
+/* ---------------------------------------------------------------- tables --- */
+
+.pm-status-table {
+  --bs-table-bg: transparent;
+  --bs-table-border-color: var(--pm-border);
+  margin-bottom: 0;
+}
+
+.pm-status-table > thead > tr > th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--pm-surface-sunken);
+  border-bottom: 1px solid var(--pm-border-strong);
+  /* Column labels are metadata: small, quiet, and unmistakably not data. */
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--pm-text-muted);
+  padding: 0.5rem 0.625rem;
+  white-space: nowrap;
+}
+
+.pm-status-table > tbody > tr > td {
+  padding: 0.5rem 0.625rem;
+  border-bottom: 1px solid var(--pm-border);
+}
+
+.pm-status-table > tbody > tr:last-child > td {
+  border-bottom: 0;
+}
+
+.pm-status-table > tbody > tr {
+  transition: background-color var(--pm-transition);
+}
+
+.pm-status-table > tbody > tr:hover {
+  background: var(--pm-surface-sunken);
+}
+
+/* Sort affordance: invisible until the header is useful to click. */
+th[data-sort] {
+  cursor: pointer;
+  user-select: none;
+}
+
+th[data-sort]:hover {
+  color: var(--bs-emphasis-color, #0f172a);
+}
+
+th[data-sort] .sort-indicator {
+  display: inline-block;
+  width: 1.1em;
+  text-align: center;
+  opacity: 0.55;
+}
+
+/* The service name is the row's identity — let it carry a little more weight. */
+td.col-app {
+  font-weight: 550;
+}
+
+/* --------------------------------------------------------------- badges --- */
+
+/* Status is the most-scanned cell on the page. Soft tinted pill + a leading dot,
+   so state survives greyscale, projector washout and colour-blindness — never
+   colour alone. */
+.pm-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  padding: 0.2em 0.6em;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.pm-state::before {
+  content: "";
+  width: 0.45em;
+  height: 0.45em;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+
+.pm-state-run { color: var(--pm-ok); background: var(--pm-ok-soft); }
+.pm-state-warn { color: var(--pm-warn); background: var(--pm-warn-soft); }
+.pm-state-bad { color: var(--pm-bad); background: var(--pm-bad-soft); }
+.pm-state-idle { color: var(--pm-idle); background: var(--pm-idle-soft); }
+
+/* A running service earns a gentle pulse — the one thing on the page that is
+   genuinely live. Respects reduced-motion. */
+.pm-state-run::before {
+  animation: pm-pulse 2.4s ease-in-out infinite;
+}
+
+@keyframes pm-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pm-state-run::before { animation: none; }
+  * { transition-duration: 0.001ms !important; }
+}
+
+.pm-flag-badge {
+  font-size: 0.7rem;
+  font-weight: 500;
+  padding: 0.2em 0.5em;
+  border-radius: 999px;
+}
+
+.pm-badge-sys {
+  color: var(--pm-bad);
+  background: var(--pm-bad-soft);
+}
+
+.pm-badge-user {
+  color: var(--pm-warn);
+  background: var(--pm-warn-soft);
+}
+
+.pm-flags-cell {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+
+/* --------------------------------------------------------- action buttons --- */
+
+.pm-action-btn {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--pm-radius-sm);
+  line-height: 1;
+  color: var(--pm-text-muted);
+  border-color: var(--pm-border-strong) !important;
+  background: transparent;
+  transition: color var(--pm-transition), background-color var(--pm-transition),
+    border-color var(--pm-transition);
+}
+
+.pm-action-btn .pm-icon { width: 17px; height: 17px; }
+.pm-action-btn.pm-kind-play .pm-icon,
+.pm-action-btn.pm-kind-stop .pm-icon { width: 20px; height: 20px; }
+
+/* Meaning on hover: green to start, red to stop. Neutral until then, so a row of
+   actions doesn't look like a warning. */
+.pm-action-btn:hover { background: var(--pm-surface-sunken); border-color: var(--pm-text-muted) !important; }
+.pm-action-btn.pm-kind-play:hover { color: var(--pm-ok); border-color: var(--pm-ok) !important; }
+.pm-action-btn.pm-kind-stop:hover { color: var(--pm-bad); border-color: var(--pm-bad) !important; }
+.pm-action-btn:active { transform: translateY(1px); }
+
+.pm-actions { white-space: nowrap; display: inline-flex; gap: 0.25rem; }
+
+td.col-actions { overflow-x: auto; overflow-y: hidden; }
+td.col-actions::-webkit-scrollbar { height: 5px; }
+td.col-actions::-webkit-scrollbar-thumb { background: var(--pm-border-strong); border-radius: 999px; }
+td.col-actions::-webkit-scrollbar-track { background: transparent; }
+
+.pm-icon { display: inline-block; vertical-align: -0.125em; }
+
+/* ------------------------------------------------------------------ logs --- */
+
+/* Log panes are a terminal. Give them terminal contrast in both themes rather
+   than a light-on-light panel that ANSI colours were never designed for. */
+.pm-log-pane {
+  background: var(--pm-log-bg);
+  color: var(--pm-log-fg);
+  border-radius: var(--pm-radius);
+  border: 1px solid var(--pm-border);
+  font-family: var(--pm-font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.55;
+  padding: 0.875rem 1rem;
+}
+
+/* --------------------------------------------------------------- overlay --- */
+
+.pm-busy-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--pm-canvas) 62%, transparent);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+}
+
+.pm-busy-card {
+  width: 64px;
+  height: 64px;
+  border-radius: var(--pm-radius);
+  background: var(--pm-surface);
+  border: 1px solid var(--pm-border);
+  box-shadow: var(--pm-shadow);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+@keyframes pm-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+.pm-busy-spinner {
+  width: 30px;
+  height: 30px;
+  color: var(--pm-accent);
+  animation: pm-spin 0.9s linear infinite;
+}
+
+/* ------------------------------------------------------------------ misc --- */
+
+.pm-truncate { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pm-col-hidden { display: none !important; }
+
+.alert {
+  border-radius: var(--pm-radius);
+  border-width: 1px;
+  font-size: 0.875rem;
+}
+
+.form-control, .form-select {
+  border-radius: var(--pm-radius-sm);
+  border-color: var(--pm-border-strong);
+  background: var(--pm-surface);
+  font-size: 0.875rem;
+}
+
+.form-control:focus, .form-select:focus {
+  border-color: var(--pm-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--pm-accent) 22%, transparent);
+}
+
+/* Fixed column widths, in characters, so filtering rows never reflows the table. */
+th.col-app, td.col-app { width: 21ch; max-width: 21ch; }
+th.col-status, td.col-status { width: 11ch; max-width: 11ch; }
+th.col-crashes_10m, td.col-crashes_10m { width: 15ch; max-width: 15ch; }
+th.col-crashes_10m { white-space: nowrap; }
+th.col-pid, td.col-pid { width: 8ch; max-width: 8ch; }
+th.col-uptime, td.col-uptime { width: 14ch; max-width: 14ch; }
+th.col-enabled, td.col-enabled { width: 8ch; max-width: 8ch; }
+th.col-last_run, td.col-last_run { width: 20ch; max-width: 20ch; }
+th.col-actions, td.col-actions { width: 20ch; max-width: 20ch; }
+th.col-schedule, td.col-schedule { width: 21ch; max-width: 21ch; }
+td.col-schedule .btn { max-width: 100%; }
+td.col-schedule code {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+}
+th.col-flags, td.col-flags { width: auto; }
+
+table.pm-status-table { table-layout: fixed; width: 100%; }
+table.pm-status-table th, table.pm-status-table td { vertical-align: middle; }
+
+/* ANSI (SGR) colours for rendered logs. Tuned for the dark log pane in both themes. */
+.ansi-bold { font-weight: 600; }
+.ansi-dim { opacity: 0.72; }
+.ansi-underline { text-decoration: underline; }
+.ansi-fg-30 { color: #64748b; }
+.ansi-fg-31 { color: #f87171; }
+.ansi-fg-32 { color: #4ade80; }
+.ansi-fg-33 { color: #fbbf24; }
+.ansi-fg-34 { color: #60a5fa; }
+.ansi-fg-35 { color: #e879f9; }
+.ansi-fg-36 { color: #2dd4bf; }
+.ansi-fg-37 { color: #e2e8f0; }
+.ansi-fg-90 { color: #94a3b8; }
+.ansi-fg-91 { color: #fca5a5; }
+.ansi-fg-92 { color: #86efac; }
+.ansi-fg-93 { color: #fde047; }
+.ansi-fg-94 { color: #93c5fd; }
+.ansi-fg-95 { color: #f0abfc; }
+.ansi-fg-96 { color: #5eead4; }
+.ansi-fg-97 { color: #ffffff; }
+
+/* ----------------------------------------------------------- small screens --- */
+
+@media (max-width: 768px) {
+  .pm-toolbar { width: 100%; }
+  .pm-toolbar .btn { flex: 1 1 auto; }
+  .pm-toolbar-sep { display: none; }
+  .pm-brand-meta { display: none; }
+}

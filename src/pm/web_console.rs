@@ -155,6 +155,9 @@ fn build_router(state: WebState) -> Router {
         // Common typo/alias
         .route("/favico.ico", get(favicon_ico))
         .route("/static/logo.png", get(static_logo_png))
+        .route("/static/app.css", get(static_app_css))
+        .route("/static/bootstrap.css", get(vendor_bootstrap_css))
+        .route("/static/bootstrap.bundle.js", get(vendor_bootstrap_js))
         .route("/icons/:name", get(icon_asset))
         .route("/rpc", post(jsonrpc))
         .with_state(state)
@@ -184,6 +187,14 @@ const ICON_FAVICON_16: &[u8] = include_bytes!("../../templates/icons/favicon-16x
 const ICON_FAVICON_32: &[u8] = include_bytes!("../../templates/icons/favicon-32x32.png");
 const ICON_APPLE_TOUCH: &[u8] = include_bytes!("../../templates/icons/apple-touch-icon.png");
 
+// CSS/JS are embedded rather than loaded from a CDN. processmaster supervises
+// servers, and those are routinely air-gapped or egress-filtered — pulling Bootstrap
+// over the network meant the console rendered as unstyled HTML exactly where it is
+// needed most. Embedding also removes a third-party origin from a root-privileged UI.
+const VENDOR_BOOTSTRAP_CSS: &[u8] = include_bytes!("../../templates/vendor/bootstrap.min.css");
+const VENDOR_BOOTSTRAP_JS: &[u8] = include_bytes!("../../templates/vendor/bootstrap.bundle.min.js");
+const APP_CSS: &[u8] = include_bytes!("../../templates/app.css");
+
 fn bytes_response(content_type: &'static str, bytes: &'static [u8]) -> AxumResponse {
     (
         StatusCode::OK,
@@ -203,6 +214,18 @@ async fn favicon_ico() -> AxumResponse {
 async fn static_logo_png() -> AxumResponse {
     // Serve the logo from embedded bytes; currently reusing the 192x192 icon.
     bytes_response("image/png", ICON_ANDROID_192)
+}
+
+async fn vendor_bootstrap_css() -> AxumResponse {
+    bytes_response("text/css; charset=utf-8", VENDOR_BOOTSTRAP_CSS)
+}
+
+async fn vendor_bootstrap_js() -> AxumResponse {
+    bytes_response("text/javascript; charset=utf-8", VENDOR_BOOTSTRAP_JS)
+}
+
+async fn static_app_css() -> AxumResponse {
+    bytes_response("text/css; charset=utf-8", APP_CSS)
 }
 
 async fn icon_asset(AxumPath(name): AxumPath<String>) -> AxumResponse {
@@ -436,7 +459,8 @@ async fn status_page(
         title: "processmaster",
         csrf_token: &token,
         admin_actions,
-        build_banner: crate::pm::build_info::banner(),
+        // Compact stamp: the navbar already carries the product name.
+        build_banner: crate::pm::build_info::short_stamp(),
     };
     match t.render() {
         Ok(s) => Html(s).into_response(),

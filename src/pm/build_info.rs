@@ -48,4 +48,13 @@ pub fn banner() -> String {
     )
 }
 
+/// Compact build stamp for the web console navbar.
+///
+/// The navbar already says "ProcessMaster", so repeating the product name there just
+/// costs horizontal space. This is the same information as [`banner`] with the prose
+/// stripped: `<host> · <build time>`.
+pub fn short_stamp() -> String {
+    format!("{} · {}", build_host(), build_time_pretty())
+}
+
 
