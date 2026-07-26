@@ -1,6 +1,6 @@
 ---
 name: processmaster
-description: Operate the processmaster daemon (a cgroup-v2 process supervisor + cron runner for Linux) and its CLI client pmctl. Use when starting/stopping/inspecting services, tailing logs, reloading service definitions, managing the unix socket, or deploying new processmaster/pmctl binaries.
+description: Deploy and operate apps under processmaster (a cgroup-v2 process supervisor + cron runner for Linux) using its CLI client pmctl. Use when deploying a new service or cron job into processmaster, writing service YAML, starting/stopping/inspecting services, tailing logs, reloading service definitions, managing the unix socket, or deploying new processmaster/pmctl binaries.
 ---
 
 # processmaster / pmctl operations
@@ -21,12 +21,118 @@ Start the daemon:
 sudo processmaster -c /etc/processmaster/config.yaml   # default config path: ./config.yaml
 ```
 
-Key concepts:
-- **Master config** (`config.yaml`): cgroup limits, unix socket, config directories, web console, `admin_actions`. Strict parsing (`deny_unknown_fields`).
-- **Service definitions**: YAML files in `global.config_directory` (e.g. `conf.d/*.yaml`). Minimal service = just `process.working_directory`; defaults to running `./run.sh` as root, stop via SIGTERM.
-- **Auto-services**: every direct child directory of `global.auto_service_directory` becomes a service (`run.sh` convention); processmaster generates a `service.yml` stub you can edit. Drop a `.regen_pm_config` marker file in the app dir to regenerate the stub (old one is saved as `service.yml.bak`).
-- **Cron**: set `process.schedule` (5-field cron, 1-minute resolution). Cron jobs never overlap; `process.max_time_per_run` auto-kills overtime runs. Mutually exclusive with `restart_policy`.
-- **Provisioning**: one-time workdir setup (chown/chmod/setcap) guarded by `${working_directory}/.pm_provisioned`; delete the marker + `pmctl update` to re-apply.
+Two config layers (strict parsing — unknown fields are rejected):
+- **Master config** (`config.yaml`, passed via `processmaster -c`): cgroup limits, unix socket, `global.config_directory` / `global.auto_service_directory`, web console, `admin_actions`.
+- **Service definitions**: one YAML per app, in `global.config_directory` (explicit) or per-app directories under `global.auto_service_directory` (implicit).
+
+## Deploying an app into processmaster
+
+There are two ways to define an app. Both end with `pmctl update` to load it — the daemon does not watch files.
+
+### Way 1: auto-service (fastest — just a directory with run.sh)
+
+Every direct child directory of `global.auto_service_directory` becomes a service named after the directory:
+
+```bash
+mkdir /opt/pm/services/myapp
+cp myapp-launcher.sh /opt/pm/services/myapp/run.sh   # must be executable
+chmod +x /opt/pm/services/myapp/run.sh
+pmctl update            # daemon discovers it, generates service.yml with defaults
+pmctl start myapp
+```
+
+Defaults: working_directory = that dir, start_command = `./run.sh`, run as root (or `global.default_service_user/group`), stop = SIGTERM, logs under `./logs/`. The generated `service.yml` in the app dir is yours to edit (edit → `pmctl update` → `pmctl restart myapp`). Notes:
+- Rename a directory to `<name>.disabled` to have it ignored entirely.
+- Same app name in both `config_directory` and `auto_service_directory` is a hard error.
+- After a processmaster upgrade, drop an empty `.regen_pm_config` file in the app dir + `pmctl update` to regenerate a fresh `service.yml` (the old one is kept as `service.yml.bak`).
+
+### Way 2: explicit service YAML in config_directory
+
+Create `<config_directory>/myapp.yaml` (app name derives from the filename unless `application:` is set). Minimal:
+
+```yaml
+process:
+  working_directory: /opt/myapp    # runs /opt/myapp/run.sh as root, SIGTERM to stop
+```
+
+Realistic long-running service:
+
+```yaml
+application: myapp
+process:
+  working_directory: /opt/myapp
+  start_command: ["./bin/myapp", "--config", "app.conf"]   # argv list, NOT a shell string
+  stop_signal: SIGTERM              # OR stop_command: ["./stop.sh"] — exactly one, not both
+  stop_grace_period_ms: 5000        # then escalates to cgroup.kill
+  user: appuser                     # optional; daemon (root) setuids the child
+  group: appgroup
+  environment:
+    - name: DB_PASSWORD
+      value: "@file:///etc/myapp/db_password"   # also @base64://..., @hex://..., or literal
+logs:
+  stdout: ./logs/stdout.log         # relative paths resolve under working_directory
+  stderr: ./logs/stderr.log
+  rotation_size: 10m                # default; rotation_backups: 10, gzip on
+  hints: [./logs/app.log]           # app-written files, made visible in pmctl logs / web UI
+resources:                          # optional cgroup limits for this app
+  max_cpu: 500m                     # "500m" or "1.5" (cores)
+  max_memory: 256MiB
+  max_swap: 0                       # 0 = no swap for this app
+restart_policy:
+  policy: always                    # "always" | "never"
+  restart_backoff_ms: 1000
+  tolerance: { max_restarts: 3, duration: 1m }   # exceed → app marked FAILED, no more auto-restarts
+```
+
+Then deploy it:
+
+```bash
+pmctl update           # load/reload definitions (also runs pending provisioning)
+pmctl start myapp
+pmctl status myapp
+pmctl logs myapp -n 50
+```
+
+Your app may fork/daemonize freely — processmaster tracks everything via the app's cgroup, so stop is still deterministic.
+
+### Cron jobs
+
+Set `process.schedule` to make the app a cron job instead of a daemon (`restart_policy` must then be absent — they're mutually exclusive):
+
+```yaml
+process:
+  working_directory: /opt/nightly-report
+  start_command: ["./run.sh"]
+  schedule: "15 2 * * *"        # 5-field cron, 1-minute resolution; supports , - / and JAN/MON names
+  max_time_per_run: "30m"       # overtime → normal stop, then cgroup.kill; "never" to disable
+  # not_before: "2026-01-01"    # optional activation window (local time)
+  # not_after: "2026-12-31"
+```
+
+Runs never overlap: if the previous run is still going at the next tick, that tick is skipped (no queueing).
+
+### Provisioning (one-time setup at load)
+
+`provisioning:` entries run once per working_directory during definition load, guarded by the marker file `${working_directory}/.pm_provisioned`. The marker is written only if ALL entries succeed; on failure the app is not loaded — fix and `pmctl update` to retry. Relative paths resolve under working_directory.
+
+```yaml
+provisioning:
+  - path: .
+    ownership: { owner: appuser, group: appgroup, recursive: true }
+    mode: "0770"
+  - path: ./bin/myserver
+    mode: "0755"
+    add_net_bind_capability: true   # setcap cap_net_bind_service=+ep → bind :80/:443 without root
+```
+
+To re-apply (e.g. after changing provisioning): delete `.pm_provisioned`, then `pmctl update`.
+
+### Updating a deployed app's binary/files
+
+1. `pmctl stop myapp` (deterministic — nothing survives)
+2. Replace the app's files in its working_directory
+3. `pmctl start myapp` — or `pmctl restart myapp` if you replaced files while running (most binaries tolerate this on Linux)
+4. If you changed the service YAML too: `pmctl update` first, then restart.
 
 ## pmctl: socket resolution (PMCTL_SOCK)
 
@@ -96,7 +202,7 @@ pmctl password generate --user u --password p      # bcrypt htpasswd entry for w
 pmctl password verify --secure "u:$2b$..." --user u --password   # no value after --password = read stdin
 ```
 
-## Building and deploying a new binary
+## Building and deploying the processmaster/pmctl binaries themselves
 
 ### Build
 
