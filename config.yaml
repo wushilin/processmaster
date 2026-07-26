@@ -40,18 +40,12 @@ web_console:
   enabled: false
   bind: 0.0.0.0
   port: 9001
-  # client_host is added to the auto-generated TLS certificate SANs (DNS or IP).
-  client_host: localhost
-  # client_port is parsed/stored for future use; defaults to `port`.
-  client_port: 9001
-  # cookie_secure controls whether the CSRF cookie has the `Secure` attribute.
-  # - null: auto (Secure when tls.enabled=true)
-  # - true: always Secure (useful behind HTTPS reverse proxy even if processmaster serves HTTP)
-  # - false: never Secure
-  cookie_secure: null
   tls:
     enabled: true
-    cookie_secure: false
+    # client_host is added to the auto-generated TLS certificate SANs (DNS or IP).
+    # Set this when operators reach the console by hostname or LAN IP, otherwise the
+    # generated cert only covers localhost/127.0.0.1/::1.
+    client_host: localhost
     # Defaults (relative to this config file):
     # - ca_pem: ./ca.pem
     # - server_cert_pem: ./server.pem

@@ -184,14 +184,69 @@ pub struct WebConsoleBasicAuthConfig {
     pub users: Vec<String>,
 }
 
+/// Build a socket address from a bare IP string plus a port.
+///
+/// Deliberately not `format!("{bind}:{port}").parse()`: that syntax requires IPv6
+/// literals to be bracketed, so a perfectly ordinary `bind: "::1"` would be rejected
+/// as malformed. Parsing the address and the port separately accepts v4 and v6 alike.
+pub fn parse_bind_addr(bind: &str, port: u16) -> Result<std::net::SocketAddr, String> {
+    let host = bind.trim();
+    if host.is_empty() {
+        return Err("bind address is empty".to_string());
+    }
+    // Tolerate a bracketed IPv6 literal, since operators reasonably write both forms.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let ip: std::net::IpAddr = host
+        .parse()
+        .map_err(|e| format!("invalid bind address {bind:?}: {e}"))?;
+    Ok(std::net::SocketAddr::new(ip, port))
+}
+
+impl Default for MasterConfig {
+    /// The configuration the daemon runs with when a YAML file sets nothing:
+    /// `processmaster` under the cgroup root, no limits, an owner-only control socket,
+    /// and the web console switched off.
+    fn default() -> Self {
+        Self {
+            cgroup_root: default_cgroup_root(),
+            cgroup_name: default_cgroup_name(),
+            cgroup_memory_max: default_max(),
+            cgroup_memory_swap_max: default_max(),
+            cgroup_cpu_max: default_max(),
+            cgroup_subtree_control_allow: default_subtree_control_allow(),
+            sock: default_sock(),
+            sock_owner: default_sock_owner(),
+            sock_group: default_sock_group(),
+            sock_mode: default_sock_mode(),
+            config_directory: default_config_directory(),
+            auto_service_directory: None,
+            default_service_user: "root".to_string(),
+            default_service_group: "root".to_string(),
+            web_console: WebConsoleConfig::default(),
+            admin_actions: BTreeMap::new(),
+        }
+    }
+}
+
+/// The `admin`/`admin` bootstrap entry.
+///
+/// This hash is published in the README and in `examples/`, so it is public knowledge
+/// and provides no security whatsoever. The daemon recognises it on startup and
+/// refuses to serve the console on a non-loopback address while it is in use — see
+/// `daemon::validate_web_console_config`.
+pub const DEFAULT_BOOTSTRAP_BASIC_AUTH_ENTRY: &str =
+    "admin:$2a$10$jqNWtAzhWEVlPnvJwyI6g.Nwb8YPU5ypCED9lBEhahUSs13ac1MPe";
+
 impl Default for WebConsoleBasicAuthConfig {
     fn default() -> Self {
         // Default admin/admin for initial bootstrapping.
-        // NOTE: operators should override this in config.yaml.
+        // NOTE: operators must override this in config.yaml; the daemon will not expose
+        // the console beyond loopback while this entry is present.
         Self {
-            users: vec![
-                "admin:$2a$10$jqNWtAzhWEVlPnvJwyI6g.Nwb8YPU5ypCED9lBEhahUSs13ac1MPe".to_string(),
-            ],
+            users: vec![DEFAULT_BOOTSTRAP_BASIC_AUTH_ENTRY.to_string()],
         }
     }
 }
@@ -334,10 +389,12 @@ where
     use serde::de::Error as _;
     let v = serde_yaml::Value::deserialize(deserializer)?;
     match v {
-        serde_yaml::Value::Number(n) => n
-            .as_u64()
-            .map(|x| x as u32)
-            .ok_or_else(|| D::Error::custom("sock_mode must be an integer")),
+        serde_yaml::Value::Number(n) => {
+            let raw = n
+                .as_u64()
+                .ok_or_else(|| D::Error::custom("sock_mode must be a non-negative integer"))?;
+            parse_mode_number(raw).map_err(D::Error::custom)
+        }
         serde_yaml::Value::String(s) => parse_mode_str(&s).map_err(D::Error::custom),
         _ => Err(D::Error::custom(
             "sock_mode must be an integer or string (e.g. 660 or \"0660\")",
@@ -345,12 +402,36 @@ where
     }
 }
 
-fn parse_mode_str(s: &str) -> Result<u32, String> {
+/// Highest bit pattern a file mode may carry (setuid/setgid/sticky + rwxrwxrwx).
+pub(crate) const MAX_MODE: u32 = 0o7777;
+
+/// Interpret a YAML *number* as an octal mode.
+///
+/// YAML 1.2 only treats `0o`-prefixed scalars as octal, so an unquoted `660` reaches
+/// serde as decimal 660 — which as a raw mode is `0o1224`, not the `rw-rw----` the
+/// operator meant. Modes are octal by universal convention, so re-read the decimal
+/// digits as octal and `660`, `"660"`, and `0660` all agree.
+pub(crate) fn parse_mode_number(n: u64) -> Result<u32, String> {
+    parse_mode_str(&n.to_string())
+}
+
+pub(crate) fn parse_mode_str(s: &str) -> Result<u32, String> {
     let t = s.trim();
-    let t = t.strip_prefix("0o").unwrap_or(t);
-    let t = t.strip_prefix("0O").unwrap_or(t);
-    let t = t.strip_prefix("0").unwrap_or(t);
-    u32::from_str_radix(t, 8).map_err(|e| format!("invalid sock_mode {s:?}: {e}"))
+    let t = t
+        .strip_prefix("0o")
+        .or_else(|| t.strip_prefix("0O"))
+        .unwrap_or(t);
+    if t.is_empty() {
+        return Err(format!("invalid mode {s:?}: empty"));
+    }
+    let v = u32::from_str_radix(t, 8)
+        .map_err(|e| format!("invalid mode {s:?}: {e} (modes are octal, e.g. 0640)"))?;
+    if v > MAX_MODE {
+        return Err(format!(
+            "invalid mode {s:?}: 0o{v:o} exceeds the maximum 0o{MAX_MODE:o}"
+        ));
+    }
+    Ok(v)
 }
 
 pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
@@ -360,24 +441,7 @@ pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
         .map_err(|e| anyhow::anyhow!("failed to parse config {}: {e}", config_path.display()))?;
 
     // Start from defaults (processmaster + MAX all the way) and overlay provided groups.
-    let mut cfg = MasterConfig {
-        cgroup_root: default_cgroup_root(),
-        cgroup_name: default_cgroup_name(),
-        cgroup_memory_max: default_max(),
-        cgroup_memory_swap_max: default_max(),
-        cgroup_cpu_max: default_max(),
-        cgroup_subtree_control_allow: default_subtree_control_allow(),
-        sock: default_sock(),
-        sock_owner: default_sock_owner(),
-        sock_group: default_sock_group(),
-        sock_mode: default_sock_mode(),
-        config_directory: default_config_directory(),
-        auto_service_directory: None,
-        default_service_user: "root".to_string(),
-        default_service_group: "root".to_string(),
-        web_console: WebConsoleConfig::default(),
-        admin_actions: BTreeMap::new(),
-    };
+    let mut cfg = MasterConfig::default();
 
     if let Some(cg) = file_cfg.cgroup {
         cfg.cgroup_root = cg.root;
@@ -516,3 +580,120 @@ pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sock_mode_from_yaml(y: &str) -> Result<u32, String> {
+        #[derive(Deserialize)]
+        struct Holder {
+            #[serde(deserialize_with = "deserialize_sock_mode")]
+            mode: u32,
+        }
+        serde_yaml::from_str::<Holder>(y)
+            .map(|h| h.mode)
+            .map_err(|e| e.to_string())
+    }
+
+    // ---- octal mode parsing ----------------------------------------------------
+    //
+    // Security regression: YAML 1.2 only treats `0o`-prefixed scalars as octal, so an
+    // unquoted `750` arrives as decimal 750 == 0o1356, whose "other" bits are `rw-`.
+    // Since connect(2) on a unix socket requires *write* permission, that silently
+    // published the root control socket to every local user.
+
+    #[test]
+    fn unquoted_yaml_integers_are_read_as_octal() {
+        assert_eq!(sock_mode_from_yaml("mode: 660").unwrap(), 0o660);
+        assert_eq!(sock_mode_from_yaml("mode: 750").unwrap(), 0o750);
+        assert_eq!(sock_mode_from_yaml("mode: 700").unwrap(), 0o700);
+        assert_eq!(sock_mode_from_yaml("mode: 600").unwrap(), 0o600);
+    }
+
+    #[test]
+    fn all_spellings_of_a_mode_agree() {
+        // The README promises `0660`, `"0660"` and `660` are interchangeable.
+        let expected = 0o660;
+        for y in ["mode: 0660", "mode: \"0660\"", "mode: 660", "mode: \"660\"", "mode: \"0o660\""] {
+            assert_eq!(sock_mode_from_yaml(y).unwrap(), expected, "for {y}");
+        }
+    }
+
+    #[test]
+    fn mode_never_silently_widens_permissions() {
+        // Whatever the spelling, "other" must not gain write access unless asked for.
+        for y in ["mode: 0600", "mode: 600", "mode: 0640", "mode: 640", "mode: 0750", "mode: 750"] {
+            let m = sock_mode_from_yaml(y).unwrap();
+            assert_eq!(m & 0o002, 0, "{y} unexpectedly granted world-write (got 0o{m:o})");
+        }
+    }
+
+    #[test]
+    fn mode_rejects_non_octal_digits_and_oversized_values() {
+        assert!(parse_mode_str("680").is_err(), "8 is not an octal digit");
+        assert!(parse_mode_str("999").is_err());
+        assert!(parse_mode_str("").is_err());
+        assert!(parse_mode_str("rwx").is_err());
+        // Above the setuid/setgid/sticky + rwxrwxrwx range.
+        assert!(parse_mode_str("77777").is_err());
+        assert_eq!(parse_mode_str("7777").unwrap(), 0o7777);
+    }
+
+    #[test]
+    fn mode_accepts_the_full_legal_range() {
+        assert_eq!(parse_mode_str("0").unwrap(), 0);
+        assert_eq!(parse_mode_str("0000").unwrap(), 0);
+        assert_eq!(parse_mode_str("777").unwrap(), 0o777);
+        assert_eq!(parse_mode_number(4755).unwrap(), 0o4755);
+    }
+
+    // ---- bind address parsing --------------------------------------------------
+
+    #[test]
+    fn bind_accepts_ipv4_and_ipv6_alike() {
+        // Regression: `format!("{bind}:{port}").parse()` rejected every IPv6 address,
+        // because that syntax requires brackets. `bind: "::1"` is a normal thing to write.
+        for (bind, port) in [
+            ("127.0.0.1", 9001u16),
+            ("0.0.0.0", 9001),
+            ("::1", 9001),
+            ("::", 9001),
+            ("[::1]", 9001),
+            ("  127.0.0.1  ", 80),
+        ] {
+            let a = parse_bind_addr(bind, port)
+                .unwrap_or_else(|e| panic!("{bind:?} should parse: {e}"));
+            assert_eq!(a.port(), port);
+        }
+    }
+
+    #[test]
+    fn bind_preserves_the_address_family() {
+        assert!(parse_bind_addr("127.0.0.1", 1).unwrap().is_ipv4());
+        assert!(parse_bind_addr("::1", 1).unwrap().is_ipv6());
+        assert_eq!(parse_bind_addr("::1", 8080).unwrap().to_string(), "[::1]:8080");
+    }
+
+    #[test]
+    fn bind_rejects_hostnames_and_junk() {
+        // Only literal addresses: resolving a name here would be a surprising
+        // network dependency during config validation.
+        assert!(parse_bind_addr("localhost", 9001).is_err());
+        assert!(parse_bind_addr("", 9001).is_err());
+        assert!(parse_bind_addr("   ", 9001).is_err());
+        assert!(parse_bind_addr("999.999.999.999", 9001).is_err());
+        assert!(parse_bind_addr("127.0.0.1:9001", 9001).is_err());
+    }
+
+    // ---- defaults --------------------------------------------------------------
+
+    #[test]
+    fn socket_defaults_are_owner_only() {
+        // The socket is the only access control on the RPC protocol; if this test
+        // starts failing, someone has widened the default reach of the daemon.
+        assert_eq!(default_sock_mode(), 0o600);
+        assert_eq!(default_sock_owner().as_deref(), Some("root"));
+        assert_eq!(default_sock_group().as_deref(), Some("root"));
+    }
+}

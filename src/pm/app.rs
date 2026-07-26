@@ -398,16 +398,19 @@ where
             let u = n
                 .as_u64()
                 .ok_or_else(|| D::Error::custom("mode must be a non-negative integer or octal string like \"0700\""))?;
-            Ok(Some(u as u32))
+            // Shared with the socket mode: unquoted YAML integers are decimal, but a
+            // file mode is octal by convention. See config::parse_mode_number.
+            crate::pm::config::parse_mode_number(u)
+                .map(Some)
+                .map_err(D::Error::custom)
         }
         serde_yaml::Value::String(s) => {
-            let t = s.trim();
-            if t.is_empty() {
+            if s.trim().is_empty() {
                 return Ok(None);
             }
-            let t = t.strip_prefix("0o").unwrap_or(t);
-            let parsed = u32::from_str_radix(t, 8).map_err(|e| D::Error::custom(format!("invalid mode {s:?}: {e}")))?;
-            Ok(Some(parsed))
+            crate::pm::config::parse_mode_str(&s)
+                .map(Some)
+                .map_err(D::Error::custom)
         }
         _ => Err(D::Error::custom("mode must be an integer or octal string like \"0700\"")),
     }
@@ -556,6 +559,42 @@ struct AppConfigFile {
     provisioning: Vec<ProvisioningEntry>,
 }
 
+/// Longest accepted service name. Generous, but bounded so names stay usable as
+/// cgroup directory components and in fixed-width status output.
+pub const MAX_APPLICATION_NAME_LEN: usize = 64;
+
+/// Reject any service name that could escape the master cgroup directory or corrupt
+/// operator-facing output.
+///
+/// Names reach `<cgroup_root>/<cgroup_name>/pm-<app>` via `PathBuf::join`, which
+/// splits on `/`, so an unvalidated name containing `..` would resolve outside the
+/// master cgroup — and `cgroup.kill` on the result would signal unrelated services.
+pub fn validate_application_name(name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!name.is_empty(), "service name must not be empty");
+    anyhow::ensure!(
+        name.len() <= MAX_APPLICATION_NAME_LEN,
+        "service name {name:?} is longer than {MAX_APPLICATION_NAME_LEN} characters"
+    );
+    anyhow::ensure!(
+        name != "." && name != "..",
+        "service name {name:?} is reserved"
+    );
+    anyhow::ensure!(
+        !name.starts_with('.'),
+        "service name {name:?} must not start with '.'"
+    );
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+    {
+        anyhow::bail!(
+            "service name {name:?} contains invalid character {bad:?} \
+             (allowed: ASCII letters, digits, '-', '_', '.')"
+        );
+    }
+    Ok(())
+}
+
 impl AppConfigFile {
     pub fn into_definition(
         self,
@@ -588,6 +627,11 @@ impl AppConfigFile {
                 derived
             }
         };
+
+        // The application name is interpolated into cgroup directory paths
+        // (`<master>/pm-<app>`) and into log/event output, so it must not be able to
+        // escape that directory or carry control characters.
+        validate_application_name(&application)?;
 
         // Mutual exclusivity: schedule vs restart_policy
         if self.process.schedule.is_some() && self.restart_policy.is_some() {
@@ -1064,3 +1108,121 @@ pub fn normalize_swap_for_launcher(swap: Option<&str>) -> anyhow::Result<String>
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- validate_application_name ---------------------------------------------
+    //
+    // Security regression: the name is interpolated into `<master>/pm-<app>` via
+    // PathBuf::join, which splits on '/'. An unvalidated `x/../../system.slice`
+    // resolved outside the master cgroup, so `pmctl stop` would write to
+    // /sys/fs/cgroup/system.slice/cgroup.kill and SIGKILL every systemd service.
+
+    #[test]
+    fn service_name_rejects_path_traversal() {
+        for bad in [
+            "x/../../system.slice",
+            "../evil",
+            "..",
+            ".",
+            "a/b",
+            "/absolute",
+            "trailing/",
+        ] {
+            assert!(
+                validate_application_name(bad).is_err(),
+                "{bad:?} must be rejected as a service name"
+            );
+        }
+    }
+
+    #[test]
+    fn service_name_rejects_empty_hidden_and_control_characters() {
+        assert!(validate_application_name("").is_err());
+        assert!(validate_application_name(".hidden").is_err());
+        assert!(validate_application_name("has space").is_err());
+        assert!(validate_application_name("nul\0byte").is_err());
+        assert!(validate_application_name("new\nline").is_err());
+        assert!(validate_application_name("semi;colon").is_err());
+        assert!(validate_application_name(&"a".repeat(MAX_APPLICATION_NAME_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn service_name_accepts_ordinary_names() {
+        for ok in [
+            "web",
+            "my-service",
+            "my_service",
+            "api.v2",
+            "worker3",
+            &"a".repeat(MAX_APPLICATION_NAME_LEN),
+        ] {
+            assert!(
+                validate_application_name(ok).is_ok(),
+                "{ok:?} should be a valid service name"
+            );
+        }
+    }
+
+    // ---- parse_duration_str ----------------------------------------------------
+
+    #[test]
+    fn duration_units_convert_to_milliseconds() {
+        assert_eq!(parse_duration_str("1000ms").unwrap(), 1000);
+        assert_eq!(parse_duration_str("10s").unwrap(), 10_000);
+        assert_eq!(parse_duration_str("1m").unwrap(), 60_000);
+        assert_eq!(parse_duration_str("2h").unwrap(), 7_200_000);
+        assert_eq!(parse_duration_str("1.5s").unwrap(), 1500);
+        assert_eq!(parse_duration_str("  10s  ").unwrap(), 10_000);
+    }
+
+    #[test]
+    fn duration_rejects_unsupported_input() {
+        assert!(parse_duration_str("").is_err());
+        assert!(parse_duration_str("10").is_err(), "unit is required");
+        assert!(parse_duration_str("s").is_err(), "number is required");
+        assert!(parse_duration_str("-1s").is_err());
+        // Documented divergence from flag TTLs, which *do* accept days. Pinned so the
+        // inconsistency is a deliberate choice rather than a surprise.
+        assert!(parse_duration_str("1d").is_err());
+    }
+
+    // ---- parse_cpu_millicores --------------------------------------------------
+
+    #[test]
+    fn cpu_accepts_millicores_and_fractional_cores() {
+        assert_eq!(parse_cpu_millicores("100m").unwrap(), 100);
+        assert_eq!(parse_cpu_millicores("1500m").unwrap(), 1500);
+        assert_eq!(parse_cpu_millicores("1").unwrap(), 1000);
+        assert_eq!(parse_cpu_millicores("1.5").unwrap(), 1500);
+        assert_eq!(parse_cpu_millicores("0.25").unwrap(), 250);
+    }
+
+    #[test]
+    fn cpu_rejects_garbage() {
+        assert!(parse_cpu_millicores("").is_err());
+        assert!(parse_cpu_millicores("abc").is_err());
+        assert!(parse_cpu_millicores("-1").is_err());
+    }
+
+    // ---- provisioning mode parsing ---------------------------------------------
+
+    #[test]
+    fn provisioning_mode_is_octal_in_every_spelling() {
+        #[derive(Deserialize)]
+        struct Holder {
+            #[serde(default, deserialize_with = "deserialize_mode_octal_opt")]
+            mode: Option<u32>,
+        }
+        let parse = |y: &str| serde_yaml::from_str::<Holder>(y).map(|h| h.mode);
+
+        assert_eq!(parse("mode: \"0755\"").unwrap(), Some(0o755));
+        assert_eq!(parse("mode: 0755").unwrap(), Some(0o755));
+        assert_eq!(parse("mode: 755").unwrap(), Some(0o755));
+        assert_eq!(parse("mode: \"0o755\"").unwrap(), Some(0o755));
+        assert_eq!(parse("other: 1").unwrap(), None);
+        assert!(parse("mode: 799").is_err(), "9 is not an octal digit");
+    }
+}

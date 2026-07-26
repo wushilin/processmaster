@@ -943,8 +943,7 @@ fn validate_web_console_config(cfg: &MasterConfig) -> anyhow::Result<()> {
     }
 
     // bind/port sanity
-    let _addr: std::net::SocketAddr = format!("{}:{}", wc.bind, wc.port)
-        .parse()
+    let _addr = crate::pm::config::parse_bind_addr(&wc.bind, wc.port)
         .map_err(|e| anyhow::anyhow!("web_console bind/port invalid: {e}"))?;
 
     // basic auth required
@@ -957,6 +956,31 @@ fn validate_web_console_config(cfg: &MasterConfig) -> anyhow::Result<()> {
         anyhow::ensure!(
             t.contains(':'),
             "invalid web_console.auth.basic.users entry (expected 'user:hash'): {t:?}"
+        );
+    }
+
+    // The bootstrap credential is published in the README and in examples/, so leaving
+    // it in place is equivalent to no authentication at all — and this console can run
+    // arbitrary root commands via admin_actions. Warn on every startup, and refuse
+    // outright if the console is also reachable off-host.
+    if wc.auth.basic.users.iter().any(|u| {
+        u.trim() == crate::pm::config::DEFAULT_BOOTSTRAP_BASIC_AUTH_ENTRY
+    }) {
+        let loopback_only = wc.bind.trim() == "127.0.0.1" || wc.bind.trim() == "::1";
+        anyhow::ensure!(
+            loopback_only,
+            "web_console is bound to {} with the default bootstrap credentials still in \
+             place. That password is published in the README, and the console can run \
+             admin_actions as root. Generate a real entry with `pmctl password generate` \
+             and set web_console.auth.basic.users, or bind to 127.0.0.1 for local-only use.",
+            wc.bind
+        );
+        pm_event(
+            "web",
+            None,
+            "WARNING default bootstrap web console credentials are in use \
+             (loopback-only); replace them via `pmctl password generate`"
+                .to_string(),
         );
     }
 
@@ -2332,7 +2356,20 @@ async fn handle_connection_async(
 ) -> anyhow::Result<()> {
     let mut reader = TokioBufReader::new(stream);
     let mut line = String::new();
-    let n = reader.read_line(&mut line).await?;
+    // Bound the request line. An unbounded `read_line` lets anything that can open the
+    // socket grow this String until the root daemon is OOM-killed, taking supervision
+    // of every managed service with it. Real requests are a few hundred bytes.
+    const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
+    let n = {
+        use tokio::io::AsyncReadExt as _;
+        let mut limited = (&mut reader).take(MAX_REQUEST_BYTES);
+        let n = limited.read_line(&mut line).await?;
+        anyhow::ensure!(
+            n < MAX_REQUEST_BYTES as usize,
+            "request exceeds {MAX_REQUEST_BYTES} byte limit"
+        );
+        n
+    };
     if n == 0 || line.trim().is_empty() {
         return Ok(());
     }
@@ -3726,14 +3763,20 @@ async fn do_stop_async(state: &Arc<Mutex<DaemonState>>, name: &str) -> anyhow::R
 
     out.sort_by(|a, b| a.0.cmp(&b.0));
     let mut lines: Vec<String> = vec![];
+    // `ok` must reflect whether every target succeeded: pmctl derives its exit status
+    // from it, and scripts chain destructive work off `pmctl stop <app> && ...`.
+    let mut any_err = false;
     for (_t, r) in out {
         match r {
             Ok(line) => lines.push(line),
-            Err(e) => lines.push(format!("error: {e}")),
+            Err(e) => {
+                any_err = true;
+                lines.push(format!("error: {e:#}"));
+            }
         }
     }
 
-    Ok(Response { ok: true, message: lines.join("\n"), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![], perf_metrics: None })
+    Ok(Response { ok: !any_err, message: lines.join("\n"), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![], perf_metrics: None })
 }
 
 async fn do_restart_async(state: &Arc<Mutex<DaemonState>>, name: &str, force: bool) -> anyhow::Result<Response> {
@@ -3790,14 +3833,20 @@ async fn do_restart_async(state: &Arc<Mutex<DaemonState>>, name: &str, force: bo
 
     out.sort_by(|a, b| a.0.cmp(&b.0));
     let mut lines: Vec<String> = vec![];
+    // `ok` must reflect whether every target succeeded: pmctl derives its exit status
+    // from it, and scripts chain destructive work off `pmctl stop <app> && ...`.
+    let mut any_err = false;
     for (_t, r) in out {
         match r {
             Ok(line) => lines.push(line),
-            Err(e) => lines.push(format!("error: {e}")),
+            Err(e) => {
+                any_err = true;
+                lines.push(format!("error: {e:#}"));
+            }
         }
     }
 
-    Ok(Response { ok: true, message: lines.join("\n"), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![], perf_metrics: None })
+    Ok(Response { ok: !any_err, message: lines.join("\n"), restarted: vec![], statuses: vec![], events: vec![], admin_actions: vec![], perf_metrics: None })
 }
 
 async fn do_start_all_async(state: &Arc<Mutex<DaemonState>>, force: bool) -> anyhow::Result<Response> {
@@ -3896,7 +3945,7 @@ async fn do_stop_all_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Re
             if let Some(name) = pending.next() {
                 let cfg2 = cfg.clone();
                 js.spawn(async move {
-                    let is_running = cgroup_running_async(&cfg2, &name).await.unwrap_or(false);
+                    let is_running = cgroup_running_or_assume_running(&cfg2, &name).await;
                     (name, is_running)
                 });
             }
@@ -3909,7 +3958,7 @@ async fn do_stop_all_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Re
                 if let Some(next) = pending.next() {
                     let cfg2 = cfg.clone();
                     js.spawn(async move {
-                        let is_running = cgroup_running_async(&cfg2, &next).await.unwrap_or(false);
+                        let is_running = cgroup_running_or_assume_running(&cfg2, &next).await;
                         (next, is_running)
                     });
                 }
@@ -4790,6 +4839,10 @@ fn spawn_launcher_child(cfg: &MasterConfig, def: &AppDefinition) -> anyhow::Resu
     // Capture-only mode: stdout/stderr always go through processmaster log pumps.
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    // Never hand a service the daemon's stdin. setsid() detaches the session but does
+    // not close fd 0, so without this a daemon started from a terminal leaks that
+    // terminal to every supervised service.
+    cmd.stdin(Stdio::null());
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -5007,6 +5060,14 @@ fn chown_recursive(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> anyhow::R
     walk(root, uid, gid)
 }
 
+/// Open a service log file for appending, as root.
+///
+/// `O_NOFOLLOW` is essential here, not defensive polish. The log directory normally
+/// lives inside a working directory owned by the *service* user (provisioning chowns
+/// it), so without it that user can replace `logs/stdout.log` with a symlink to
+/// `/etc/cron.d/x` or `/root/.ssh/authorized_keys` and have the root daemon append
+/// application-controlled bytes there. `O_NOFOLLOW` makes such an open fail with
+/// `ELOOP` instead.
 async fn open_append_log_async(path: &Path) -> anyhow::Result<tokio::fs::File> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -5017,9 +5078,15 @@ async fn open_append_log_async(path: &Path) -> anyhow::Result<tokio::fs::File> {
         .create(true)
         .append(true)
         .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .await
-        .with_context(|| format!("open log {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "open log {} (note: refusing to follow a symlink here is intentional)",
+                path.display()
+            )
+        })?;
     Ok(f)
 }
 
@@ -5757,7 +5824,7 @@ fn spawn_supervisor_thread(
             if *waiter_running {
                 return;
             }
-            if !cgroup_running_async(cfg, app).await.unwrap_or(false) {
+            if !cgroup_running_or_assume_running(cfg, app).await {
                 return;
             }
             *waiter_epoch = waiter_epoch.wrapping_add(1);
@@ -5850,7 +5917,7 @@ fn spawn_supervisor_thread(
                     }
 
                     // If already running, do not change markers (same as manual start).
-                    if cgroup_running_async(&cfg, &app).await.unwrap_or(false) {
+                    if cgroup_running_or_assume_running(&cfg, &app).await {
                         ensure_waiter_attached(
                             &cfg,
                             &app,
@@ -5928,7 +5995,7 @@ fn spawn_supervisor_thread(
                     }
 
                     // If already running, just ensure waiter and return OK.
-                    if cgroup_running_async(&cfg, &app).await.unwrap_or(false) {
+                    if cgroup_running_or_assume_running(&cfg, &app).await {
                         // No-op: starting an already running service should not change intent markers or other flags.
                         ensure_waiter_attached(
                             &cfg,
@@ -6039,7 +6106,7 @@ fn spawn_supervisor_thread(
                 => {
                     // If already stopped, do NOT update markers OR clear FAILED/BACKOFF/history.
                     // "Stop" should be a no-op if nothing is running; keeping FAILED makes sense for failed/stopped services.
-                    if !cgroup_running_async(&cfg, &app).await.unwrap_or(false) {
+                    if !cgroup_running_or_assume_running(&cfg, &app).await {
                         set_phase_and_emit(&run_info, &events, &app, Phase::Stopped, "stop_noop_already_stopped");
                         let _ = resp.send(Ok(()));
                         continue;
@@ -6084,7 +6151,7 @@ fn spawn_supervisor_thread(
                 }
                 SupervisorCmd::ShutdownStop { resp } => {
                     // System stop should not persist operator intent.
-                    if !cgroup_running_async(&cfg, &app).await.unwrap_or(false) {
+                    if !cgroup_running_or_assume_running(&cfg, &app).await {
                         set_phase_and_emit(&run_info, &events, &app, Phase::Stopped, "stop_noop_already_stopped");
                         let _ = resp.send(Ok(()));
                         continue;
@@ -6103,7 +6170,7 @@ fn spawn_supervisor_thread(
                 }
                 SupervisorCmd::OverTimeStop { resp } => {
                     // Overtime stop should not persist operator intent, but does set an informational sysflag for cron jobs.
-                    if !cgroup_running_async(&cfg, &app).await.unwrap_or(false) {
+                    if !cgroup_running_or_assume_running(&cfg, &app).await {
                         set_phase_and_emit(&run_info, &events, &app, Phase::Stopped, "stop_noop_already_stopped");
                         let _ = resp.send(Ok(()));
                         continue;
@@ -6141,7 +6208,7 @@ fn spawn_supervisor_thread(
                         e.recent_system_crashes_ms.clear();
                     }
                     // Stop step
-                    if cgroup_running_async(&cfg, &app).await.unwrap_or(false) {
+                    if cgroup_running_or_assume_running(&cfg, &app).await {
                         // IMPORTANT: during manual restart we intentionally stop the cgroup.
                         // The existing waiter is "wait until cgroup empty" and would report this as an exit event,
                         // which can race and be interpreted as a crash after restart. Invalidate it before stopping.
@@ -6155,7 +6222,7 @@ fn spawn_supervisor_thread(
                         }
                     }
                     // Start step
-                    if cgroup_running_async(&cfg, &app).await.unwrap_or(false) {
+                    if cgroup_running_or_assume_running(&cfg, &app).await {
                         ensure_waiter_attached(
                             &cfg,
                             &app,
@@ -6257,7 +6324,7 @@ fn spawn_supervisor_thread(
                         e.recent_system_crashes_ms.clear();
                     }
                     // Stop step (same invalidation as manual restart).
-                    if cgroup_running_async(&cfg, &app).await.unwrap_or(false) {
+                    if cgroup_running_or_assume_running(&cfg, &app).await {
                         waiter_epoch = waiter_epoch.wrapping_add(1);
                         cancel_waiter(&mut waiter_running, &mut waiter_cancel);
                         set_phase_and_emit(&run_info, &events, &app, Phase::Stopping, "reload_restart_stop");
@@ -6268,7 +6335,7 @@ fn spawn_supervisor_thread(
                         }
                     }
                     // Start step
-                    if cgroup_running_async(&cfg, &app).await.unwrap_or(false) {
+                    if cgroup_running_or_assume_running(&cfg, &app).await {
                         ensure_waiter_attached(
                             &cfg,
                             &app,
@@ -6346,7 +6413,7 @@ fn spawn_supervisor_thread(
                             continue;
                         }
                     }
-                    if cgroup_running_async(&cfg, &app).await.unwrap_or(false) {
+                    if cgroup_running_or_assume_running(&cfg, &app).await {
                         ensure_waiter_attached(
                             &cfg,
                             &app,
@@ -6407,7 +6474,7 @@ fn spawn_supervisor_thread(
                         let _ = resp.send(Err(anyhow::anyhow!("{app}: disabled")));
                         continue;
                     }
-                    if cgroup_running_async(&cfg, &app).await.unwrap_or(false) {
+                    if cgroup_running_or_assume_running(&cfg, &app).await {
                         ensure_waiter_attached(
                             &cfg,
                             &app,
@@ -6503,7 +6570,7 @@ fn spawn_supervisor_thread(
                         set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "failure_auto_restart_failed_flag_set");
                         continue;
                     }
-                    if cgroup_running_async(&cfg, &app).await.unwrap_or(false) {
+                    if cgroup_running_or_assume_running(&cfg, &app).await {
                         // Already running again; just ensure waiter.
                         ensure_waiter_attached(
                             &cfg,
@@ -7557,6 +7624,26 @@ async fn cgroup_running_async(cfg: &MasterConfig, app: &str) -> anyhow::Result<b
     Ok(!cgroup::list_pids_async(&dir).await?.is_empty())
 }
 
+/// Liveness check that fails **safe**: if the cgroup cannot be read, assume the
+/// service may still be running.
+///
+/// Use this anywhere a `false` would cause the caller to skip stopping something.
+/// Treating "I could not look" as "it is stopped" is how a stop silently becomes a
+/// no-op — and how a restart ends up with two live instances sharing one cgroup.
+async fn cgroup_running_or_assume_running(cfg: &MasterConfig, app: &str) -> bool {
+    match cgroup_running_async(cfg, app).await {
+        Ok(v) => v,
+        Err(e) => {
+            pm_event(
+                "cgroup",
+                Some(app),
+                format!("liveness_check_failed assuming_running err={e:#}"),
+            );
+            true
+        }
+    }
+}
+
 fn launcher_kill_signal(cfg: &MasterConfig, app: &str, sig: &str) -> anyhow::Result<()> {
     let s = parse_signal(sig)?;
     let dir = app_cgroup_dir(cfg, app);
@@ -7604,3 +7691,230 @@ fn enforce_app_user_group_rules(def: &AppDefinition) -> anyhow::Result<()> {
 
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- parse_size_spec_bytes -------------------------------------------------
+    // Feeds both cgroup memory limits and log rotation thresholds, so a wrong answer
+    // here silently writes a wrong memory.max.
+
+    #[test]
+    fn size_plain_integer_is_bytes() {
+        assert_eq!(parse_size_spec_bytes("1234").unwrap(), 1234);
+        assert_eq!(parse_size_spec_bytes("0").unwrap(), 0);
+        assert_eq!(parse_size_spec_bytes("  42  ").unwrap(), 42);
+    }
+
+    #[test]
+    fn size_decimal_units_are_powers_of_1000() {
+        assert_eq!(parse_size_spec_bytes("10k").unwrap(), 10_000);
+        assert_eq!(parse_size_spec_bytes("10m").unwrap(), 10_000_000);
+        assert_eq!(parse_size_spec_bytes("2g").unwrap(), 2_000_000_000);
+        // The trailing `b` is optional and case is irrelevant.
+        assert_eq!(parse_size_spec_bytes("10MB").unwrap(), 10_000_000);
+        assert_eq!(parse_size_spec_bytes("10mb").unwrap(), 10_000_000);
+    }
+
+    #[test]
+    fn size_binary_units_are_powers_of_1024() {
+        assert_eq!(parse_size_spec_bytes("1ki").unwrap(), 1024);
+        assert_eq!(parse_size_spec_bytes("64MiB").unwrap(), 64 * 1024 * 1024);
+        assert_eq!(parse_size_spec_bytes("1GiB").unwrap(), 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn size_accepts_fractions_only_with_a_unit() {
+        assert_eq!(parse_size_spec_bytes("1.5GiB").unwrap(), 1_610_612_736);
+        // Documented quirk: a bare decimal has no unit boundary to split on and is
+        // rejected. Pinned so a future refactor makes the change deliberately.
+        assert!(parse_size_spec_bytes("1.5").is_err());
+    }
+
+    #[test]
+    fn size_rejects_garbage() {
+        assert!(parse_size_spec_bytes("").is_err());
+        assert!(parse_size_spec_bytes("   ").is_err());
+        assert!(parse_size_spec_bytes("abc").is_err());
+        assert!(parse_size_spec_bytes("10x").is_err());
+        assert!(parse_size_spec_bytes("m10").is_err());
+    }
+
+    // ---- parse_flag_ttl_ms -----------------------------------------------------
+
+    #[test]
+    fn ttl_single_and_compound_units() {
+        assert_eq!(parse_flag_ttl_ms("1500ms").unwrap(), 1500);
+        assert_eq!(parse_flag_ttl_ms("10s").unwrap(), 10_000);
+        assert_eq!(parse_flag_ttl_ms("10m").unwrap(), 600_000);
+        assert_eq!(parse_flag_ttl_ms("2h").unwrap(), 7_200_000);
+        assert_eq!(parse_flag_ttl_ms("1d").unwrap(), 86_400_000);
+        assert_eq!(parse_flag_ttl_ms("3h1m").unwrap(), 3 * 3_600_000 + 60_000);
+        assert_eq!(
+            parse_flag_ttl_ms("5d4h3m2s1ms").unwrap(),
+            5 * 86_400_000 + 4 * 3_600_000 + 3 * 60_000 + 2 * 1_000 + 1
+        );
+    }
+
+    #[test]
+    fn ttl_requires_descending_units_without_repeats() {
+        assert!(parse_flag_ttl_ms("1m3h").is_err(), "ascending units must be rejected");
+        assert!(parse_flag_ttl_ms("1h1h").is_err(), "repeated units must be rejected");
+        assert!(parse_flag_ttl_ms("1m1m").is_err());
+    }
+
+    #[test]
+    fn ttl_is_case_insensitive_and_rejects_malformed_input() {
+        assert_eq!(parse_flag_ttl_ms("2H").unwrap(), 7_200_000);
+        assert!(parse_flag_ttl_ms("").is_err());
+        assert!(parse_flag_ttl_ms("10").is_err(), "missing unit");
+        assert!(parse_flag_ttl_ms("h").is_err(), "missing number");
+        assert!(parse_flag_ttl_ms("10y").is_err(), "unknown unit");
+        assert!(parse_flag_ttl_ms("1h 1m").is_err(), "whitespace is not allowed");
+        assert!(parse_flag_ttl_ms("18446744073709551615d").is_err(), "overflow");
+    }
+
+    // ---- normalize_cron_expr ---------------------------------------------------
+
+    #[test]
+    fn cron_five_fields_gets_a_seconds_column() {
+        assert_eq!(normalize_cron_expr("0 * * * *").unwrap(), "0 0 * * * *");
+        assert_eq!(normalize_cron_expr("*/15 2 * * MON").unwrap(), "0 */15 2 * * MON");
+        // Surrounding whitespace is trimmed before the seconds column is prepended.
+        assert_eq!(normalize_cron_expr("  15 2 * * *  ").unwrap(), "0 15 2 * * *");
+    }
+
+    #[test]
+    fn cron_rejects_field_counts_we_cannot_honour() {
+        // 6 fields would imply seconds resolution, which the scheduler cannot provide.
+        assert!(normalize_cron_expr("0 0 * * * *").is_err());
+        assert!(normalize_cron_expr("* * * *").is_err());
+        assert!(normalize_cron_expr("").is_err());
+        assert!(normalize_cron_expr("   ").is_err());
+    }
+
+    #[test]
+    fn cron_shorthands_pass_through() {
+        assert_eq!(normalize_cron_expr("@hourly").unwrap(), "@hourly");
+        assert_eq!(normalize_cron_expr("@daily").unwrap(), "@daily");
+    }
+
+    #[test]
+    fn cron_normalized_output_is_accepted_by_the_cron_crate() {
+        use std::str::FromStr as _;
+        // The whole point of normalization is that the result parses downstream.
+        for expr in ["0 * * * *", "*/15 2 * * MON", "15 2 * * *", "0 0 1 JAN *"] {
+            let norm = normalize_cron_expr(expr).unwrap();
+            assert!(
+                cron::Schedule::from_str(&norm).is_ok(),
+                "normalized {expr:?} -> {norm:?} was rejected by the cron crate"
+            );
+        }
+    }
+
+    // ---- parse_signal ----------------------------------------------------------
+
+    #[test]
+    fn signal_accepts_both_prefixed_and_bare_names_any_case() {
+        assert_eq!(parse_signal("SIGTERM").unwrap(), Signal::SIGTERM);
+        assert_eq!(parse_signal("TERM").unwrap(), Signal::SIGTERM);
+        assert_eq!(parse_signal("sigterm").unwrap(), Signal::SIGTERM);
+        assert_eq!(parse_signal("  SIGKILL ").unwrap(), Signal::SIGKILL);
+        assert_eq!(parse_signal("USR1").unwrap(), Signal::SIGUSR1);
+    }
+
+    #[test]
+    fn signal_rejects_unknown_names() {
+        assert!(parse_signal("SIGDANCE").is_err());
+        assert!(parse_signal("").is_err());
+        assert!(parse_signal("9").is_err(), "numeric signals are not supported");
+    }
+
+    // ---- cgroup control-file payloads -----------------------------------------
+
+    #[test]
+    fn cpu_max_payload_matches_cgroup_v2_format() {
+        assert_eq!(to_cpu_max_string("MAX").unwrap(), "max 100000\n");
+        assert_eq!(to_cpu_max_string("max").unwrap(), "max 100000\n");
+        // 100 millicores of a 100ms period is a 10ms quota.
+        assert_eq!(to_cpu_max_string("100m").unwrap(), "10000 100000\n");
+        assert_eq!(to_cpu_max_string("1").unwrap(), "100000 100000\n");
+        assert_eq!(to_cpu_max_string("1.5").unwrap(), "150000 100000\n");
+        // An explicit "quota period" pair is passed through untouched.
+        assert_eq!(to_cpu_max_string("20000 100000").unwrap(), "20000 100000\n");
+    }
+
+    // ---- web console config validation -----------------------------------------
+
+    fn cfg_with_console(bind: &str, users: Vec<String>) -> MasterConfig {
+        let mut cfg = MasterConfig::default();
+        cfg.web_console.enabled = true;
+        cfg.web_console.bind = bind.to_string();
+        cfg.web_console.port = 9001;
+        cfg.web_console.auth.basic.users = users;
+        cfg
+    }
+
+    #[test]
+    fn default_bootstrap_credentials_may_not_be_exposed_off_host() {
+        // Security regression: the bootstrap hash is published in the README, and the
+        // console can run admin_actions as root.
+        let default_entry = crate::pm::config::DEFAULT_BOOTSTRAP_BASIC_AUTH_ENTRY.to_string();
+        for bind in ["0.0.0.0", "::", "192.168.1.10"] {
+            let cfg = cfg_with_console(bind, vec![default_entry.clone()]);
+            assert!(
+                validate_web_console_config(&cfg).is_err(),
+                "binding to {bind} with default credentials must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn default_bootstrap_credentials_are_allowed_on_loopback() {
+        let default_entry = crate::pm::config::DEFAULT_BOOTSTRAP_BASIC_AUTH_ENTRY.to_string();
+        for bind in ["127.0.0.1", "::1"] {
+            let cfg = cfg_with_console(bind, vec![default_entry.clone()]);
+            assert!(
+                validate_web_console_config(&cfg).is_ok(),
+                "loopback bind should remain usable for bootstrapping (bind={bind})"
+            );
+        }
+    }
+
+    #[test]
+    fn real_credentials_may_be_exposed_anywhere() {
+        let cfg = cfg_with_console(
+            "0.0.0.0",
+            vec!["alice:$2b$12$BZCGuMAbOe5rXqoieAs5aOxvCRLsq5VaFUSiKk/7xlEM305d63GN6".to_string()],
+        );
+        assert!(validate_web_console_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn console_requires_at_least_one_well_formed_user() {
+        assert!(validate_web_console_config(&cfg_with_console("127.0.0.1", vec![])).is_err());
+        assert!(
+            validate_web_console_config(&cfg_with_console(
+                "127.0.0.1",
+                vec!["missing-colon".to_string()]
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn disabled_console_is_not_validated() {
+        let mut cfg = cfg_with_console("0.0.0.0", vec![]);
+        cfg.web_console.enabled = false;
+        assert!(validate_web_console_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn mem_max_payload_matches_cgroup_v2_format() {
+        assert_eq!(to_mem_max_string("MAX").unwrap(), "max\n");
+        assert_eq!(to_mem_max_string("64MiB").unwrap(), "67108864\n");
+        assert_eq!(to_mem_max_string("0").unwrap(), "0\n");
+        assert!(to_mem_max_string("not-a-size").is_err());
+    }
+}

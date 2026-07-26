@@ -93,7 +93,7 @@ pub(super) fn start_web_console(state: Arc<Mutex<DaemonState>>) {
         }
     };
 
-    let bind_addr: SocketAddr = match format!("{}:{}", cfg.bind, cfg.port).parse() {
+    let bind_addr: SocketAddr = match crate::pm::config::parse_bind_addr(&cfg.bind, cfg.port) {
         Ok(a) => a,
         Err(e) => {
             crate::pm::daemon::pm_event(
@@ -223,8 +223,8 @@ async fn basic_auth_middleware(
     req: axum::http::Request<axum::body::Body>,
     next: middleware::Next,
 ) -> impl IntoResponse {
-    let headers = req.headers();
-    match check_basic_auth(&st.users, &st.auth_cache, headers) {
+    let headers = req.headers().clone();
+    match check_basic_auth(&st.users, &st.auth_cache, &headers).await {
         Ok(()) => next.run(req).await,
         Err(msg) => (
             StatusCode::UNAUTHORIZED,
@@ -235,7 +235,12 @@ async fn basic_auth_middleware(
     }
 }
 
-fn check_basic_auth(
+// bcrypt hash of a fixed throwaway password, generated at bcrypt::DEFAULT_COST.
+// Verified against when the username is unknown so that unknown and known users cost
+// the same wall-clock time (otherwise the response time enumerates valid usernames).
+const DUMMY_BCRYPT_HASH: &str = "$2b$12$BZCGuMAbOe5rXqoieAs5aOxvCRLsq5VaFUSiKk/7xlEM305d63GN6";
+
+async fn check_basic_auth(
     users: &HashMap<String, String>,
     auth_cache: &Arc<Mutex<AuthCache>>,
     headers: &axum::http::HeaderMap,
@@ -257,27 +262,42 @@ fn check_basic_auth(
     let (user, pass) = decoded
         .split_once(':')
         .ok_or_else(|| "invalid basic auth payload".to_string())?;
-    let Some(expected_hash) = users.get(user) else {
+    let Some(expected_hash) = users.get(user).cloned() else {
+        // Unknown user: burn an equivalent bcrypt verify so the reply time does not
+        // reveal whether the username exists, then fail with the same message.
+        let _ = bcrypt_verify_blocking(pass, DUMMY_BCRYPT_HASH).await;
         return Err("invalid credentials".to_string());
     };
 
     // Cache lookup: if this (user, hash, pass) succeeded before, accept immediately.
     if let Ok(mut c) = auth_cache.lock() {
-        if c.is_cached_ok(user, expected_hash, pass) {
+        if c.is_cached_ok(user, &expected_hash, pass) {
             return Ok(());
         }
     }
 
     // Cache miss: verify once.
-    let ok = bcrypt::verify(pass, expected_hash).map_err(|_| "invalid credentials".to_string())?;
+    let ok = bcrypt_verify_blocking(pass, &expected_hash).await;
     if !ok {
         return Err("invalid credentials".to_string());
     }
     // Successful verify: remember it (best-effort).
     if let Ok(mut c) = auth_cache.lock() {
-        c.put_ok(user.to_string(), expected_hash.clone(), pass.to_string());
+        c.put_ok(user.to_string(), expected_hash, pass.to_string());
     }
     Ok(())
+}
+
+// bcrypt is deliberately CPU-expensive and this daemon shares ONE tokio runtime with
+// all supervision work, so a burst of logins on the async workers would starve it.
+// Always verify on the blocking pool. Any error (bad hash, join failure) is a mismatch.
+async fn bcrypt_verify_blocking(pass: &str, hash: &str) -> bool {
+    let pass = pass.to_string();
+    let hash = hash.to_string();
+    matches!(
+        tokio::task::spawn_blocking(move || bcrypt::verify(&pass, &hash)).await,
+        Ok(Ok(true))
+    )
 }
 
 // ---------------- CSRF ----------------
@@ -285,41 +305,71 @@ fn check_basic_auth(
 const CSRF_COOKIE: &str = "pm_csrf";
 const CSRF_HEADER: &str = "x-csrf-token";
 
+// The CSRF token for the current request, handed to handlers via a request extension so
+// the status page can render a token even on the very first load (before any cookie).
+#[derive(Clone)]
+struct CsrfToken(String);
+
+// Constant-time comparison, so a wrong token cannot be recovered byte-by-byte via
+// timing. Length mismatch is not secret (the token length is fixed), so it fails fast.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 async fn csrf_middleware(
     State(st): State<WebState>,
-    req: axum::http::Request<axum::body::Body>,
+    mut req: axum::http::Request<axum::body::Body>,
     next: middleware::Next,
 ) -> impl IntoResponse {
-    // Set CSRF cookie on GETs if missing (used by the UI).
-    // Enforce CSRF on POST /rpc: require X-CSRF-Token == cookie value.
+    // NOTE: this layer lives inside `.nest("/processmaster", ..)`, so the path observed
+    // here is already prefix-stripped -- matching on a mounted path would never fire.
+    // Enforce on METHOD instead: every unsafe method must carry X-CSRF-Token == cookie.
     let method = req.method().clone();
-    let uri = req.uri().path().to_string();
     let headers = req.headers().clone();
 
+    let safe_method = matches!(
+        method,
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    );
+
     let cookie_token = cookie_get(&headers, CSRF_COOKIE);
-    if method == axum::http::Method::POST && uri == "/processmaster/rpc" {
-        let hdr = headers
-            .get(CSRF_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.trim().to_string());
-        if cookie_token.is_none() || hdr.is_none() || cookie_token.as_deref() != hdr.as_deref() {
+    if !safe_method {
+        let hdr = headers.get(CSRF_HEADER).and_then(|v| v.to_str().ok()).map(|s| s.trim());
+        let ok = match (cookie_token.as_deref(), hdr) {
+            (Some(c), Some(h)) => !c.is_empty() && ct_eq(c, h),
+            _ => false,
+        };
+        if !ok {
             return (StatusCode::FORBIDDEN, "csrf check failed").into_response();
         }
     }
 
+    // Mint the token up front (not just on the response) so the first page load already
+    // renders it into <meta name="csrf-token">, and set that same value as the cookie.
+    let (token, fresh) = match cookie_token {
+        Some(t) if !t.is_empty() => (t, false),
+        _ => (new_csrf_token(), true),
+    };
+    req.extensions_mut().insert(CsrfToken(token.clone()));
+
     let mut resp = next.run(req).await;
 
-    if method == axum::http::Method::GET {
-        if cookie_token.is_none() {
-            let t = new_csrf_token();
-            let mut cookie = format!("{CSRF_COOKIE}={t}; Path=/processmaster/; SameSite=Strict");
-            if st.tls_enabled {
-                cookie.push_str("; Secure");
-            }
-            cookie.push_str("; HttpOnly");
-            resp.headers_mut()
-                .append(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
+    if fresh && safe_method {
+        let mut cookie = format!("{CSRF_COOKIE}={token}; Path=/processmaster/; SameSite=Strict");
+        if st.tls_enabled {
+            cookie.push_str("; Secure");
         }
+        cookie.push_str("; HttpOnly");
+        resp.headers_mut()
+            .append(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
     }
 
     resp
@@ -361,8 +411,12 @@ struct AdminActionButton {
     label: String,
 }
 
-async fn status_page(State(_st): State<WebState>, headers: HeaderMap) -> AxumResponse {
-    let token = cookie_get(&headers, CSRF_COOKIE).unwrap_or_else(|| "".to_string());
+async fn status_page(
+    State(_st): State<WebState>,
+    axum::Extension(CsrfToken(token)): axum::Extension<CsrfToken>,
+) -> AxumResponse {
+    // The token comes from csrf_middleware (cookie value, or freshly minted on first
+    // load) so the rendered <meta> tag is never empty.
     // Build banner is computed from build-time env vars (see build.rs).
     let admin_actions = {
         let st = _st.daemon.lock().unwrap_or_else(|p| p.into_inner());
@@ -1385,15 +1439,31 @@ async fn serve(
                 Ok(())
             }
 
+            // The private key must never be world-readable, not even for the instant
+            // between write and chmod: create it 0600 up front. Errors are propagated --
+            // silently failing here would leave the key readable by every local user.
+            async fn write_private_file(path: &str, contents: &str) -> anyhow::Result<()> {
+                let p = Path::new(path);
+                if let Some(parent) = p.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                }
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.mode(0o600);
+                }
+                let mut f = opts.open(p)?;
+                std::io::Write::write_all(&mut f, contents.as_bytes())?;
+                Ok(())
+            }
+
             write_file(&ca, &ca_pem).await?;
             write_file(&cert, &server_chain_pem).await?;
-            write_file(&key, &server_key_pem).await?;
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600));
-            }
+            write_private_file(&key, &server_key_pem).await?;
 
             crate::pm::daemon::pm_event(
                 "web",
@@ -1480,3 +1550,132 @@ async fn serve(
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- timing-safe primitives ------------------------------------------------
+
+    #[test]
+    fn dummy_bcrypt_hash_is_a_real_verifiable_hash() {
+        // This matters more than it looks: if the constant were malformed,
+        // bcrypt::verify would return Err *immediately* instead of doing the work,
+        // which would silently restore the username-enumeration timing oracle it
+        // exists to close.
+        let r = bcrypt::verify("any password at all", DUMMY_BCRYPT_HASH);
+        assert!(r.is_ok(), "DUMMY_BCRYPT_HASH is not a parseable bcrypt hash");
+        assert!(!r.unwrap(), "DUMMY_BCRYPT_HASH must not match a guessable password");
+    }
+
+    #[test]
+    fn ct_eq_matches_ordinary_equality() {
+        assert!(ct_eq("", ""));
+        assert!(ct_eq("abc", "abc"));
+        assert!(ct_eq(&"x".repeat(64), &"x".repeat(64)));
+        assert!(!ct_eq("abc", "abd"));
+        assert!(!ct_eq("abc", "ab"));
+        assert!(!ct_eq("", "a"));
+        // Differences in the final byte must be caught just as reliably as the first.
+        assert!(!ct_eq("aaaaaaaaZ", "aaaaaaaaY"));
+        assert!(!ct_eq("Zaaaaaaaa", "Yaaaaaaaa"));
+    }
+
+    // ---- systemd argument allow-lists ------------------------------------------
+
+    #[test]
+    fn systemd_unit_names_reject_injection_and_traversal() {
+        for bad in [
+            "foo.service; rm -rf /",
+            "../../etc/passwd",
+            "foo.service && reboot",
+            "foo.socket",
+            "foo",
+            "",
+            "$(reboot).service",
+            "foo bar.service",
+        ] {
+            assert!(
+                validate_systemd_unit(bad).is_err(),
+                "{bad:?} must be rejected as a systemd unit"
+            );
+        }
+    }
+
+    #[test]
+    fn systemd_unit_names_accept_ordinary_units() {
+        for ok in ["processmaster.service", "nginx.service", "user@1000.service"] {
+            assert!(
+                validate_systemd_unit(ok).is_ok(),
+                "{ok:?} should be a valid systemd unit"
+            );
+        }
+    }
+
+    #[test]
+    fn systemd_actions_are_restricted_to_a_known_set() {
+        assert!(validate_systemd_action("start").is_ok());
+        assert!(validate_systemd_action("stop").is_ok());
+        for bad in ["mask", "isolate", "poweroff", "", "start;reboot"] {
+            assert!(
+                validate_systemd_action(bad).is_err(),
+                "{bad:?} must not be an accepted systemd action"
+            );
+        }
+    }
+
+    // ---- htpasswd parsing ------------------------------------------------------
+
+    #[test]
+    fn htpasswd_entries_split_on_the_first_colon_only() {
+        // bcrypt hashes contain '$' and '/', and the hash itself must survive intact.
+        let cfg = WebConsoleConfig {
+            enabled: true,
+            auth: crate::pm::config::WebConsoleAuthConfig {
+                basic: crate::pm::config::WebConsoleBasicAuthConfig {
+                    users: vec![format!("alice:{DUMMY_BCRYPT_HASH}")],
+                },
+            },
+            ..Default::default()
+        };
+        let users = parse_htpasswd_users(&cfg).expect("parses");
+        assert_eq!(users.get("alice").map(String::as_str), Some(DUMMY_BCRYPT_HASH));
+    }
+
+    #[test]
+    fn htpasswd_rejects_entries_without_a_colon() {
+        let cfg = WebConsoleConfig {
+            enabled: true,
+            auth: crate::pm::config::WebConsoleAuthConfig {
+                basic: crate::pm::config::WebConsoleBasicAuthConfig {
+                    users: vec!["no-colon-here".to_string()],
+                },
+            },
+            ..Default::default()
+        };
+        assert!(parse_htpasswd_users(&cfg).is_err());
+    }
+
+    // ---- cookies ---------------------------------------------------------------
+
+    #[test]
+    fn cookie_get_finds_the_named_cookie_among_others() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::COOKIE,
+            HeaderValue::from_static("other=1; pm_csrf=abc123; trailing=2"),
+        );
+        assert_eq!(cookie_get(&h, CSRF_COOKIE).as_deref(), Some("abc123"));
+        assert_eq!(cookie_get(&h, "nope"), None);
+        assert_eq!(cookie_get(&HeaderMap::new(), CSRF_COOKIE), None);
+    }
+
+    #[test]
+    fn csrf_tokens_are_unpredictable_and_long_enough() {
+        let a = new_csrf_token();
+        let b = new_csrf_token();
+        assert_ne!(a, b, "tokens must not repeat");
+        // 32 random bytes, base64url without padding.
+        assert!(a.len() >= 40, "token {a:?} is shorter than expected");
+    }
+}

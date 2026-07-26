@@ -559,10 +559,13 @@
     window.setTimeout(() => el.classList.add("d-none"), 5000);
   }
 
+  // esc() output is interpolated into double-quoted attributes (title="...",
+  // data-app="...") that are then assigned via innerHTML, so it MUST escape quotes.
+  // The textContent/innerHTML trick does not (HTML only serializes quotes in attribute
+  // mode), so delegate to escapeHtmlFast, which escapes & < > " ' -- it is a hoisted
+  // function declaration in this same script block, so it is safe to call from here.
   function esc(s) {
-    const div = document.createElement("div");
-    div.textContent = s;
-    return div.innerHTML;
+    return escapeHtmlFast(s === null || s === undefined ? "" : String(s));
   }
 
   function fmtUptimeMs(ms) {

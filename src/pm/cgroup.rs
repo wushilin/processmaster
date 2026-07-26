@@ -20,34 +20,37 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs as tokio_fs;
 use tokio::task;
 
-/// Minimal cgroup-v2 helpers intended to replace external "launcher" features over time.
+/// Minimal cgroup-v2 helpers: process launching, cgroup membership, resource limits
+/// and kill/wait primitives.
 ///
-/// NOTE: This module is currently not wired into the daemon. It's meant for evaluation and
-/// incremental rollout.
+/// This module owns the privilege drop for every supervised process (see
+/// `build_command`), so changes here are security-sensitive.
 
+/// Write `content` to a cgroup control file.
+///
+/// The `io::Error` is attached as the error *source* rather than being formatted into
+/// a string, so callers can still recover the errno with
+/// `downcast_ref::<io::Error>()` — several fail-safe branches depend on distinguishing
+/// `NotFound` (cgroup already gone) from a real failure.
 fn write_file(path: &Path, content: &str) -> anyhow::Result<()> {
     let mut f = fs::OpenOptions::new()
         .write(true)
         .open(path)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "open for write {} failed: kind={:?} os_error={:?} err={}",
-                path.display(),
-                e.kind(),
-                e.raw_os_error(),
-                e
-            )
-        })?;
-    f.write_all(content.as_bytes()).map_err(|e| {
-        anyhow::anyhow!(
-            "write {} failed: kind={:?} os_error={:?} err={}",
-            path.display(),
-            e.kind(),
-            e.raw_os_error(),
-            e
-        )
-    })?;
+        .with_context(|| format!("open for write {} failed", path.display()))?;
+    f.write_all(content.as_bytes())
+        .with_context(|| format!("write {} failed", path.display()))?;
     Ok(())
+}
+
+/// True if any error in the chain is an `io::Error` with kind `NotFound`.
+///
+/// Walks the whole chain rather than downcasting the outermost error, so it keeps
+/// working no matter how many layers of `.context()` a caller adds.
+pub(crate) fn is_io_not_found(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<io::Error>()
+            .is_some_and(|ioe| ioe.kind() == io::ErrorKind::NotFound)
+    })
 }
 
 fn ensure_dir(path: &Path) -> anyhow::Result<()> {
@@ -175,10 +178,8 @@ pub(crate) fn kill_all_pids(cgroup_dir: &Path) -> anyhow::Result<()> {
     match write_file(&killf, "1\n") {
         Ok(()) => {}
         Err(e) => {
-            // Fail-safe: if cgroup doesn't exist, nothing to kill.
-            if let Some(ioe) = e.downcast_ref::<io::Error>()
-                && ioe.kind() == io::ErrorKind::NotFound
-            {
+            // Fail-safe: if the cgroup doesn't exist, there is nothing to kill.
+            if is_io_not_found(&e) {
                 return Ok(());
             }
             return Err(e).with_context(|| format!("kill all via {}", killf.display()));
@@ -301,7 +302,10 @@ pub(crate) fn wait_all_cancellable(cgroup_dir: &Path, cancel: &AtomicBool) -> an
 
         let pid = pids[0];
         let fd = match pidfd_open(pid) {
-            Ok(fd) => fd,
+            // Owned so the descriptor is closed on every exit path, including the
+            // `?` below — otherwise a poll() failure leaks one fd per stop attempt
+            // and eventually exhausts the daemon's table.
+            Ok(fd) => OwnedPidFd(fd),
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => return Err(anyhow::anyhow!("pidfd_open pid={pid} failed: {e}")),
         };
@@ -312,18 +316,26 @@ pub(crate) fn wait_all_cancellable(cgroup_dir: &Path, cancel: &AtomicBool) -> an
         const CANCEL_POLL_MS: i32 = 5_000;
         loop {
             if cancel.load(Ordering::Relaxed) {
-                unsafe { let _ = libc::close(fd); }
                 return Ok(false);
             }
-            let ready = wait_pidfd(fd, CANCEL_POLL_MS)
+            let ready = wait_pidfd(fd.0, CANCEL_POLL_MS)
                 .with_context(|| format!("wait on pidfd for pid={pid}"))?;
             if ready {
                 break;
             }
         }
+        // `fd` closes here via Drop.
+    }
+}
 
+/// Owning wrapper for a `pidfd`, so it is closed on every path out of a scope.
+struct OwnedPidFd(RawFd);
+
+impl Drop for OwnedPidFd {
+    fn drop(&mut self) {
+        // SAFETY: self.0 came from pidfd_open and is owned exclusively by this value.
         unsafe {
-            let _ = libc::close(fd);
+            let _ = libc::close(self.0);
         }
     }
 }
@@ -445,6 +457,121 @@ pub(crate) fn resolve_device_major_minor(path: &Path) -> anyhow::Result<(u32, u3
     Ok((maj, min))
 }
 
+/// Target credentials for a spawned service, fully resolved in the parent so the
+/// child's `pre_exec` only has to make bare syscalls.
+#[derive(Debug, Clone)]
+struct ResolvedCreds {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    /// Supplementary groups to install with `setgroups(2)`.
+    groups: Vec<libc::gid_t>,
+}
+
+/// Resolve `user`/`group` names to numeric ids plus the supplementary group list.
+///
+/// Accepts either a name or a numeric id, matching what the provisioning code accepts.
+/// If only `user` is given, the group defaults to that user's primary gid — running as
+/// a named user while retaining gid 0 is never what the operator meant.
+fn resolve_credentials(
+    user: Option<&str>,
+    group: Option<&str>,
+) -> anyhow::Result<Option<ResolvedCreds>> {
+    // Normalize before deciding whether anything was requested: an empty or
+    // whitespace-only value in YAML means "unset", not "a user named ''".
+    let user = user.map(str::trim).filter(|s| !s.is_empty());
+    let group = group.map(str::trim).filter(|s| !s.is_empty());
+    if user.is_none() && group.is_none() {
+        return Ok(None);
+    }
+
+    let (uid, primary_gid, uname) = match user {
+        None => (None, None, None),
+        Some(u) => {
+            if let Ok(raw) = u.parse::<libc::uid_t>() {
+                let name = users::get_user_by_uid(raw).map(|e| e.name().to_string_lossy().to_string());
+                let gid = users::get_user_by_uid(raw).map(|e| e.primary_group_id());
+                (Some(raw), gid, name)
+            } else {
+                let e = users::get_user_by_name(u)
+                    .ok_or_else(|| anyhow::anyhow!("user not found: {u}"))?;
+                (Some(e.uid()), Some(e.primary_group_id()), Some(u.to_string()))
+            }
+        }
+    };
+
+    let gid = match group {
+        Some(g) => {
+            if let Ok(raw) = g.parse::<libc::gid_t>() {
+                Some(raw)
+            } else {
+                Some(
+                    users::get_group_by_name(g)
+                        .ok_or_else(|| anyhow::anyhow!("group not found: {g}"))?
+                        .gid(),
+                )
+            }
+        }
+        // No explicit group: fall back to the user's primary group rather than
+        // leaving the child with the daemon's gid (root).
+        None => primary_gid,
+    };
+
+    let (Some(uid), Some(gid)) = (uid, gid) else {
+        anyhow::bail!(
+            "process.group is set without process.user; specify both (or neither) so the \
+             privilege drop is unambiguous"
+        );
+    };
+
+    // Supplementary groups the target user legitimately belongs to. Anything not in
+    // this list is dropped, which is the entire point of calling setgroups.
+    //
+    // Deliberately NOT users::get_user_groups: that crate (0.11, unmaintained) returns
+    // a trailing bogus entry — on this host it reports `nobody` as belonging to
+    // gid 0 — which would hand every "unprivileged" service the root group and quietly
+    // undo the privilege drop. Ask libc directly.
+    let mut groups: Vec<libc::gid_t> = match uname.as_deref() {
+        Some(n) => supplementary_groups(n, gid)?,
+        None => Vec::new(),
+    };
+    if !groups.contains(&gid) {
+        groups.push(gid);
+    }
+    groups.sort_unstable();
+    groups.dedup();
+
+    Ok(Some(ResolvedCreds { uid, gid, groups }))
+}
+
+/// The group list `getgrouplist(3)` reports for `username`, seeded with `gid`.
+fn supplementary_groups(username: &str, gid: libc::gid_t) -> anyhow::Result<Vec<libc::gid_t>> {
+    let cname = std::ffi::CString::new(username)
+        .map_err(|_| anyhow::anyhow!("user name contains an interior NUL byte"))?;
+
+    // getgrouplist returns -1 when the buffer is too small, writing the required
+    // length back through `ngroups`. Retry once at the reported size; the bound stops
+    // a misbehaving libc from looping forever.
+    let mut ngroups: libc::c_int = 32;
+    for _ in 0..3 {
+        let mut buf: Vec<libc::gid_t> = vec![0; ngroups.max(1) as usize];
+        // SAFETY: cname is NUL-terminated; buf has room for `ngroups` gid_t; ngroups is
+        // a valid out-param. getgrouplist writes at most `ngroups` entries.
+        let rc = unsafe {
+            libc::getgrouplist(cname.as_ptr(), gid, buf.as_mut_ptr(), &mut ngroups)
+        };
+        if rc >= 0 {
+            let n = (rc as usize).min(buf.len());
+            buf.truncate(n);
+            return Ok(buf);
+        }
+        anyhow::ensure!(
+            ngroups > 0 && ngroups <= 65_536,
+            "getgrouplist reported an implausible group count ({ngroups}) for {username:?}"
+        );
+    }
+    anyhow::bail!("could not determine supplementary groups for {username:?}")
+}
+
 fn decorate_argv0(program: &OsString, group: &str) -> OsString {
     let base = program.to_string_lossy();
     let basename = base.rsplit('/').next().unwrap_or(&base);
@@ -481,8 +608,12 @@ pub(crate) fn build_command(p: &LaunchParams) -> anyhow::Result<Command> {
     }
 
     let cgroup_procs = attach_cgroup_dir.join("cgroup.procs");
-    let user = p.user.clone();
-    let group = p.group.clone();
+
+    // Resolve credentials HERE, in the parent. getpwnam/getgrnam allocate, take glibc
+    // locks and may dlopen NSS modules — none of which is async-signal-safe, so doing
+    // it between fork and exec in a multi-threaded process can deadlock the child
+    // forever on a lock held by a thread that does not exist post-fork.
+    let creds = resolve_credentials(p.user.as_deref(), p.group.as_deref())?;
 
     // Preflight in parent: ensure we can at least open cgroup.procs for write.
     // This does NOT move the parent into the cgroup (only writing a pid would).
@@ -509,20 +640,34 @@ pub(crate) fn build_command(p: &LaunchParams) -> anyhow::Result<Command> {
             let mut f = std::fs::OpenOptions::new().write(true).open(&cgroup_procs)?;
             f.write_all(b"0\n")?;
 
-            // Drop privileges if requested.
-            if let Some(gname) = group.as_deref() {
-                let g = users::get_group_by_name(gname)
-                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("group not found: {gname}")))?;
-                let gid = nix::unistd::Gid::from_raw(g.gid());
-                nix::unistd::setgid(gid)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("setgid({gname}) failed: {e}")))?;
-            }
-            if let Some(uname) = user.as_deref() {
-                let u = users::get_user_by_name(uname)
-                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("user not found: {uname}")))?;
-                let uid = nix::unistd::Uid::from_raw(u.uid());
-                nix::unistd::setuid(uid)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("setuid({uname}) failed: {e}")))?;
+            // Drop privileges if requested. Everything below is a bare syscall: no
+            // allocation, no locks, no NSS. Errors return the raw errno so the parent
+            // receives something meaningful from pre_exec.
+            if let Some(c) = creds.as_ref() {
+                // Order matters and is not optional:
+                //   setgroups -> setgid -> setuid
+                // setuid() drops the ability to do the other two, and neither setgid()
+                // nor setuid() clears the supplementary group list. Skipping setgroups
+                // leaves the child in root's groups (docker, disk, adm, ...), which
+                // defeats the whole point of running the service as another user.
+                if libc::setgroups(c.groups.len(), c.groups.as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setgid(c.gid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setuid(c.uid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Verify the drop actually happened rather than trusting the return
+                // codes; a silent failure here would run the service as root.
+                if libc::getuid() != c.uid
+                    || libc::geteuid() != c.uid
+                    || libc::getgid() != c.gid
+                    || libc::getegid() != c.gid
+                {
+                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                }
             }
             Ok(())
         });
@@ -717,3 +862,122 @@ pub(crate) fn read_resource_snapshot(cgroup_dir: &Path) -> anyhow::Result<Cgroup
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn io_not_found_is_detected_through_context_layers() {
+        // kill_all_pids treats "cgroup is already gone" as success. That branch was
+        // dead for a long time because the io::Error had been formatted into a string,
+        // so it could no longer be downcast. Keep it recoverable however deeply the
+        // error gets wrapped.
+        let base = io::Error::from(io::ErrorKind::NotFound);
+        let e = anyhow::Error::new(base).context("open for write /x failed");
+        assert!(is_io_not_found(&e));
+
+        let deep = e.context("kill all via /x").context("stopping service");
+        assert!(is_io_not_found(&deep));
+    }
+
+    #[test]
+    fn other_io_errors_are_not_mistaken_for_not_found() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::Other,
+        ] {
+            let e = anyhow::Error::new(io::Error::from(kind)).context("ctx");
+            assert!(!is_io_not_found(&e), "{kind:?} must not read as NotFound");
+        }
+        assert!(!is_io_not_found(&anyhow::anyhow!("a plain string error")));
+    }
+
+    #[test]
+    fn write_file_preserves_the_underlying_errno() {
+        // The whole point of the change above: callers must still be able to tell
+        // ENOENT from EACCES after write_file has added its context.
+        let missing = Path::new("/definitely/not/a/real/cgroup/path/cgroup.kill");
+        let err = write_file(missing, "1\n").expect_err("must fail");
+        assert!(
+            is_io_not_found(&err),
+            "expected a recoverable NotFound, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn resolving_no_credentials_is_a_no_op() {
+        // Neither user nor group configured: the child keeps the daemon's identity and
+        // no setgroups/setgid/setuid is attempted.
+        assert!(resolve_credentials(None, None).unwrap().is_none());
+        assert!(resolve_credentials(Some(""), None).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolving_root_yields_a_complete_credential_set() {
+        // root exists everywhere this daemon runs.
+        let c = resolve_credentials(Some("root"), None)
+            .expect("root resolves")
+            .expect("some credentials");
+        assert_eq!(c.uid, 0);
+        // A group must always be derived, even when only `user` was configured --
+        // otherwise the child would setuid() while retaining gid 0.
+        assert!(
+            c.groups.contains(&c.gid),
+            "supplementary list must include the primary gid"
+        );
+        assert!(!c.groups.is_empty(), "setgroups() needs an explicit list");
+    }
+
+    #[test]
+    fn supplementary_groups_do_not_include_root_for_an_unprivileged_user() {
+        // Security regression, and a real one: users-0.11's get_user_groups reports a
+        // trailing gid 0 for `nobody`, so feeding its output to setgroups() left every
+        // "unprivileged" service in the root group. getgrouplist(3) must not.
+        let gid = match users::get_user_by_name("nobody") {
+            Some(u) => u.primary_group_id(),
+            None => return, // no `nobody` on this host; nothing to assert
+        };
+        let groups = supplementary_groups("nobody", gid).expect("getgrouplist works");
+        assert!(
+            !groups.contains(&0),
+            "nobody must not be placed in the root group; got {groups:?}"
+        );
+        assert!(groups.contains(&gid), "the primary gid should be present");
+    }
+
+    #[test]
+    fn resolved_credentials_for_nobody_exclude_root() {
+        if users::get_user_by_name("nobody").is_none() {
+            return;
+        }
+        let c = resolve_credentials(Some("nobody"), None)
+            .expect("resolves")
+            .expect("some credentials");
+        assert_ne!(c.uid, 0);
+        assert_ne!(c.gid, 0);
+        assert!(
+            !c.groups.contains(&0),
+            "root group leaked into the drop list: {:?}",
+            c.groups
+        );
+    }
+
+    #[test]
+    fn resolving_accepts_numeric_ids() {
+        let c = resolve_credentials(Some("0"), Some("0"))
+            .expect("numeric ids resolve")
+            .expect("some credentials");
+        assert_eq!((c.uid, c.gid), (0, 0));
+    }
+
+    #[test]
+    fn resolving_reports_unknown_names() {
+        assert!(resolve_credentials(Some("no-such-user-here-9c1f"), None).is_err());
+        assert!(resolve_credentials(Some("root"), Some("no-such-group-9c1f")).is_err());
+        // A group without a user is ambiguous and must be refused rather than
+        // silently running as the daemon's uid.
+        assert!(resolve_credentials(None, Some("root")).is_err());
+    }
+}

@@ -1,2 +1,11 @@
 /target
 /dist
+
+# Daemon-generated runtime state and captured output.
+*.log
+appstate.json
+
+# Auto-generated TLS material for the web console.
+ca.pem
+server.pem
+server.key
