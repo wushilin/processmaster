@@ -24,8 +24,8 @@ Issues 3, 4, 5, and 6 all cross boundary 1, which is the weakest area of the cod
 | Critical | 6 |
 | High | 11 |
 | Medium | 14 |
-| Low | 11 |
-| **Total (safety)** | **42** |
+| Low | 12 |
+| **Total (safety)** | **43** |
 | Cleanliness / maintainability | 10 themes — see [Part 2](#part-2--code-cleanliness) |
 | Architecture / modularity / efficiency | 12 themes — see [Part 3](#part-3--architecture-modularity-and-efficiency) |
 | **Test coverage** | was **0%**; now 58 tests. See [A11](#a11-test-architecture--the-coverage-gap) |
@@ -510,6 +510,30 @@ Failed logins are not recorded, and successful `/rpc` calls carry no identity �
 
 ### 41. LOW — File-descriptor leak on the error path of `wait_all_cancellable`  **[FIXED]**
 **`src/pm/cgroup.rs:318-319.`** `wait_pidfd(fd, CANCEL_POLL_MS).with_context(...)?` returns early **without closing `fd`**. The cancellation and success paths both close it correctly (`:315`, `:325`); only the error path leaks. A `poll()` failure other than EINTR (EINVAL, ENOMEM) leaks one fd per stop attempt, and repeated failures exhaust the daemon's fd table — which in turn triggers Issues 10 and 29. **Fix:** wrap the raw fd in an `OwnedFd` so it closes on drop.
+
+### 43. LOW — Captured service logs are created world-readable
+
+**`src/pm/daemon.rs`** — `open_append_log_async`, reached from the log pumps at `:4866`/`:4869`.
+
+Services get a pipe (`cmd.stdout(Stdio::piped())`, `:4840-4841`) and the **daemon** writes
+the log file, so the file is created by root. That part is deliberate and desirable: the
+service cannot truncate or rewrite its own audit trail, and root ownership is retained on
+purpose.
+
+The *mode* is the issue. The daemon never calls `umask()` anywhere in `src/`, so files land
+at `0666 & ~umask` — 0644 under the usual systemd umask 022.
+
+**Failure scenario:** a service prints a connection string, bearer token, or debug dump of
+its configuration to stdout. Every local user on the host can read it out of
+`logs/stdout.log`, including the other, less-trusted services this daemon supervises.
+Observed directly: a service running as `nobody` had its captured logs created `root:root`
+mode `-rw-r--r--`.
+
+**Fix:** create captured log files with an explicit restrictive mode (`OpenOptionsExt::mode`)
+or set `umask(0027)` for the daemon, and document the resulting mode so operators who *want*
+group-readable logs can opt in. Note this is the same missing-umask root cause as
+[Issue 19](#19-medium--tls-private-key-written-world-readable-then-chmodd-failure-discarded)
+and [Issue 20](#20-medium--default-control-socket-in-world-writable-tmp).
 
 ### 42. LOW — Documented `global.user`/`global.group` do not exist and would break startup  **[FIXED]**
 **`config.yaml:35-37`** documents:
