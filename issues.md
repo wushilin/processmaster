@@ -22,10 +22,10 @@ Issues 3, 4, 5, and 6 all cross boundary 1, which is the weakest area of the cod
 | Severity | Count |
 |---|---|
 | Critical | 6 |
-| High | 11 |
+| High | 12 |
 | Medium | 14 |
 | Low | 12 |
-| **Total (safety)** | **43** |
+| **Total (safety)** | **44** |
 | Cleanliness / maintainability | 10 themes — see [Part 2](#part-2--code-cleanliness) |
 | Architecture / modularity / efficiency | 12 themes — see [Part 3](#part-3--architecture-modularity-and-efficiency) |
 | **Test coverage** | was **0%**; now 58 tests. See [A11](#a11-test-architecture--the-coverage-gap) |
@@ -117,7 +117,7 @@ No `O_NOFOLLOW`, no fd anchoring, no containment check, and `create_dir_all(pare
 
 **Fix:** open log files with `O_NOFOLLOW`, ideally via `openat` relative to an `O_PATH` fd for the log directory; reject absolute or `..`-escaping log paths unless explicitly opted in; verify with `fstat` that the opened file is a regular file.
 
-### 4. CRITICAL — Provisioning `chown`/`chmod`/`setcap` follow symlinks on the target
+### 4. CRITICAL — Provisioning `chown`/`chmod`/`setcap` follow symlinks on the target  **[FIXED]**
 
 **`src/pm/daemon.rs:4869`** (target resolution), **`:4920`** (`chown`), **`:4935`** (`set_permissions`), **`:4948-4950`** (`setcap`), **`:4986`** (`chown_recursive` root).
 
@@ -202,7 +202,7 @@ There is also no range validation: `mode: 2500` → `0o4704` sets **setuid** on 
 
 **Fix:** parse numeric modes as octal digits, or reject non-string modes with an error telling the operator to quote the value. Reject modes `> 0o777` unless setuid/setgid/sticky is explicitly intended. Warn at startup if the resulting socket mode grants non-owner write. Fix `examples/config.yaml:12` and the README.
 
-### 9. HIGH — Global `waitpid(-1)` reaper races every `Child::wait`/`try_wait`
+### 9. HIGH — Global `waitpid(-1)` reaper races every `Child::wait`/`try_wait`  **[FIXED]**
 
 **`src/pm/daemon.rs:2286-2299`** (started unconditionally at `:877`), racing **`:5640`** (`try_wait` for `stop_command`) and **`:6825`** (`child.wait()` in the per-app waiter thread).
 
@@ -256,7 +256,7 @@ The daemon uses one shared multi-thread runtime (`daemon.rs:777`) for both the w
 
 **Fix:** wrap the verify in `spawn_blocking`, add a per-IP failed-attempt limiter with backoff, and bound verification concurrency with a semaphore.
 
-### 13. HIGH — Children inherit the root daemon's entire environment
+### 13. HIGH — Children inherit the root daemon's entire environment  **[FIXED]**
 
 **`src/pm/cgroup.rs:475-477`** — `for (k, v) in &p.environment { cmd.env(k, v); }`, with no `cmd.env_clear()` anywhere in the repo.
 
@@ -266,7 +266,7 @@ The daemon uses one shared multi-thread runtime (`daemon.rs:777`) for both the w
 
 **Fix:** call `cmd.env_clear()` before the `.env()` loop and set an explicit minimal base (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`) derived from the resolved target user. Require `start_command[0]` to be absolute.
 
-### 14. HIGH — `logs -f` sessions pin the blocking pool
+### 14. HIGH — `logs -f` sessions pin the blocking pool  **[FIXED]**
 
 **`src/pm/daemon.rs:2368-2377`**, **`:3041-3110`**, runtime builder at **`:777-780`**.
 
@@ -290,7 +290,7 @@ No length limit, no read timeout, and the accept loop spawns one task per connec
 
 **Fix:** `AsyncBufReadExt::take(MAX_REQ_BYTES)` (e.g. 1 MiB) before `read_line`, plus a read timeout and a `Semaphore` on the accept loop.
 
-### 16. HIGH — Credentials sent in cleartext by default
+### 16. HIGH — Credentials sent in cleartext by default  **[FIXED]**
 
 **`src/pm/config.rs:211-222`** (`tls.enabled: false`), **`:276`** (`bind: 0.0.0.0`), **`web_console.rs:1257-1266`** (plain TCP path), **`:316-318`** (`Secure` omitted when TLS is off).
 
@@ -345,7 +345,7 @@ The daemon never calls `umask()`, so under the usual systemd umask 022 the compl
 
 **Fix:** create with `OpenOptions::new().write(true).create_new(true).mode(0o600)` so the key is never world-readable at any instant, and propagate permission errors.
 
-### 20. MEDIUM — Default control socket in world-writable `/tmp`
+### 20. MEDIUM — Default control socket in world-writable `/tmp`  **[FIXED]**
 
 **`src/pm/config.rs:260-262`** (`/tmp/processmaster.sock`), created at **`daemon.rs:2302-2325`**/**`:795`**, permissions applied only *after* bind at **`:802`** → `apply_socket_settings` (`:2097-2101`).
 
@@ -355,7 +355,7 @@ The daemon never calls `umask()`, so under the usual systemd umask 022 the compl
 
 **Fix:** default to `/run/processmaster/processmaster.sock` with a root-owned `0700` parent; `umask(0177)` around the bind; refuse to start if the socket's parent directory is writable by non-root.
 
-### 21. MEDIUM — `@file://` env indirection: unbounded read on non-regular files
+### 21. MEDIUM — `@file://` env indirection: unbounded read on non-regular files  **[FIXED]**
 
 **`src/pm/daemon.rs:4737-4750`**, called from `:5586-5591`.
 
@@ -367,7 +367,7 @@ Separately by design: the read happens as root with no path restriction and the 
 
 **Fix:** reject non-regular files up front and enforce the cap *during* the read (`File::open(...).take(MAX_ENV_FILE_BYTES)`) rather than trusting a prior `metadata` call.
 
-### 22. MEDIUM — `logs.hints` is an arbitrary root file-read primitive exposed over RPC and the web console
+### 22. MEDIUM — `logs.hints` is an arbitrary root file-read primitive exposed over RPC and the web console  **[FIXED]**
 
 **`src/pm/app.rs:466-468`** (no validation) → **`daemon.rs:2860-2862`** (`do_logs`) and **`:2957-2959`** (`handle_logs_follow`), both via `resolve_under_workdir`, which permits absolute paths.
 
@@ -375,7 +375,7 @@ Separately by design: the read happens as root with no path restriction and the 
 
 **Fix:** constrain hint paths to `working_directory` (canonicalize and verify the prefix), or drop paths not readable by the service's own uid.
 
-### 23. MEDIUM — `PerfMetrics` accepts an unvalidated remote-supplied name
+### 23. MEDIUM — `PerfMetrics` accepts an unvalidated remote-supplied name  **[FIXED]**
 
 **`src/pm/daemon.rs:2490-2497`.**
 
@@ -383,7 +383,7 @@ Unlike `Stop`/`Start`/`Logs`/`Status`, which resolve through `resolve_targets` o
 
 **Fix:** resolve the name against `st.defs` before constructing the path, and apply the containment check from Issue 5.
 
-### 24. MEDIUM — `.pm_provisioned` marker write follows symlinks
+### 24. MEDIUM — `.pm_provisioned` marker write follows symlinks  **[FIXED]**
 
 **`src/pm/daemon.rs:4825-4826`** (`marker.exists()` follows symlinks) and **`:4970-4974`** (`fs::write`).
 
@@ -391,7 +391,7 @@ Unlike `Stop`/`Start`/`Logs`/`Status`, which resolve through `resolve_targets` o
 
 **Fix:** create the marker with `O_CREAT|O_EXCL|O_NOFOLLOW` and treat "marker is a symlink" as a hard provisioning failure.
 
-### 25. MEDIUM — `.regen_pm_config` regeneration writes without `O_NOFOLLOW`/`O_EXCL`
+### 25. MEDIUM — `.regen_pm_config` regeneration writes without `O_NOFOLLOW`/`O_EXCL`  **[FIXED]**
 
 **`src/pm/daemon.rs:7230-7341`**, rename at **`:7255`**, open at **`:7293-7298`**.
 
@@ -401,7 +401,7 @@ The rename to `service.yml.bak` is safe (rename operates on the link itself), bu
 
 **Fix:** write to a temp file in the same directory with `O_EXCL`, then `rename` into place; open with `O_NOFOLLOW` and refuse if `service.yml` is a symlink.
 
-### 26. MEDIUM — TOCTOU in `chown_recursive`'s walk
+### 26. MEDIUM — TOCTOU in `chown_recursive`'s walk  **[FIXED]**
 
 **`src/pm/daemon.rs:4991-5006`.**
 
@@ -417,7 +417,7 @@ The lstat-then-chown-by-path pattern is racy — the chown is not anchored to th
 
 **Fix:** walk with `openat`/`O_NOFOLLOW` directory fds and use `fchownat(dirfd, name, ..., AT_SYMLINK_NOFOLLOW)`. Never re-resolve a path after checking it.
 
-### 27. MEDIUM — PID-reuse race in `kill_with_signal`
+### 27. MEDIUM — PID-reuse race in `kill_with_signal`  **[FIXED]**
 
 **`src/pm/cgroup.rs:193-201`.**
 
@@ -443,7 +443,7 @@ if let Some(ioe) = e.downcast_ref::<io::Error>() && ioe.kind() == io::ErrorKind:
 
 **Fix:** return the `io::Error` (or `anyhow::Error::new(e).context(...)`) so `downcast_ref` works.
 
-### 29. MEDIUM — cgroup waiter reports a live service as exited when the read errors
+### 29. MEDIUM — cgroup waiter reports a live service as exited when the read errors  **[FIXED]**
 
 **`src/pm/daemon.rs:6798-6811`**, **`cgroup.rs:292-329`.**
 
@@ -469,7 +469,7 @@ An unknown username returns in microseconds; a known username with a wrong passw
 
 *Note:* the username itself is a `HashMap` lookup (SipHash with a per-process random key), not a byte comparison, so it is not a practical byte-level timing oracle. The leak is the early return.
 
-### 31. MEDIUM — No authentication or authorization audit trail
+### 31. MEDIUM — No authentication or authorization audit trail  **[FIXED]**
 
 **`src/pm/web_console.rs`** — `pm_event` appears only at `:87`, `:99`, `:118`, `:1248`, `:1290`, `:1398` (startup/shutdown/TLS), never in `basic_auth_middleware` or `jsonrpc`.
 
@@ -481,37 +481,37 @@ Failed logins are not recorded, and successful `/rpc` calls carry no identity �
 
 ## Low
 
-### 32. LOW — Plaintext passwords retained in root process memory indefinitely
+### 32. LOW — Plaintext passwords retained in root process memory indefinitely  **[FIXED]**
 **`src/pm/web_console.rs:36-71`.** `AuthCache` stores `(expected_hash, plaintext_password)` for up to 1024 entries, never expired and never zeroized. The code comment acknowledges the tradeoff, but it converts any root-process memory disclosure — a core dump, a `/proc/pid/mem` read, hibernation to unencrypted swap — into credential disclosure, recoverable weeks later. **Fix:** cache a keyed HMAC of the password rather than the plaintext, wrap in a zeroizing type, add a TTL, and set `RLIMIT_CORE = 0`.
 
-### 33. LOW — Auto-generated certificate: 20-year validity, `CN=test`, no SAN for the bind address
+### 33. LOW — Auto-generated certificate: 20-year validity, `CN=test`, no SAN for the bind address  **[FIXED]**
 **`src/pm/web_console.rs:1302`, `:1330-1346`, `:1362-1366`.** A leaked key is valid for two decades with no revocation path — the CA key is generated at `:1310` and discarded, so no CRL/OCSP and no ability to issue a replacement. With `bind = 0.0.0.0`, remote operators connecting by hostname get a name mismatch unless `client_host` was set, training them to click through TLS warnings and re-opening MITM on the Basic credentials. **Fix:** cap validity near 397 days with regeneration on expiry, persist the CA key at 0600, derive SANs from the bind address/hostname, and warn loudly when the cert cannot cover the bind address.
 
-### 34. LOW — `pmctl password` exposes secrets via argv and echoes stdin
+### 34. LOW — `pmctl password` exposes secrets via argv and echoes stdin  **[FIXED]**
 **`src/pm/cli.rs:117-144`, `pmctl_cli.rs:65-78`.** `--password <value>` and `--secure <user:hash>` are ordinary clap args, so cleartext passwords and credential hashes land in world-readable `/proc/<pid>/cmdline` and shell history. The `-`/stdin fallback uses `read_line` without disabling terminal echo, so an interactively typed password is printed to screen and scrollback. **Fix:** drop the value form of `--password` in favour of stdin/`--password-file`, and clear `ECHO` when reading from a tty.
 
-### 35. LOW — `password verify` leaks user-vs-password distinction, and echoes the credential on parse error
+### 35. LOW — `password verify` leaks user-vs-password distinction, and echoes the credential on parse error  **[FIXED]**
 **`src/pm/pmctl_cli.rs:108-123`** — the username is compared with a short-circuiting `!=` and, on mismatch, exits without running bcrypt, giving the same timing oracle as Issue 30. **`:97-99`** — `anyhow!("invalid --secure entry (missing ':'): {t:?}")` prints the entire credential entry to stderr, which lands in CI logs and journald. **Fix:** always run bcrypt against a stored or dummy hash; never echo the value.
 
-### 36. LOW — Client-side `read_line` is likewise unbounded
+### 36. LOW — Client-side `read_line` is likewise unbounded  **[FIXED]**
 **`src/pm/rpc.rs:478-484`, `:510-530`.** `client_call`/`client_follow` read responses into an unbounded `String`. A hostile daemon — or an impostor socket at a path passed via `PMCTL_SOCK`, which is honoured with no ownership check (`pmctl_cli.rs:22-27`) — drives `pmctl` to OOM. **Fix:** `reader.take(MAX_RESP_BYTES)`.
 
-### 37. LOW — `kill_orphan_pids_in_cgroup_procs_file` signals stale pids across a 300 ms sleep
+### 37. LOW — `kill_orphan_pids_in_cgroup_procs_file` signals stale pids across a 300 ms sleep  **[FIXED]**
 **`src/pm/daemon.rs:1935-1996`.** Pids are read once (`:1941`), SIGTERM'd (`:1982`), then after a 300 ms sleep the **same stale list** is SIGKILL'd (`:1986`) with no re-read. If an orphan exits promptly and the kernel recycles its pid within the window, root SIGKILLs an unrelated process. Bounded impact — this runs only at startup against a cgroup that should be empty. **Fix:** re-read `cgroup.procs` before the SIGKILL pass, or use `cgroup.kill` here too.
 
 ### 38. LOW — Service children inherit the daemon's stdin  **[FIXED]**
 **`src/pm/daemon.rs:4786-4793`** sets `stdout`/`stderr` to `piped()` but never sets `stdin`, so fd 0 is inherited. The other two spawn sites do this correctly (`:2730`, `:5614` use `Stdio::null()`). `setsid()` detaches the session but does not close the fd. **Fix:** add `cmd.stdin(Stdio::null())`.
 
-### 39. LOW — `set_enabled_in_yaml` read/modify/write follows symlinks
+### 39. LOW — `set_enabled_in_yaml` read/modify/write follows symlinks  **[FIXED]**
 **`src/pm/daemon.rs:2819-2846`.** `read_to_string` + `write` on `def.source_file` with no symlink check. Exploitation is constrained because the target must parse as a YAML mapping, but pointing an auto-service `service.yml` at, say, `/etc/netplan/50-cloud-init.yaml` means `pmctl disable <app>` makes root reserialize and inject `global.enabled` into that file. **Fix:** `O_NOFOLLOW` on read and write; write via temp file + rename.
 
-### 40. LOW — Predictable appstate temp filename
+### 40. LOW — Predictable appstate temp filename  **[FIXED]**
 **`src/pm/daemon.rs:1623-1626`.** `.appstate.json.tmp.<pid>` is written with `fs::write` (follows symlinks) then renamed. If `config_directory` is ever not root-exclusive, a pre-planted symlink at the predictable name redirects the write. **Fix:** `O_CREAT|O_EXCL|O_NOFOLLOW` with a random suffix, and `fsync` before rename.
 
 ### 41. LOW — File-descriptor leak on the error path of `wait_all_cancellable`  **[FIXED]**
 **`src/pm/cgroup.rs:318-319.`** `wait_pidfd(fd, CANCEL_POLL_MS).with_context(...)?` returns early **without closing `fd`**. The cancellation and success paths both close it correctly (`:315`, `:325`); only the error path leaks. A `poll()` failure other than EINTR (EINVAL, ENOMEM) leaks one fd per stop attempt, and repeated failures exhaust the daemon's fd table — which in turn triggers Issues 10 and 29. **Fix:** wrap the raw fd in an `OwnedFd` so it closes on drop.
 
-### 43. LOW — Captured service logs are created world-readable
+### 43. LOW — Captured service logs are created world-readable  **[FIXED]**
 
 **`src/pm/daemon.rs`** — `open_append_log_async`, reached from the log pumps at `:4866`/`:4869`.
 
@@ -543,6 +543,48 @@ and [Issue 20](#20-medium--default-control-socket-in-world-writable-tmp).
   # group: somegroup
 ```
 But `GlobalConfigFile` (`config.rs:122-134`) has only `config_directory`, `auto_service_directory`, `default_service_user`, and `default_service_group`, and is `#[serde(deny_unknown_fields)]`. Uncommenting those lines makes the daemon **fail to start** with an unknown-field error. The daemon also hard-requires root (`daemon.rs:787`), so the described feature does not exist at all. **Fix:** delete the comment, or implement the feature.
+
+### 44. HIGH — `systemctl stop` does not stop the daemon  **[PARTIALLY FIXED — repo side]**
+
+**Deployment/packaging, not a source file.** Found while deploying to a real host.
+
+The daemon moves itself into its own cgroup at startup (`setup_master_cgroup_or_instructions`,
+`daemon.rs:809`), leaving the systemd unit's cgroup. With the default
+`KillMode=control-group`, `systemctl stop` kills only what remains in the *unit's*
+cgroup — which, when the unit's `ExecStart` is a wrapper script that runs the daemon as
+a child rather than `exec`ing it, is just the wrapper shell.
+
+**Observed on a live host:** `systemctl stop processmaster` returned success, the unit
+went inactive, and the daemon kept running — `readlink /proc/<pid>/exe` showed
+`/usr/local/sbin/processmaster (deleted)`, i.e. it was still executing a binary that had
+been replaced weeks earlier. Every deploy had silently left the old daemon in place
+until the next reboot. The next `systemctl start` then fails, because the orphan still
+owns the control socket and `prepare_socket` correctly refuses to start a second daemon.
+
+**Failure scenario:** an operator follows the documented upgrade procedure (stop,
+replace binary, start). The stop appears to succeed, the new unit fails to bind, and the
+host is left running the *old* code with the unit reporting failure — or, if the unit is
+`Restart=on-failure`, flapping.
+
+**Status:** the repo-side parts are done — `run.sh` now `exec`s instead of spawning a
+child, and the README documents the cgroup self-migration, adds `TimeoutStopSec`, and
+gives an upgrade recipe that verifies the daemon actually exited. What remains is
+operational: existing installs still carry their old wrapper script and unit file, so
+each host needs its `run.sh`/unit updated once.
+
+**Fix (all three, they are complementary):**
+- `exec` the daemon from any wrapper script (`exec processmaster -c config.yaml`) so
+  systemd's main PID is the daemon itself rather than a shell.
+- Ship a unit that does not depend on cgroup-based killing for the daemon:
+  `KillMode=mixed` (SIGTERM to the main PID) plus a generous `TimeoutStopSec`, so the
+  daemon's own graceful shutdown path runs and stops the supervised services.
+- Document, in the README's systemd section, that `processmaster` self-migrates out of
+  the unit cgroup, and give an upgrade recipe that verifies the daemon actually exited
+  (`pgrep -x processmaster`) before replacing the binary.
+
+Worth noting the daemon's graceful shutdown itself is fine: a direct `SIGTERM` to the
+daemon stopped all supervised services cleanly and released the socket. The defect is
+purely that systemd never delivers that signal.
 
 ---
 

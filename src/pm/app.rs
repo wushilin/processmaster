@@ -231,6 +231,15 @@ pub struct AppDefinition {
     #[serde(default)]
     pub environment: Vec<EnvironmentVar>,
 
+    /// Inherit the daemon's own environment instead of starting from a minimal base.
+    ///
+    /// Default false. Services normally get only PATH/HOME/USER/LOGNAME/SHELL plus
+    /// whatever `environment:` declares, so secrets in the daemon's environment (systemd
+    /// `Environment=`, an operator's exported tokens) are not handed to every service.
+    /// Set true only for a service that genuinely needs something exported globally.
+    #[serde(default)]
+    pub inherit_environment: bool,
+
     /// Optional restart strategy configuration.
     #[serde(default)]
     pub restart: Option<RestartConfig>,
@@ -504,6 +513,9 @@ pub(crate) struct ProcessSection {
     group: Option<String>,
     #[serde(default)]
     environment: Vec<EnvironmentVar>,
+    /// See `AppDefinition::inherit_environment`.
+    #[serde(default)]
+    inherit_environment: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -843,6 +855,7 @@ impl AppConfigFile {
             alt_log_file_hint: logs.hints,
             start_command,
             environment: self.process.environment,
+            inherit_environment: self.process.inherit_environment,
             restart,
             stop_signal,
             stop_command: self.process.stop_command,

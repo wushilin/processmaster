@@ -199,12 +199,51 @@ ExecStart=/opt/processmaster/processmaster -c /etc/processmaster/config.yaml
 Restart=always
 RestartSec=2
 
-# Let processmaster handle its own children (it uses its own cgroup tree).
+# processmaster manages its own cgroup tree, so systemd must signal the daemon itself
+# rather than trying to kill a cgroup the daemon has already left (see below).
 KillMode=process
+
+# Give the daemon time to stop every supervised service before systemd escalates.
+TimeoutStopSec=90
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+### Important: the main PID must be the daemon
+
+At startup processmaster moves itself into `${cgroup.root}/${cgroup.name}`, leaving the
+systemd unit's own cgroup. One consequence catches people out:
+
+**If `ExecStart` points at a wrapper script that runs processmaster as a child, then
+`systemctl stop` will not stop processmaster.** systemd kills what is in the unit's
+cgroup (or, with `KillMode=process`, only the main PID) — and by then the daemon is in
+neither. The unit goes `inactive`, the daemon keeps running with the old binary, and the
+next `systemctl start` fails because the orphan still holds the control socket.
+
+So either point `ExecStart` straight at the binary, as above, or `exec` from the wrapper:
+
+```sh
+#!/bin/sh
+exec processmaster -c config.yaml   # NOT: processmaster -c config.yaml
+```
+
+When upgrading, verify the daemon actually exited before replacing the binary:
+
+```bash
+sudo systemctl stop processmaster
+# Confirm nothing survived; if it did, signal it directly so it can shut its
+# services down cleanly, and wait for it to go.
+pgrep -x processmaster && sudo pkill -TERM -x processmaster
+while pgrep -x processmaster >/dev/null; do sleep 1; done
+
+sudo install -o root -g root -m 0755 processmaster pmctl /usr/local/sbin/
+sudo systemctl start processmaster
+pmctl server-version   # proves the daemon is the newly deployed build
+```
+
+A direct `SIGTERM` to the daemon is safe: it stops all supervised services, force-kills
+anything left in their cgroups, and releases the socket before exiting.
 
 Then:
 

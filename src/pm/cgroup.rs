@@ -194,11 +194,40 @@ pub(crate) fn kill_all_pids(cgroup_dir: &Path) -> anyhow::Result<()> {
 pub(crate) fn kill_with_signal(cgroup_dir: &Path, signal: Option<Signal>) -> anyhow::Result<usize> {
     let sig = signal.unwrap_or(Signal::SIGTERM);
     let pids = list_pids(cgroup_dir)?;
+    let mut signalled = 0usize;
     for pid in &pids {
+        // Re-check cgroup membership immediately before signalling. Enumerating a large
+        // subtree takes time, and a pid that exits in that window can be recycled by the
+        // kernel for an unrelated process. This runs as root and kill(2) has no cgroup
+        // scoping, so a stale entry would deliver the stop signal to an innocent victim.
+        if !pid_is_in_cgroup(*pid, cgroup_dir) {
+            continue;
+        }
         // Best-effort: ignore ESRCH races (process already exited).
         let _ = kill_pid(Pid::from_raw(*pid as i32), sig);
+        signalled += 1;
     }
-    Ok(pids.len())
+    Ok(signalled)
+}
+
+/// True if `/proc/<pid>/cgroup` still places the process under `cgroup_dir`.
+///
+/// Reads the v2 unified line (`0::/path`) and checks it against the target's path
+/// relative to the cgroup mount root. Fails closed: if anything cannot be determined,
+/// the caller skips the signal rather than risking an unrelated process.
+fn pid_is_in_cgroup(pid: u32, cgroup_dir: &Path) -> bool {
+    const MOUNT_ROOT: &str = "/sys/fs/cgroup";
+    let Ok(target_rel) = cgroup_dir.strip_prefix(MOUNT_ROOT) else {
+        // Non-standard mount point: we cannot compare reliably, so do not guess.
+        return false;
+    };
+    let want = format!("/{}", target_rel.to_string_lossy());
+    let Ok(text) = fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
+        return false; // process is gone, or unreadable
+    };
+    text.lines()
+        .filter_map(|l| l.strip_prefix("0::"))
+        .any(|path| path == want || path.starts_with(&format!("{want}/")))
 }
 
 #[cfg(target_os = "linux")]
@@ -383,6 +412,12 @@ pub(crate) struct LaunchParams {
     /// Linux group to run as (name).
     pub(crate) group: Option<String>,
     pub(crate) environment: Vec<(OsString, OsString)>,
+    /// Opt back in to inheriting the daemon's environment.
+    ///
+    /// Off by default: see the `env_clear` call in `build_command`. Provided because a
+    /// few services legitimately depend on something the operator exports globally, and
+    /// forcing those to re-declare every variable would be worse than letting them say so.
+    pub(crate) inherit_environment: bool,
     pub(crate) resources: Resources,
 }
 
@@ -396,6 +431,7 @@ impl LaunchParams {
             user: None,
             group: None,
             environment: Vec::new(),
+            inherit_environment: false,
             resources: Resources::default(),
         }
     }
@@ -455,6 +491,46 @@ pub(crate) fn resolve_device_major_minor(path: &Path) -> anyhow::Result<(u32, u3
     let maj = libc::major(dev) as u32;
     let min = libc::minor(dev) as u32;
     Ok((maj, min))
+}
+
+/// Look up a user's home directory from the passwd database.
+///
+/// The `users` crate at the pinned version exposes no `home_dir()`, so go to libc.
+/// Called in the parent only — never between fork and exec.
+fn home_dir_of(user: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let cname = std::ffi::CString::new(user).ok()?;
+    // SAFETY: cname is NUL-terminated; the returned passwd is owned by libc and is only
+    // read before the next getpwnam call on this thread.
+    let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
+    if pw.is_null() {
+        return None;
+    }
+    // SAFETY: pw is non-null and points at a valid passwd with a NUL-terminated pw_dir.
+    let dir = unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) };
+    if dir.to_bytes().is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
+}
+
+/// The minimal, explicit environment a supervised service starts with.
+///
+/// Mirrors what systemd gives a unit: enough for a normal program to function, and
+/// nothing inherited from whoever happened to start the daemon. Anything else must be
+/// declared in the service's own `environment:` block, which is the point.
+fn default_service_environment(user: &str) -> Vec<(OsString, OsString)> {
+    let home = home_dir_of(user).unwrap_or_else(|| PathBuf::from("/"));
+    vec![
+        (
+            OsString::from("PATH"),
+            OsString::from("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+        ),
+        (OsString::from("HOME"), home.into_os_string()),
+        (OsString::from("USER"), OsString::from(user)),
+        (OsString::from("LOGNAME"), OsString::from(user)),
+        (OsString::from("SHELL"), OsString::from("/bin/sh")),
+    ]
 }
 
 /// Target credentials for a spawned service, fully resolved in the parent so the
@@ -593,12 +669,35 @@ pub(crate) fn build_command(p: &LaunchParams) -> anyhow::Result<Command> {
     let attach_cgroup_dir = p.cgroup_dir.join("run");
     ensure_dir(&attach_cgroup_dir)?;
 
+    // Identity used for the minimal environment below. With no user configured the
+    // service runs as the daemon's own identity (root).
+    let service_user = p
+        .user
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("root")
+        .to_string();
+
     let program = p.argv[0].clone();
     let mut cmd = Command::new(&program);
     if p.argv.len() > 1 {
         cmd.args(&p.argv[1..]);
     }
     cmd.current_dir(&p.working_directory);
+    if !p.inherit_environment {
+        // std::process::Command starts from the *parent's* environment and .env() only
+        // adds to it, so without this every service inherited the root daemon's
+        // environment: systemd `Environment=` secrets, an operator shell's
+        // AWS_SECRET_ACCESS_KEY / VAULT_TOKEN / KUBECONFIG, and -- in the other
+        // direction -- any LD_PRELOAD or PATH poisoning present when the daemon was
+        // started, which matters because argv[0] is resolved via PATH when it is not
+        // absolute. Start from nothing and supply a documented minimal base instead.
+        cmd.env_clear();
+        for (k, v) in default_service_environment(&service_user) {
+            cmd.env(k, v);
+        }
+    }
     for (k, v) in &p.environment {
         cmd.env(k, v);
     }
@@ -903,6 +1002,65 @@ mod tests {
         assert!(
             is_io_not_found(&err),
             "expected a recoverable NotFound, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn default_service_environment_is_minimal_and_explicit() {
+        // Services must not inherit the root daemon's environment, so the base we hand
+        // them has to be complete enough to be usable on its own.
+        let env = default_service_environment("root");
+        let keys: Vec<String> = env
+            .iter()
+            .map(|(k, _)| k.to_string_lossy().to_string())
+            .collect();
+        for expected in ["PATH", "HOME", "USER", "LOGNAME", "SHELL"] {
+            assert!(keys.contains(&expected.to_string()), "missing {expected}");
+        }
+        // Nothing inherited: no secrets, no proxy vars, no LD_PRELOAD.
+        assert!(!keys.iter().any(|k| k.starts_with("LD_")));
+        assert_eq!(keys.len(), 5, "base env should stay minimal, got {keys:?}");
+    }
+
+    #[test]
+    fn launch_params_do_not_inherit_the_environment_by_default() {
+        let lp = LaunchParams::new(
+            vec!["/bin/true"],
+            PathBuf::from("/tmp"),
+            PathBuf::from("/sys/fs/cgroup/pm-test"),
+        );
+        assert!(
+            !lp.inherit_environment,
+            "inheriting the daemon environment must be opt-in"
+        );
+    }
+
+    #[test]
+    fn pid_cgroup_membership_check_fails_closed() {
+        // A pid that does not exist, and a non-standard mount root, must both read as
+        // "not a member" so callers skip the signal rather than risk an innocent process.
+        assert!(!pid_is_in_cgroup(u32::MAX, Path::new("/sys/fs/cgroup/nope")));
+        assert!(!pid_is_in_cgroup(std::process::id(), Path::new("/not/cgroupfs/x")));
+    }
+
+    #[test]
+    fn pid_cgroup_membership_recognises_our_own_cgroup() {
+        // Whatever cgroup this test process is in, the check must agree.
+        let Ok(text) = std::fs::read_to_string(format!("/proc/{}/cgroup", std::process::id()))
+        else {
+            return;
+        };
+        let Some(rel) = text.lines().find_map(|l| l.strip_prefix("0::")) else {
+            return;
+        };
+        if rel == "/" {
+            return; // cgroup root; nothing meaningful to assert
+        }
+        let dir = PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
+        assert!(
+            pid_is_in_cgroup(std::process::id(), &dir),
+            "our own pid should be reported as a member of {}",
+            dir.display()
         );
     }
 

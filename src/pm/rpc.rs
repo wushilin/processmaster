@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read as _, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use chrono::{Local, TimeZone};
@@ -459,6 +459,10 @@ fn fmt_uptime_ms(ms: i64) -> String {
     }
 }
 
+/// Upper bound on a single response line from the daemon. Real responses are far
+/// smaller; a `status --format json` over many services is still well under this.
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+
 pub fn client_call(sock: &Path, req: Request) -> anyhow::Result<Response> {
     let mut stream = UnixStream::connect(sock).map_err(|e| {
         anyhow::anyhow!(
@@ -475,7 +479,10 @@ pub fn client_call(sock: &Path, req: Request) -> anyhow::Result<Response> {
     stream.write_all(line.as_bytes())?;
     stream.flush()?;
 
-    let mut reader = BufReader::new(stream);
+    // Bound the response like the daemon bounds requests. A hostile or wedged peer --
+    // including an impostor socket pointed at via PMCTL_SOCK, which is accepted with no
+    // ownership check -- could otherwise stream bytes without a newline until pmctl OOMs.
+    let mut reader = BufReader::new(stream).take(MAX_RESPONSE_BYTES);
     let mut resp_line = String::new();
     reader.read_line(&mut resp_line)?;
     if resp_line.trim().is_empty() {
@@ -507,7 +514,7 @@ where
     stream.write_all(line.as_bytes())?;
     stream.flush()?;
 
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream).take(MAX_RESPONSE_BYTES);
     let mut first = String::new();
     reader.read_line(&mut first)?;
     if first.trim().is_empty() {

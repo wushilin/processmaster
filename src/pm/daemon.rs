@@ -776,6 +776,12 @@ pub fn run_daemon(cfg: &MasterConfig) -> anyhow::Result<()> {
     // Keep a sync wrapper for CLI/binary compatibility while we migrate internals to async.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        // Size the blocking pool explicitly rather than inheriting tokio's default of
+        // 512. Every `pmctl logs -f` session parks one of these threads for as long as
+        // the client stays connected, and once the pool is exhausted every other
+        // spawn_blocking call queues forever -- including stops and status. The
+        // semaphore below is the real bound; this just makes the budget visible.
+        .max_blocking_threads(MAX_BLOCKING_THREADS)
         .build()
         .context("build tokio runtime")?;
     rt.block_on(run_daemon_async(cfg.clone()))
@@ -792,8 +798,43 @@ pub async fn run_daemon_async(cfg: MasterConfig) -> anyhow::Result<()> {
 
     let sock = cfg.sock.clone();
     prepare_socket(&sock)?;
-    let listener = TokioUnixListener::bind(&sock)
-        .map_err(|e| anyhow::anyhow!("failed to bind socket {}: {e}", sock.display()))?;
+    // bind() creates the socket with 0777 & ~umask, and the daemon inherits whatever
+    // umask it was started with -- a unit with UMask=0000 would publish a
+    // world-connectable root control socket for the window before the chmod below.
+    // Force a restrictive umask across the bind, then restore it.
+    let listener = {
+        // SAFETY: umask is process-global but this runs during single-threaded startup,
+        // before any worker or supervisor task exists.
+        let prev_umask = unsafe { libc::umask(0o177) };
+        let l = TokioUnixListener::bind(&sock)
+            .map_err(|e| anyhow::anyhow!("failed to bind socket {}: {e}", sock.display()));
+        unsafe {
+            libc::umask(prev_umask);
+        }
+        l?
+    };
+
+    // The socket's permissions are the only access control on the RPC protocol, so a
+    // directory anyone can write is a problem regardless of the socket's own mode: a
+    // local user could unlink and replace it. Warn rather than refuse, since operators
+    // may deliberately use /tmp.
+    if let Some(parent) = sock.parent() {
+        if let Ok(md) = std::fs::metadata(parent) {
+            let mode = std::os::unix::fs::MetadataExt::mode(&md);
+            let world_writable = mode & 0o002 != 0;
+            let sticky = mode & 0o1000 != 0;
+            if world_writable && !sticky {
+                pm_event(
+                    "rpc",
+                    None,
+                    format!(
+                        "WARNING socket directory {} is world-writable without the sticky bit;                          consider unix_socket.path under /run/processmaster",
+                        parent.display()
+                    ),
+                );
+            }
+        }
+    }
 
     let shutting_down = Arc::new(AtomicBool::new(false));
 
@@ -1644,10 +1685,34 @@ fn write_appstate_atomic(path: &Path, run_info: &Arc<Mutex<HashMap<String, RunIn
     };
 
     let json = serde_json::to_vec_pretty(&snapshot)?;
-    let tmp = parent.join(format!(".appstate.json.tmp.{}", std::process::id()));
-    fs::write(&tmp, &json)?;
+    // A predictable temp name in a directory that may not be root-exclusive lets an
+    // attacker pre-plant a symlink there and redirect this write. Randomise the name,
+    // refuse to follow a link, and refuse to reuse an existing file.
+    let mut nonce = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    let tmp = parent.join(format!(
+        ".appstate.json.tmp.{}.{}",
+        std::process::id(),
+        nonce.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    ));
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        f.write_all(&json)?;
+        // Durability: without this the rename can land while the contents have not,
+        // leaving a zero-length appstate after a crash.
+        f.sync_all()?;
+    }
     // Atomic replace on POSIX.
-    fs::rename(&tmp, path)?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -1956,6 +2021,91 @@ fn enable_all_subtree_controllers(parent: &Path) -> anyhow::Result<()> {
     enable_subtree_controllers(parent, &all)
 }
 
+/// Resolve a `logs.hints` entry, refusing anything that escapes the working directory.
+///
+/// Hints are displayed by `pmctl logs` and the web console, and the daemon reads them
+/// as **root**. Without containment, `hints: ["/etc/shadow"]` in any service definition
+/// turns the log viewer into an arbitrary root-file read for every console user.
+/// Absolute paths and `..` traversal are both rejected.
+fn resolve_hint_under_workdir(workdir: &Path, hint: &Path) -> Option<PathBuf> {
+    let candidate = resolve_under_workdir(workdir, hint);
+    // Compare canonical forms so symlinks and `..` cannot smuggle the path outside.
+    // Fall back to the lexical path when the file does not exist yet: a hint may
+    // legitimately point at a log the application has not created.
+    let base = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
+    let resolved = candidate.canonicalize().unwrap_or_else(|_| candidate.clone());
+    if resolved.starts_with(&base) {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+/// Write `contents` to `path` atomically, without ever following a symlink.
+///
+/// Used for operator-facing YAML the daemon rewrites as root inside directories that a
+/// service user may own. Writing to a fresh `O_EXCL|O_NOFOLLOW` temp file and renaming
+/// means a planted symlink is never written through, a partially written file is never
+/// observable, and the rename replaces the directory entry itself rather than whatever
+/// a link happened to point at.
+fn write_yaml_atomically(path: &Path, contents: &str) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut nonce = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    let file_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "out".to_string());
+    let tmp = parent.join(format!(
+        ".{}.tmp.{}.{}",
+        file_name,
+        std::process::id(),
+        nonce.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    ));
+
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(0o644)
+            .open(&tmp)
+            .with_context(|| format!("create temp file {}", tmp.display()))?;
+        f.write_all(contents.as_bytes())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync {}", tmp.display()))?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("rename into {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Read the pids currently listed in a `cgroup.procs` file.
+///
+/// Returns an empty set if the file is gone or unreadable — callers use this to
+/// *narrow* an existing kill list, so failing closed is the safe direction.
+fn read_pids_from_cgroup_procs(cgroup_procs: &Path) -> Vec<i32> {
+    let Ok(text) = fs::read_to_string(cgroup_procs) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| l.trim().parse::<i32>().ok())
+        .filter(|p| *p > 1)
+        .collect()
+}
+
 fn kill_orphan_pids_in_cgroup_procs_file(
     state: Option<&Arc<Mutex<DaemonState>>>,
     component: &str,
@@ -2006,8 +2156,15 @@ fn kill_orphan_pids_in_cgroup_procs_file(
         let _ = kill(Pid::from_raw(*pid), Signal::SIGTERM);
     }
     std::thread::sleep(Duration::from_millis(300));
+    // Re-read the cgroup and only KILL pids that are *still* members. A pid that
+    // exited during the grace window can have been recycled by the kernel, and this
+    // runs as root: the stale entry would send SIGKILL to an unrelated process.
+    let still_present: std::collections::HashSet<i32> =
+        read_pids_from_cgroup_procs(&cgroup_procs).into_iter().collect();
     for pid in &filtered {
-        let _ = kill(Pid::from_raw(*pid), Signal::SIGKILL);
+        if still_present.contains(pid) {
+            let _ = kill(Pid::from_raw(*pid), Signal::SIGKILL);
+        }
     }
 
     let msg2 = format!(
@@ -2307,30 +2464,87 @@ To use cgroups as a non-root user, run the following as root:\n\
     }
 }
 
+/// Size of tokio's blocking pool. Follow sessions park threads here, so this and
+/// [`MAX_CONCURRENT_LOG_FOLLOWS`] together guarantee headroom for supervision work.
+const MAX_BLOCKING_THREADS: usize = 512;
+
+/// Ceiling on simultaneous `pmctl logs -f` sessions. Deliberately a small fraction of
+/// the blocking pool: even a client that opens connections and never reads cannot
+/// starve stops, status or reconciliation.
+const MAX_CONCURRENT_LOG_FOLLOWS: usize = 64;
+
+fn log_follow_semaphore() -> &'static Arc<tokio::sync::Semaphore> {
+    static SEM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LOG_FOLLOWS)))
+}
+
+/// Pids of children the daemon has deliberately disowned (currently only
+/// fire-and-forget admin actions) and which therefore have no `Child` handle left to
+/// reap them.
+///
+/// This registry exists because the reaper must NOT call `waitpid(-1)`. A blanket
+/// reaper races every live `Child::wait`/`try_wait` in the process: it consumes the
+/// exit status first, the owner then gets `ECHILD`, and the daemon misreads that as
+/// "the stop command failed" (escalating to a cgroup kill of a service that was
+/// shutting down cleanly) or as "the service crashed" (spurious restart). Reaping only
+/// pids we explicitly disowned removes the race by construction.
+static DISOWNED_PIDS: std::sync::OnceLock<Mutex<std::collections::HashSet<i32>>> =
+    std::sync::OnceLock::new();
+
+fn disowned_pids() -> &'static Mutex<std::collections::HashSet<i32>> {
+    DISOWNED_PIDS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Hand a pid to the reaper. Call this immediately after dropping a `Child` handle.
+fn disown_child_pid(pid: u32) {
+    if let Ok(mut set) = disowned_pids().lock() {
+        set.insert(pid as i32);
+    }
+}
+
 fn start_child_reaper_thread() {
     let _ = std::thread::Builder::new()
         .name("pm-child-reaper".to_string())
         .spawn(move || loop {
-        // Reap all exited children without blocking.
-        loop {
-            match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
-                Ok(WaitStatus::StillAlive) => break,
-                Ok(_) => continue,
-                Err(_) => break,
+            // Snapshot so the lock is not held across waitpid.
+            let pending: Vec<i32> = match disowned_pids().lock() {
+                Ok(set) => set.iter().copied().collect(),
+                Err(_) => Vec::new(),
+            };
+            let mut done: Vec<i32> = Vec::new();
+            for pid in pending {
+                match waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)) {
+                    // Still running: leave it registered.
+                    Ok(WaitStatus::StillAlive) => {}
+                    // Reaped, or no longer ours (ECHILD): stop tracking either way.
+                    Ok(_) | Err(_) => done.push(pid),
+                }
             }
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    });
+            if !done.is_empty() {
+                if let Ok(mut set) = disowned_pids().lock() {
+                    for pid in done {
+                        set.remove(&pid);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        });
 }
 
 fn prepare_socket(sock: &Path) -> anyhow::Result<()> {
     if let Some(parent) = sock.parent() {
+        let existed = parent.exists();
         fs::create_dir_all(parent).map_err(|e| {
             anyhow::anyhow!(
                 "failed to create socket directory {}: {e}",
                 parent.display()
             )
         })?;
+        // Only tighten a directory we just created. Narrowing one the operator already
+        // set up (say a shared /run/pm owned by an ops group) would be presumptuous.
+        if !existed {
+            let _ = fs::set_permissions(parent, PermissionsExt::from_mode(0o700));
+        }
     }
 
     if sock.exists() {
@@ -2406,10 +2620,33 @@ Fix: use the `pmctl` binary built from the same build/release as the running dae
     match wire.request {
         Request::LogsFollow { name, filename, n, .. } => {
             // Long-running follow loop; keep it off the core runtime threads for now.
+            // Cap concurrent follow sessions well below the blocking-pool size, so
+            // however many clients attach, supervision work always has threads left.
+            let permit = match log_follow_semaphore().clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    let resp = Response {
+                        ok: false,
+                        message: format!(
+                            "too many concurrent log-follow sessions (limit {MAX_CONCURRENT_LOG_FOLLOWS}); try again shortly"
+                        ),
+                        restarted: vec![], statuses: vec![], events: vec![],
+                        admin_actions: vec![], perf_metrics: None,
+                    };
+                    let line = serde_json::to_string(&resp)? + "\n";
+                    stream.write_all(line.as_bytes()).await?;
+                    stream.flush().await?;
+                    return Ok(());
+                }
+            };
             let std_stream = stream.into_std()?;
             let _ = std_stream.set_nonblocking(false);
             let st = Arc::clone(&state);
-            tasks().spawn_blocking(move || handle_logs_follow(st, std_stream, name, filename, n))
+            tasks().spawn_blocking(move || {
+                // Held for the lifetime of the session; released on any exit path.
+                let _permit = permit;
+                handle_logs_follow(st, std_stream, name, filename, n)
+            })
                 .await
                 .map_err(|e| anyhow::anyhow!("join error: {e}"))??;
             Ok(())
@@ -2526,9 +2763,14 @@ fn do_server_version() -> anyhow::Result<Response> {
 fn do_perf_metrics(state: &Arc<Mutex<DaemonState>>, name: &str) -> anyhow::Result<Response> {
     let (cfg, app) = {
         let st = state.lock().unwrap_or_else(|p| p.into_inner());
-        (st.cfg.clone(), name.trim().to_string())
+        let app = name.trim().to_string();
+        // Resolve against the loaded definitions like every other handler does. Without
+        // this the name went straight into a cgroup path, so a client could read
+        // memory/cpu/io/PSI files of any cgroup on the host.
+        anyhow::ensure!(!app.is_empty(), "missing/empty app name");
+        anyhow::ensure!(st.defs.contains_key(&app), "unknown service: {app}");
+        (st.cfg.clone(), app)
     };
-    anyhow::ensure!(!app.is_empty(), "missing/empty app name");
 
     let cg_dir = app_cgroup_dir(&cfg, &app);
     let snap = crate::pm::cgroup::read_resource_snapshot(&cg_dir)?;
@@ -2772,8 +3014,11 @@ async fn do_admin_action_async(state: &Arc<Mutex<DaemonState>>, name: &str) -> a
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn admin_action {name:?}: {e}"))?;
     let pid = child.id();
-    // Drop the child handle to "disown" it. The daemon's child reaper thread will reap it.
+    // Disown: no handle is kept, so register the pid with the reaper. It reaps only
+    // pids on that list, never waitpid(-1), so it cannot steal exit statuses from
+    // supervisor code that still owns its children.
     drop(child);
+    disown_child_pid(pid);
 
     pm_event_state(
         state,
@@ -2854,6 +3099,10 @@ async fn do_set_enabled_async(state: &Arc<Mutex<DaemonState>>, name: &str, enabl
 }
 
 fn set_enabled_in_yaml(path: &Path, enabled: bool) -> anyhow::Result<()> {
+    // `pmctl enable/disable` makes root rewrite a file inside a service-owned tree.
+    // Refuse to do that through a symlink, which would let a service redirect the
+    // rewrite at an arbitrary YAML file elsewhere on the host.
+    ensure_not_symlink(path)?;
     let raw = fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
     let mut v: serde_yaml::Value = serde_yaml::from_str(&raw)
@@ -2878,8 +3127,8 @@ fn set_enabled_in_yaml(path: &Path, enabled: bool) -> anyhow::Result<()> {
     global_map.insert(enabled_key, serde_yaml::Value::Bool(enabled));
 
     let out = serde_yaml::to_string(&v)?;
-    fs::write(path, out)
-        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))?;
+    write_yaml_atomically(path, &out)
+        .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
 
@@ -2895,7 +3144,14 @@ fn do_logs(state: &Arc<Mutex<DaemonState>>, name: &str, n: usize) -> anyhow::Res
     let (stdout_path, stderr_path) = resolve_log_paths(&def);
     let mut files: Vec<PathBuf> = vec![stdout_path, stderr_path];
     for p in &def.alt_log_file_hint {
-        files.push(resolve_under_workdir(&def.working_directory, p));
+        match resolve_hint_under_workdir(&def.working_directory, p) {
+            Some(path) => files.push(path),
+            None => pm_event(
+                "logs",
+                Some(&def.application),
+                format!("hint_rejected reason=outside_working_directory path={}", p.display()),
+            ),
+        }
     }
 
     let mut out = String::new();
@@ -2992,7 +3248,9 @@ fn handle_logs_follow(
         paths.push(stdout_path);
         paths.push(stderr_path);
         for p in &def.alt_log_file_hint {
-            paths.push(resolve_under_workdir(&def.working_directory, p));
+            if let Some(path) = resolve_hint_under_workdir(&def.working_directory, p) {
+                paths.push(path);
+            }
         }
     }
 
@@ -4786,16 +5044,34 @@ fn decode_hex(s: &str) -> anyhow::Result<Vec<u8>> {
 fn decode_env_value(value: &str) -> anyhow::Result<std::ffi::OsString> {
     let v = value.trim();
     if let Some(path) = v.strip_prefix("@file://") {
-        if let Ok(m) = fs::metadata(path) {
-            if m.is_file() && m.len() > MAX_ENV_FILE_BYTES {
-                anyhow::bail!(
-                    "env file {path:?} too large ({} bytes > {} bytes limit)",
-                    m.len(),
-                    MAX_ENV_FILE_BYTES
-                );
-            }
-        }
-        let bytes = fs::read(path).with_context(|| format!("read env file {path:?}"))?;
+        // Must be a regular file. The old size guard was `if m.is_file() && too_big`,
+        // so it simply did not apply to anything else: `@file:///dev/zero` skipped the
+        // cap entirely and read until the root daemon was OOM-killed, and a fifo
+        // blocked the launch path forever.
+        let md = fs::metadata(path).with_context(|| format!("stat env file {path:?}"))?;
+        anyhow::ensure!(
+            md.is_file(),
+            "env file {path:?} is not a regular file (character devices, fifos and \
+             directories are refused: reading one can hang or exhaust memory)"
+        );
+        anyhow::ensure!(
+            md.len() <= MAX_ENV_FILE_BYTES,
+            "env file {path:?} too large ({} bytes > {} bytes limit)",
+            md.len(),
+            MAX_ENV_FILE_BYTES
+        );
+        // Enforce the cap *during* the read as well: the metadata call above is a
+        // separate syscall, so the file may have grown since.
+        use std::io::Read as _;
+        let f = fs::File::open(path).with_context(|| format!("read env file {path:?}"))?;
+        let mut bytes = Vec::new();
+        f.take(MAX_ENV_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("read env file {path:?}"))?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= MAX_ENV_FILE_BYTES,
+            "env file {path:?} exceeded the {MAX_ENV_FILE_BYTES} byte limit while reading"
+        );
         return Ok(std::ffi::OsString::from_vec(bytes));
     }
     if let Some(b64) = v.strip_prefix("@base64://").or_else(|| v.strip_prefix("@b64://")) {
@@ -4876,7 +5152,9 @@ fn maybe_provision_workdir(def: &AppDefinition) -> anyhow::Result<()> {
         return Ok(());
     }
     let marker = def.working_directory.join(".pm_provisioned");
-    if marker.exists() {
+    // symlink_metadata: a *dangling* symlink makes exists() false, which would let a
+    // service re-trigger provisioning and have root create the link's target.
+    if fs::symlink_metadata(&marker).is_ok() {
         pm_event(
             "provision",
             Some(&def.application),
@@ -4921,8 +5199,20 @@ fn maybe_provision_workdir(def: &AppDefinition) -> anyhow::Result<()> {
     for (idx, p) in def.provisioning.iter().enumerate() {
         let target = resolve_under_workdir(&def.working_directory, &p.path);
 
-        // If the target doesn't exist, create it only when it looks like a directory provisioning action.
-        if !target.exists() {
+        // symlink_metadata, not exists(): exists() follows links, so a dangling or
+        // redirecting symlink would look like "already there" (or like "missing" and
+        // get created through).
+        let target_lstat = fs::symlink_metadata(&target);
+        if let Ok(md) = &target_lstat {
+            anyhow::ensure!(
+                !md.file_type().is_symlink(),
+                "service {} provisioning[{}]: target {} is a symlink; refusing to provision through it",
+                def.application,
+                idx,
+                target.display()
+            );
+        }
+        if target_lstat.is_err() {
             if p.add_net_bind_capability {
                 anyhow::bail!(
                     "service {} provisioning[{}]: target {} does not exist (needed for setcap)",
@@ -4970,9 +5260,9 @@ fn maybe_provision_workdir(def: &AppDefinition) -> anyhow::Result<()> {
                     chown_recursive(&target, uid_opt, gid_opt)
                         .with_context(|| format!("service {} provisioning[{}]: chown_recursive {}", def.application, idx, target.display()))?;
                 } else {
-                    chown(&target, uid_opt, gid_opt).map_err(|e| {
-                        anyhow::anyhow!(
-                            "service {} provisioning[{}]: chown failed for {}: {e}",
+                    lchown_no_follow(&target, uid_opt, gid_opt).with_context(|| {
+                        format!(
+                            "service {} provisioning[{}]: chown failed for {}",
                             def.application,
                             idx,
                             target.display()
@@ -4984,10 +5274,9 @@ fn maybe_provision_workdir(def: &AppDefinition) -> anyhow::Result<()> {
 
         // Mode (optional; non-recursive)
         if let Some(mode) = p.mode {
-            let perm = std::fs::Permissions::from_mode(mode);
-            fs::set_permissions(&target, perm).map_err(|e| {
-                anyhow::anyhow!(
-                    "service {} provisioning[{}]: chmod {:o} failed for {}: {e}",
+            fchmod_no_follow(&target, mode).with_context(|| {
+                format!(
+                    "service {} provisioning[{}]: chmod {:o} failed for {}",
                     def.application,
                     idx,
                     mode,
@@ -4998,6 +5287,17 @@ fn maybe_provision_workdir(def: &AppDefinition) -> anyhow::Result<()> {
 
         // Capabilities (optional)
         if p.add_net_bind_capability {
+            // setcap takes a path and follows symlinks, and has no fd-based form, so
+            // the best available guard is to refuse a symlinked target outright. A
+            // pre-planted symlink -- the realistic attack -- is blocked; a residual
+            // race remains only for an attacker who can win the window between this
+            // check and exec.
+            ensure_not_symlink(&target).with_context(|| {
+                format!(
+                    "service {} provisioning[{}]: refusing setcap on {}",
+                    def.application, idx, target.display()
+                )
+            })?;
             let status = Command::new("setcap")
                 .arg("cap_net_bind_service=+ep")
                 .arg(&target)
@@ -5020,11 +5320,32 @@ fn maybe_provision_workdir(def: &AppDefinition) -> anyhow::Result<()> {
         );
     }
 
-    fs::write(
-        &marker,
-        format!("provisioned_at_ms={}\n", Local::now().timestamp_millis()),
-    )
-    .map_err(|e| anyhow::anyhow!("service {}: failed to write marker {}: {e}", def.application, marker.display()))?;
+    // O_CREAT|O_EXCL|O_NOFOLLOW: never write through a symlink a service planted, and
+    // never silently reuse an existing file.
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&marker)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "service {}: failed to create marker {}: {e}",
+                    def.application,
+                    marker.display()
+                )
+            })?;
+        f.write_all(format!("provisioned_at_ms={}\n", Local::now().timestamp_millis()).as_bytes())
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "service {}: failed to write marker {}: {e}",
+                    def.application,
+                    marker.display()
+                )
+            })?;
+    }
 
     pm_event(
         "provision",
@@ -5034,10 +5355,85 @@ fn maybe_provision_workdir(def: &AppDefinition) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---------------- symlink-safe primitives for root-privileged file operations ----
+//
+// Provisioning runs as root against paths inside a working directory that is often
+// owned by the *service* user — provisioning itself chowns it there. Every operation
+// below therefore has to refuse to traverse a final symlink, otherwise the service can
+// point one at /etc/shadow and have root chown, chmod or setcap it.
+
+/// `lchown(2)`: change ownership without following a final symlink.
+///
+/// `nix::unistd::chown` is `chown(2)`, which *does* follow, so it cannot be used on any
+/// path an unprivileged user can influence.
+fn lchown_no_follow(path: &Path, uid: Option<Uid>, gid: Option<Gid>) -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| anyhow::anyhow!("path contains an interior NUL: {}", path.display()))?;
+    let uid_raw = uid.map(|u| u.as_raw()).unwrap_or(u32::MAX); // -1 == "leave unchanged"
+    let gid_raw = gid.map(|g| g.as_raw()).unwrap_or(u32::MAX);
+    // SAFETY: c is a valid NUL-terminated path; lchown does not retain the pointer.
+    let rc = unsafe { libc::lchown(c.as_ptr(), uid_raw, gid_raw) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("lchown {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Open a path for metadata work without following a final symlink.
+///
+/// Works for both regular files and directories (`O_RDONLY` on a directory is fine on
+/// Linux). Returning a file descriptor lets callers use `f*` syscalls, which act on the
+/// opened inode and so cannot be redirected by a concurrent rename.
+fn open_no_follow(path: &Path) -> anyhow::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "open {} without following symlinks (refusing to traverse one is intentional)",
+                path.display()
+            )
+        })
+}
+
+/// `fchmod(2)` on an fd opened with `O_NOFOLLOW` — race-free, unlike path-based chmod.
+fn fchmod_no_follow(path: &Path, mode: u32) -> anyhow::Result<()> {
+    let f = open_no_follow(path)?;
+    // SAFETY: f owns a valid fd for the duration of the call.
+    let rc = unsafe { libc::fchmod(f.as_raw_fd(), mode as libc::mode_t) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("fchmod {:o} {}", mode, path.display()));
+    }
+    Ok(())
+}
+
+/// Reject a path whose final component is a symlink, for operations that have no
+/// `*at`/`f*` equivalent (currently only `setcap`, which takes a path).
+fn ensure_not_symlink(path: &Path) -> anyhow::Result<()> {
+    let md = fs::symlink_metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?;
+    anyhow::ensure!(
+        !md.file_type().is_symlink(),
+        "{} is a symlink; refusing to operate on it as root",
+        path.display()
+    );
+    Ok(())
+}
+
 fn chown_recursive(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> anyhow::Result<()> {
-    // Apply to root itself
-    chown(root, uid, gid).map_err(|e| anyhow::anyhow!("chown failed for {}: {e}", root.display()))?;
+    // Apply to root itself. lchown, not chown: the root target is exactly what an
+    // attacker replaces with a symlink, and the old code followed it.
+    lchown_no_follow(root, uid, gid)?;
     let md = fs::symlink_metadata(root)?;
+    if md.file_type().is_symlink() {
+        // Never descend through a symlinked root.
+        return Ok(());
+    }
     if !md.is_dir() {
         return Ok(());
     }
@@ -5050,7 +5446,9 @@ fn chown_recursive(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> anyhow::R
                 // Do not follow symlinks (avoid loops / unexpected ownership changes).
                 continue;
             }
-            chown(&p, uid, gid).map_err(|e| anyhow::anyhow!("chown failed for {}: {e}", p.display()))?;
+            // lchown even here: between the lstat above and this call the entry could
+            // have been swapped for a symlink, and chown would follow it.
+            lchown_no_follow(&p, uid, gid)?;
             if md.is_dir() {
                 walk(&p, uid, gid)?;
             }
@@ -5079,6 +5477,10 @@ async fn open_append_log_async(path: &Path) -> anyhow::Result<tokio::fs::File> {
         .append(true)
         .write(true)
         .custom_flags(libc::O_NOFOLLOW)
+        // 0640, not the umask default of 0644: a service's stdout routinely carries
+        // connection strings and tokens, and every other local user could read them.
+        // Group is kept readable so an operator group can tail logs without root.
+        .mode(0o640)
         .open(path)
         .await
         .with_context(|| {
@@ -5657,6 +6059,8 @@ fn build_launch_params_for_app(
         lp.environment.push((ev.name.clone().into(), v));
     }
 
+    lp.inherit_environment = def.inherit_environment;
+
     // Resources (best-effort).
     lp.resources = resources_for_app(def)?;
 
@@ -5767,6 +6171,11 @@ enum SupervisorCmd {
     WaiterExited {
         epoch: u64,
         code: Option<i32>,
+    },
+    /// The cgroup waiter could not determine liveness (I/O error, fd exhaustion).
+    /// Distinct from `WaiterExited` on purpose: "I could not look" is not "it exited".
+    WaiterFailed {
+        epoch: u64,
     },
     Shutdown,
 }
@@ -6709,6 +7118,22 @@ fn spawn_supervisor_thread(
                     .await;
                     set_phase_and_emit(&run_info, &events, &app, Phase::Running, "failure_auto_restart_completed");
                 }
+                SupervisorCmd::WaiterFailed { epoch } => {
+                    if epoch != waiter_epoch {
+                        continue;
+                    }
+                    // Drop the waiter but record nothing: no exit code, no crash, no
+                    // restart. The periodic reconcile will re-observe real state from
+                    // the cgroup and re-attach a waiter if the service is still up.
+                    waiter_running = false;
+                    waiter_cancel = None;
+                    push_event(
+                        &events,
+                        "watch",
+                        Some(&app),
+                        "event=waiter_failed action=detached (state unchanged)".to_string(),
+                    );
+                }
                 SupervisorCmd::WaiterExited { epoch, code } => {
                     if epoch != waiter_epoch {
                         push_event(&events, "watch", Some(&app), format!("ignore_exit reason=stale_epoch got={epoch} want={waiter_epoch}"));
@@ -6872,8 +7297,18 @@ fn spawn_cgroup_waiter(
             Ok(false) => {
                 // cancelled
             }
-            Err(_) => {
-                let _ = tx2.send(SupervisorCmd::WaiterExited { epoch, code: Some(1) });
+            Err(e) => {
+                // NOT an exit. Synthesising `code: Some(1)` here made an unreadable
+                // cgroup indistinguishable from a crashed service: the supervisor
+                // recorded a crash, restarted, and ended up with two live instances
+                // sharing one cgroup. Report the failure and let the reconcile loop
+                // re-observe actual state instead.
+                pm_event(
+                    "watch",
+                    Some(&app_s),
+                    format!("waiter=error (not treated as an exit) err={e:#}"),
+                );
+                let _ = tx2.send(SupervisorCmd::WaiterFailed { epoch });
             }
         }
     })?;
@@ -7194,6 +7629,7 @@ fn build_auto_service_def(
         stop_command_stdout: Some("./logs/stop_command_stdout.log".into()),
         stop_command_stderr: Some("./logs/stop_command_stderr.log".into()),
         alt_log_file_hint: vec![],
+        inherit_environment: false,
         start_command: vec!["./run.sh".to_string()],
         environment: vec![],
         restart: Some(RestartConfig {
@@ -7357,31 +7793,24 @@ fn merge_auto_services_best_effort(
                 }
             };
             if regen_ok {
-                match std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&svc_yml)
-                {
-                    Ok(mut f) => {
-                        if let Err(e) = f.write_all(yaml_text.as_bytes()) {
-                            warnings.push(format!(
-                                "auto_service_regen_write_failed app={} file={} err={e}",
-                                app,
-                                svc_yml.display()
-                            ));
-                            regen_ok = false;
-                        } else {
-                            warnings.push(format!(
-                                "auto_service_regen_written app={} file={}",
-                                app,
-                                svc_yml.display()
-                            ));
-                        }
+                // Write to a fresh temp file and rename into place, rather than
+                // truncating svc_yml directly. An auto-service directory is often owned
+                // by the service user, who could otherwise race the window after the
+                // .bak rename and plant a symlink for root to truncate and rewrite.
+                // O_EXCL|O_NOFOLLOW means we never write through a link and never reuse
+                // a planted file; rename() is atomic and replaces the target itself,
+                // not whatever a link points at.
+                match write_yaml_atomically(&svc_yml, &yaml_text) {
+                    Ok(()) => {
+                        warnings.push(format!(
+                            "auto_service_regen_written app={} file={}",
+                            app,
+                            svc_yml.display()
+                        ));
                     }
                     Err(e) => {
                         warnings.push(format!(
-                            "auto_service_regen_write_failed app={} file={} err={e}",
+                            "auto_service_regen_write_failed app={} file={} err={e:#}",
                             app,
                             svc_yml.display()
                         ));
@@ -7389,7 +7818,6 @@ fn merge_auto_services_best_effort(
                     }
                 }
             }
-
             // Set to load the regenerated `service.yml` (even if the backup step failed; user asked for regen).
             svc_file = Some(svc_yml.clone());
 
@@ -7843,6 +8271,194 @@ mod tests {
         assert_eq!(to_cpu_max_string("1.5").unwrap(), "150000 100000\n");
         // An explicit "quota period" pair is passed through untouched.
         assert_eq!(to_cpu_max_string("20000 100000").unwrap(), "20000 100000\n");
+    }
+
+    // ---- symlink-safe root file operations --------------------------------------
+    //
+    // Security regressions. Provisioning runs as root against a tree the *service*
+    // user owns, so every one of these must refuse to traverse a planted symlink.
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let mut nonce = [0u8; 6];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+        let p = std::env::temp_dir().join(format!(
+            "pm-test-{tag}-{}",
+            nonce.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        ));
+        std::fs::create_dir_all(&p).expect("mkdir");
+        p
+    }
+
+    #[test]
+    fn open_no_follow_refuses_a_symlink() {
+        let d = tmpdir("nofollow");
+        let real = d.join("real");
+        std::fs::write(&real, b"x").unwrap();
+        let link = d.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(open_no_follow(&real).is_ok(), "a regular file must open");
+        assert!(open_no_follow(&link).is_err(), "a symlink must be refused");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn ensure_not_symlink_distinguishes_links_from_files() {
+        let d = tmpdir("notlink");
+        let real = d.join("real");
+        std::fs::write(&real, b"x").unwrap();
+        let link = d.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let dangling = d.join("dangling");
+        std::os::unix::fs::symlink(d.join("nope"), &dangling).unwrap();
+
+        assert!(ensure_not_symlink(&real).is_ok());
+        assert!(ensure_not_symlink(&link).is_err());
+        // A dangling link must be caught too: exists() would report false for it.
+        assert!(ensure_not_symlink(&dangling).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn fchmod_no_follow_changes_the_file_not_the_link_target() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = tmpdir("fchmod");
+        let victim = d.join("victim");
+        std::fs::write(&victim, b"secret").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = d.join("link");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        // Through the link: refused, and the victim keeps its mode.
+        assert!(fchmod_no_follow(&link, 0o777).is_err());
+        let mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "chmod must not have followed the symlink");
+
+        // Directly: applied.
+        fchmod_no_follow(&victim, 0o640).unwrap();
+        let mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn read_pids_from_cgroup_procs_parses_and_filters() {
+        let d = tmpdir("procs");
+        let f = d.join("cgroup.procs");
+        std::fs::write(&f, "123\n456\n\n1\n0\nnot-a-pid\n").unwrap();
+        let pids = read_pids_from_cgroup_procs(&f);
+        assert_eq!(pids, vec![123, 456], "pid 0/1 and junk must be dropped");
+        // A missing file yields an empty set, so callers narrow rather than widen.
+        assert!(read_pids_from_cgroup_procs(&d.join("absent")).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---- @file:// environment indirection ---------------------------------------
+
+    #[test]
+    fn env_file_rejects_non_regular_files() {
+        // Regression: the size cap was guarded by `if m.is_file()`, so /dev/zero
+        // skipped it entirely and read until the daemon was OOM-killed.
+        let err = decode_env_value("@file:///dev/zero").expect_err("must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not a regular file"),
+            "expected a regular-file complaint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn env_file_reads_a_regular_file_and_enforces_the_cap() {
+        let d = tmpdir("envfile");
+        let ok = d.join("ok");
+        std::fs::write(&ok, b"hello").unwrap();
+        let got = decode_env_value(&format!("@file://{}", ok.display())).unwrap();
+        assert_eq!(got.to_string_lossy(), "hello");
+
+        let big = d.join("big");
+        std::fs::write(&big, vec![b'a'; (MAX_ENV_FILE_BYTES + 1) as usize]).unwrap();
+        assert!(decode_env_value(&format!("@file://{}", big.display())).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn env_indirections_still_decode() {
+        assert_eq!(decode_env_value("plain").unwrap().to_string_lossy(), "plain");
+        assert_eq!(
+            decode_env_value("@base64://aGVsbG8=").unwrap().to_string_lossy(),
+            "hello"
+        );
+        assert_eq!(
+            decode_env_value("@hex://68656c6c6f").unwrap().to_string_lossy(),
+            "hello"
+        );
+    }
+
+    // ---- log hint containment ----------------------------------------------------
+
+    #[test]
+    fn log_hints_may_not_escape_the_working_directory() {
+        // Security regression: hints are read by the ROOT daemon and streamed to any
+        // console user, so `hints: ["/etc/shadow"]` was a remote root-file read.
+        let d = tmpdir("hints");
+        let workdir = d.join("svc");
+        std::fs::create_dir_all(workdir.join("logs")).unwrap();
+        std::fs::write(workdir.join("logs/app.log"), b"ok").unwrap();
+
+        // Inside: accepted.
+        assert!(resolve_hint_under_workdir(&workdir, Path::new("./logs/app.log")).is_some());
+        assert!(resolve_hint_under_workdir(&workdir, Path::new("logs/app.log")).is_some());
+
+        // Absolute path outside the workdir: rejected.
+        assert!(resolve_hint_under_workdir(&workdir, Path::new("/etc/shadow")).is_none());
+        // Traversal: rejected.
+        assert!(resolve_hint_under_workdir(&workdir, Path::new("../../../etc/passwd")).is_none());
+        // A symlink pointing outside is rejected via canonicalization.
+        let escape = workdir.join("logs/escape.log");
+        std::os::unix::fs::symlink("/etc/hostname", &escape).unwrap();
+        assert!(resolve_hint_under_workdir(&workdir, Path::new("./logs/escape.log")).is_none());
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---- atomic YAML writes -------------------------------------------------------
+
+    #[test]
+    fn write_yaml_atomically_replaces_content_and_leaves_no_temp() {
+        let d = tmpdir("atomic");
+        let f = d.join("service.yml");
+        std::fs::write(&f, "old: true\n").unwrap();
+
+        write_yaml_atomically(&f, "new: true\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "new: true\n");
+
+        // No .tmp leftovers.
+        let leftovers: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn write_yaml_atomically_replaces_a_symlink_rather_than_writing_through_it() {
+        // rename() replaces the directory entry itself, so a service that planted a
+        // symlink gets it replaced by a regular file -- the link target is untouched.
+        let d = tmpdir("atomic-link");
+        let victim = d.join("victim");
+        std::fs::write(&victim, b"DO NOT TOUCH").unwrap();
+        let link = d.join("service.yml");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        write_yaml_atomically(&link, "new: true\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "DO NOT TOUCH");
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "new: true\n");
+        assert!(!std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     // ---- web console config validation -----------------------------------------

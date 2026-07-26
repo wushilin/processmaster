@@ -53,6 +53,16 @@ impl fmt::Display for MissingSockHelp {
     }
 }
 
+/// Constant-time string comparison, so a mismatch cannot be narrowed byte-by-byte
+/// by timing. Length is not treated as secret.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 pub fn run() -> anyhow::Result<()> {
     let args = PmctlArgs::parse();
     if matches!(&args.cmd, Some(cli::Cmd::Version)) {
@@ -62,16 +72,54 @@ pub fn run() -> anyhow::Result<()> {
 
     // Local-only utilities (no daemon socket required).
     if let Some(cli::Cmd::Password { cmd }) = &args.cmd {
+        /// Resolve a password argument.
+        ///
+        /// `-` reads one line from stdin, with terminal echo disabled when stdin is a
+        /// tty so an interactively typed password does not end up on screen and in
+        /// scrollback. Passing the value inline still works, but warns: argv is visible
+        /// to every user on the host via /proc/<pid>/cmdline, and lands in shell history.
         fn read_password_if_stdin(s: &str) -> anyhow::Result<String> {
             let t = s.trim();
             if t != "-" {
+                eprintln!(
+                    "warning: passing a password as a command-line argument exposes it via \
+                     /proc/<pid>/cmdline and shell history; prefer `--password -` to read from stdin"
+                );
                 return Ok(s.to_string());
             }
-            // Read a single line from stdin; allow trailing newline.
-            let mut buf = String::new();
+
             let stdin = std::io::stdin();
-            let mut stdin = stdin.lock();
-            stdin.read_line(&mut buf)?;
+            // SAFETY: plain libc calls on this process's own terminal settings.
+            let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+            let saved = if is_tty {
+                unsafe {
+                    let mut term: libc::termios = std::mem::zeroed();
+                    if libc::tcgetattr(libc::STDIN_FILENO, &mut term) == 0 {
+                        let mut quiet = term;
+                        quiet.c_lflag &= !libc::ECHO;
+                        let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &quiet);
+                        eprint!("Password: ");
+                        Some(term)
+                    } else {
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let mut buf = String::new();
+            let read = stdin.lock().read_line(&mut buf);
+
+            if let Some(term) = saved {
+                // Always restore the terminal, including on a read error.
+                unsafe {
+                    let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &term);
+                }
+                eprintln!();
+            }
+            read?;
+
             let pw = buf.trim_end_matches(&['\r', '\n'][..]).to_string();
             anyhow::ensure!(!pw.is_empty(), "password read from stdin is empty");
             Ok(pw)
@@ -94,9 +142,11 @@ pub fn run() -> anyhow::Result<()> {
             } => {
                 let pass = read_password_if_stdin(password)?;
                 let t = secure.trim();
+                // Never echo the entry itself: it carries the username and the bcrypt
+                // hash, and this lands in CI logs, journald and shell transcripts.
                 let (secure_user, secure_hash) = t
                     .split_once(':')
-                    .ok_or_else(|| anyhow::anyhow!("invalid --secure entry (missing ':'): {t:?}"))?;
+                    .ok_or_else(|| anyhow::anyhow!("invalid --secure entry: expected 'user:hash'"))?;
                 let secure_user = secure_user.trim();
                 let secure_hash = secure_hash.trim();
                 anyhow::ensure!(!secure_user.is_empty(), "invalid --secure entry (empty username)");
@@ -105,17 +155,15 @@ pub fn run() -> anyhow::Result<()> {
                 let user_t = user.trim();
                 anyhow::ensure!(!user_t.is_empty(), "--user must not be empty");
 
-                // Match username first; if mismatch, treat as failed verification.
-                if user_t != secure_user {
-                    eprintln!("FAIL");
-                    std::process::exit(1);
-                }
-
                 // htpasswd -B may emit $2y$...; normalize to bcrypt crate accepted prefix.
                 let normalized_hash = secure_hash.replace("$2y$", "$2b$");
-                let ok = bcrypt::verify(pass, &normalized_hash)
-                    .map_err(|_| anyhow::anyhow!("invalid credentials"))?;
-                if ok {
+                // Always run the verify, even when the username already mismatched.
+                // Returning early on a bad username made the two failures take wildly
+                // different amounts of time, which enumerates valid usernames for
+                // anyone who can invoke or time this command.
+                let hash_ok = bcrypt::verify(pass, &normalized_hash).unwrap_or(false);
+                let user_ok = ct_eq(user_t, secure_user);
+                if user_ok && hash_ok {
                     println!("OK");
                     return Ok(());
                 }
@@ -629,3 +677,20 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ct_eq_matches_ordinary_equality() {
+        assert!(ct_eq("", ""));
+        assert!(ct_eq("admin", "admin"));
+        assert!(!ct_eq("admin", "admln"));
+        assert!(!ct_eq("admin", "admi"));
+        assert!(!ct_eq("", "a"));
+        // A difference in the last byte must be caught as reliably as the first.
+        assert!(!ct_eq("aaaaaaaaZ", "aaaaaaaaY"));
+        assert!(!ct_eq("Zaaaaaaaa", "Yaaaaaaaa"));
+    }
+}

@@ -145,6 +145,13 @@ pub struct WebConsoleConfig {
     pub tls: WebConsoleTlsConfig,
     #[serde(default)]
     pub auth: WebConsoleAuthConfig,
+    /// Opt-in to serving the console over plain HTTP on a non-loopback address.
+    ///
+    /// Basic auth transmits the password base64-encoded, not encrypted, and this console
+    /// is root-equivalent, so the daemon refuses that combination unless an operator has
+    /// deliberately accepted it (e.g. a TLS-terminating reverse proxy on the same host).
+    #[serde(default)]
+    pub allow_plaintext_remote: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,6 +266,7 @@ impl Default for WebConsoleConfig {
             port: default_web_port(),
             tls: WebConsoleTlsConfig::default(),
             auth: WebConsoleAuthConfig::default(),
+            allow_plaintext_remote: false,
         }
     }
 }
@@ -312,8 +320,19 @@ fn default_max() -> String {
 fn default_subtree_control_allow() -> bool {
     true
 }
+/// Default control-socket path.
+///
+/// `/run/processmaster/` rather than `/tmp`: `/tmp` is world-writable, so any local user
+/// can pre-create the socket path before the daemon starts. That both denies service
+/// (the daemon sees a live socket and refuses to start a second instance) and lets the
+/// squatter answer `pmctl` with fabricated status. `/run` is root-owned, and the daemon
+/// creates its subdirectory 0700.
+///
+/// NOTE: this changes the default. Deployments that relied on the old default must set
+/// `unix_socket.path: /tmp/processmaster.sock` explicitly, and point `PMCTL_SOCK` at
+/// whichever path they choose.
 fn default_sock() -> PathBuf {
-    "/tmp/processmaster.sock".into()
+    "/run/processmaster/processmaster.sock".into()
 }
 fn default_sock_mode() -> u32 {
     0o600
@@ -349,6 +368,8 @@ struct WebConsoleConfigFile {
     tls: Option<WebConsoleTlsConfigFile>,
     #[serde(default)]
     auth: Option<WebConsoleAuthConfigFile>,
+    #[serde(default)]
+    allow_plaintext_remote: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -486,6 +507,7 @@ pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
         cfg.web_console.enabled = wc.enabled;
         cfg.web_console.bind = wc.bind;
         cfg.web_console.port = wc.port;
+        cfg.web_console.allow_plaintext_remote = wc.allow_plaintext_remote;
 
         if let Some(tls) = wc.tls {
             cfg.web_console.tls.enabled = tls.enabled;
@@ -687,6 +709,29 @@ mod tests {
     }
 
     // ---- defaults --------------------------------------------------------------
+
+    #[test]
+    fn default_socket_lives_outside_world_writable_directories() {
+        // Regression: the default used to be /tmp/processmaster.sock, which any local
+        // user could pre-create to deny service or to impersonate the daemon to pmctl.
+        let p = default_sock();
+        assert!(
+            !p.starts_with("/tmp"),
+            "default socket must not live in a world-writable directory, got {}",
+            p.display()
+        );
+        assert!(p.is_absolute(), "socket path must be absolute");
+        assert!(p.parent().is_some(), "socket must have a parent directory to lock down");
+    }
+
+    #[test]
+    fn plaintext_remote_is_opt_in() {
+        // The console can run admin_actions as root; serving basic auth in the clear on
+        // a non-loopback address must require an explicit acknowledgement.
+        let cfg = WebConsoleConfig::default();
+        assert!(!cfg.allow_plaintext_remote);
+        assert!(!cfg.tls.enabled, "TLS default is unchanged");
+    }
 
     #[test]
     fn socket_defaults_are_owner_only() {

@@ -120,3 +120,31 @@ fn example_socket_mode_is_not_world_writable() {
         );
     }
 }
+
+#[test]
+fn shipped_examples_do_not_configure_a_console_that_would_refuse_to_serve() {
+    // Loading is not enough: a config can parse fine and then have the web console
+    // decline to start. The daemon refuses cleartext basic auth on a non-loopback
+    // address, so an example that ships enabled + 0.0.0.0 + no TLS would leave an
+    // operator with a console that silently never comes up.
+    for name in ["config.yaml", "config.full.yaml"] {
+        let path = repo_root().join("examples").join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let cfg = load_master_config(&path).expect("example loads");
+        let wc = &cfg.web_console;
+        if !wc.enabled || wc.tls.enabled || wc.allow_plaintext_remote {
+            continue;
+        }
+        let addr = processmaster::pm::config::parse_bind_addr(&wc.bind, wc.port)
+            .unwrap_or_else(|e| panic!("{name}: bind is unparseable: {e}"));
+        assert!(
+            addr.ip().is_loopback(),
+            "{name}: web_console is enabled without TLS on non-loopback {} — the daemon \
+             will refuse to serve it. Bind loopback, enable TLS, or set \
+             allow_plaintext_remote.",
+            wc.bind
+        );
+    }
+}

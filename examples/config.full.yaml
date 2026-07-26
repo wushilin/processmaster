@@ -46,8 +46,15 @@ global:
 
 web_console:
   enabled: true
-  bind: 0.0.0.0
+  # Loopback by default. HTTP basic auth only base64-encodes the password, and this
+  # console can run admin_actions as root, so processmaster refuses to serve it in
+  # cleartext on a non-loopback address. To expose it beyond localhost, pick one:
+  #   - set tls.enabled: true (recommended), or
+  #   - keep this on 127.0.0.1 behind a TLS-terminating reverse proxy, or
+  #   - set allow_plaintext_remote: true to accept the risk explicitly.
+  bind: 127.0.0.1
   port: 9001
+  allow_plaintext_remote: false
 
   # TLS is optional. If you enable TLS:
   # - with mtls=true: clients must present a client cert signed by ca_pem.
