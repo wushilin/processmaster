@@ -2502,6 +2502,21 @@ fn disown_child_pid(pid: u32) {
     }
 }
 
+/// Give up the `Child` handle of a freshly spawned (non-scheduled) service and hand
+/// its pid to the reaper.
+///
+/// Non-scheduled services are supervised by the cgroup waiter, which observes the
+/// cgroup via pidfd and never calls `waitpid`. Dropping the `Child` without
+/// registering it therefore left one `<defunct>` entry under the daemon for every
+/// service exit once the reaper stopped doing `waitpid(-1)`. Scheduled jobs must NOT
+/// go through here: they keep their `Child` in `spawn_process_waiter`, which needs the
+/// exit status, and the reaper would steal it.
+fn disown_service_child(child: std::process::Child) {
+    let pid = child.id();
+    drop(child);
+    disown_child_pid(pid);
+}
+
 fn start_child_reaper_thread() {
     let _ = std::thread::Builder::new()
         .name("pm-child-reaper".to_string())
@@ -6108,10 +6123,18 @@ fn run_stop_command_in_context(
     // Use the shared stop deadline (T + grace). If stop_command doesn't finish by then,
     // the caller will force-kill the cgroup (which will kill this helper too).
     loop {
-        if let Some(st) = child.try_wait().with_context(|| "try_wait stop_command")? {
-            return Ok(st);
+        match child.try_wait() {
+            Ok(Some(st)) => return Ok(st),
+            Ok(None) => {}
+            Err(e) => {
+                disown_child_pid(child.id());
+                return Err(e).context("try_wait stop_command");
+            }
         }
         if Instant::now() >= stop_deadline {
+            // The caller cgroup-kills the helper. Nobody waits on it after this point,
+            // so hand it to the reaper or it stays <defunct> for the daemon's lifetime.
+            disown_child_pid(child.id());
             anyhow::bail!("stop_command_timeout");
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -6362,9 +6385,12 @@ fn spawn_supervisor_thread(
                             continue;
                         }
                     };
-                    if let Err(e) = child_r {
-                        let _ = resp.send(Err(e));
-                        continue;
+                    match child_r {
+                        Ok(child) => disown_service_child(child),
+                        Err(e) => {
+                            let _ = resp.send(Err(e));
+                            continue;
+                        }
                     }
 
                     if !wait_for_cgroup_nonempty(&cfg, &app, Duration::from_secs(3)).await {
@@ -6467,9 +6493,14 @@ fn spawn_supervisor_thread(
                         waiter_running = true;
                         waiter_cancel = None;
                         let _ = spawn_process_waiter(child, &tx_self, &app, waiter_epoch);
-                    } else if let Err(e) = child_r {
-                        let _ = resp.send(Err(e));
-                        continue;
+                    } else {
+                        match child_r {
+                            Ok(child) => disown_service_child(child),
+                            Err(e) => {
+                                let _ = resp.send(Err(e));
+                                continue;
+                            }
+                        }
                     }
 
                     if !wait_for_cgroup_nonempty(&cfg, &app, Duration::from_secs(3)).await {
@@ -6674,9 +6705,14 @@ fn spawn_supervisor_thread(
                         waiter_running = true;
                         waiter_cancel = None;
                         let _ = spawn_process_waiter(child, &tx_self, &app, waiter_epoch);
-                    } else if let Err(e) = child_r {
-                        let _ = resp.send(Err(e));
-                        continue;
+                    } else {
+                        match child_r {
+                            Ok(child) => disown_service_child(child),
+                            Err(e) => {
+                                let _ = resp.send(Err(e));
+                                continue;
+                            }
+                        }
                     }
                     if !wait_for_cgroup_nonempty(&cfg, &app, Duration::from_secs(3)).await {
                         {
@@ -6774,9 +6810,12 @@ fn spawn_supervisor_thread(
                             continue;
                         }
                     };
-                    if let Err(e) = child_r {
-                        let _ = resp.send(Err(e));
-                        continue;
+                    match child_r {
+                        Ok(child) => disown_service_child(child),
+                        Err(e) => {
+                            let _ = resp.send(Err(e));
+                            continue;
+                        }
                     }
                     if !wait_for_cgroup_nonempty(&cfg, &app, Duration::from_secs(3)).await {
                         {
@@ -6843,9 +6882,12 @@ fn spawn_supervisor_thread(
                         .spawn_blocking(move || spawn_launcher_child(&cfg2, &def2))
                         .await
                         .map_err(|e| anyhow::anyhow!("join error: {e}"));
-                    if let Err(e) = spawn_r {
-                        let _ = resp.send(Err(e));
-                        continue;
+                    match spawn_r {
+                        Ok(Ok(child)) => disown_service_child(child),
+                        Ok(Err(e)) | Err(e) => {
+                            let _ = resp.send(Err(e));
+                            continue;
+                        }
                     }
                     if !wait_for_cgroup_nonempty(&cfg, &app, Duration::from_secs(3)).await {
                         {
@@ -7001,7 +7043,14 @@ fn spawn_supervisor_thread(
                         .spawn_blocking(move || spawn_launcher_child(&cfg2, &def2))
                         .await
                         .map_err(|e| anyhow::anyhow!("join error: {e}"));
-                    if let Err(e) = spawn_r {
+                    let spawn_err = match spawn_r {
+                        Ok(Ok(child)) => {
+                            disown_service_child(child);
+                            None
+                        }
+                        Ok(Err(e)) | Err(e) => Some(e),
+                    };
+                    if let Some(e) = spawn_err {
                         // Treat restart attempt failures as restart attempts within tolerance.
                         // Do NOT immediately mark FAILED; only do so once tolerance is exceeded.
                         let now = Instant::now();
@@ -7323,13 +7372,20 @@ fn spawn_process_waiter(
 ) -> anyhow::Result<()> {
     let tx2 = tx.clone();
     let tname = format!("pm-procwait-{}", app);
-    let _ = std::thread::Builder::new().name(tname).spawn(move || {
+    let pid = child.id();
+    let spawned = std::thread::Builder::new().name(tname).spawn(move || {
         let code = match child.wait() {
             Ok(st) => st.code().unwrap_or(1),
             Err(_) => 1,
         };
         let _ = tx2.send(SupervisorCmd::WaiterExited { epoch, code: Some(code) });
-    })?;
+    });
+    if let Err(e) = spawned {
+        // The closure (and the Child inside it) is dropped on failure: the process
+        // is still running with nobody to wait on it. The reaper is the fallback.
+        disown_child_pid(pid);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -8123,6 +8179,65 @@ fn enforce_app_user_group_rules(def: &AppDefinition) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- child reaping ---------------------------------------------------------
+    // Regression: every non-scheduled service start dropped its `Child` and relied on
+    // the cgroup waiter, which never calls waitpid. Once the reaper stopped doing
+    // waitpid(-1), each service exit left a <defunct> under the daemon.
+
+    fn proc_state(pid: u32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // "<pid> (<comm>) <state> ..." — comm may contain spaces/parens, so anchor
+        // on the last ')'.
+        let rest = stat.rsplit_once(')')?.1;
+        rest.split_whitespace().next()?.chars().next()
+    }
+
+    fn wait_reaped(pid: u32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match proc_state(pid) {
+                // Reaped: the /proc entry is gone.
+                None => return true,
+                Some(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn disowned_service_child_is_reaped_not_left_defunct() {
+        // Control: a dropped, unregistered child really does become a zombie, so the
+        // assertion below is checking something.
+        let ctl = Command::new("sleep").arg("30").stdin(Stdio::null()).spawn().unwrap();
+        let ctl_pid = ctl.id();
+        drop(ctl);
+        let _ = kill(Pid::from_raw(ctl_pid as i32), Signal::SIGKILL);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while proc_state(ctl_pid) != Some('Z') && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(proc_state(ctl_pid), Some('Z'), "control child should be a zombie");
+        // Clean the control up so the test process does not leak it.
+        let _ = waitpid(Pid::from_raw(ctl_pid as i32), None);
+
+        // The fix: same flow, but through disown_service_child + the reaper.
+        start_child_reaper_thread();
+        let child = Command::new("sleep").arg("30").stdin(Stdio::null()).spawn().unwrap();
+        let pid = child.id();
+        disown_service_child(child);
+        assert!(disowned_pids().lock().unwrap().contains(&(pid as i32)));
+        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+        assert!(
+            wait_reaped(pid, Duration::from_secs(5)),
+            "pid {pid} still present (state={:?}) after kill — reaper did not collect it",
+            proc_state(pid)
+        );
+        assert!(
+            !disowned_pids().lock().unwrap().contains(&(pid as i32)),
+            "reaped pid must be dropped from the registry so a reused pid is never waited on"
+        );
+    }
 
     // ---- parse_size_spec_bytes -------------------------------------------------
     // Feeds both cgroup memory limits and log rotation thresholds, so a wrong answer
