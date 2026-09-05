@@ -2518,6 +2518,13 @@ fn disown_service_child(child: std::process::Child) {
 }
 
 fn start_child_reaper_thread() {
+    // Idempotent: two reapers doing targeted waitpid would be harmless but pointless.
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let mut first = false;
+    STARTED.call_once(|| first = true);
+    if !first {
+        return;
+    }
     let _ = std::thread::Builder::new()
         .name("pm-child-reaper".to_string())
         .spawn(move || loop {
@@ -8237,6 +8244,186 @@ mod tests {
             !disowned_pids().lock().unwrap().contains(&(pid as i32)),
             "reaped pid must be dropped from the registry so a reused pid is never waited on"
         );
+    }
+
+    // ---- stop-behavior matrix --------------------------------------------------
+    // Whatever a service child does — exit instantly, ignore the stop signal,
+    // outlive its stop deadline, daemonize — once the daemon lets go of the Child
+    // handle the reaper must collect it, and it must never touch a child whose
+    // handle is still owned (scheduled jobs). One test per behavior.
+
+    fn spawn_sh(script: &str) -> std::process::Child {
+        Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn wait_zombie(pid: u32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if proc_state(pid) == Some('Z') {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn quick_exit_child_already_dead_at_disown_is_still_reaped() {
+        // A service can exit before the daemon even finishes its bookkeeping, so the
+        // pid enters the registry as a zombie. WNOHANG must still collect it.
+        start_child_reaper_thread();
+        let child = spawn_sh("exit 0");
+        let pid = child.id();
+        assert!(wait_zombie(pid, Duration::from_secs(3)), "quick-exit child should be a zombie");
+        disown_service_child(child);
+        assert!(
+            wait_reaped(pid, Duration::from_secs(5)),
+            "already-dead child was not reaped (state={:?})",
+            proc_state(pid)
+        );
+        assert!(!disowned_pids().lock().unwrap().contains(&(pid as i32)));
+    }
+
+    #[test]
+    fn sigterm_immune_child_survives_term_then_is_reaped_after_kill() {
+        // The "refuses to die" service: ignores the stop signal, dies only to the
+        // cgroup force-kill. The reaper must neither drop it from the registry while
+        // it is alive nor leave a zombie once SIGKILL lands.
+        start_child_reaper_thread();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; echo ready; exec >/dev/null; sleep 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // Wait for "ready" so SIGTERM cannot race the trap installation.
+        let mut out = child.stdout.take().unwrap();
+        let mut buf = [0u8; 6];
+        std::io::Read::read_exact(&mut out, &mut buf).unwrap();
+        assert_eq!(&buf, b"ready\n");
+
+        let pid = child.id();
+        disown_service_child(child);
+        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+        // Give the reaper a few cycles: the child must still be alive and tracked.
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(
+            matches!(proc_state(pid), Some(s) if s != 'Z'),
+            "TERM-immune child should still be running, got {:?}",
+            proc_state(pid)
+        );
+        assert!(
+            disowned_pids().lock().unwrap().contains(&(pid as i32)),
+            "a live disowned child must stay registered"
+        );
+        // Escalation (stand-in for cgroup.kill).
+        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+        assert!(
+            wait_reaped(pid, Duration::from_secs(5)),
+            "TERM-immune child not reaped after SIGKILL (state={:?})",
+            proc_state(pid)
+        );
+        assert!(!disowned_pids().lock().unwrap().contains(&(pid as i32)));
+    }
+
+    #[test]
+    fn timed_out_stop_helper_is_reaped_after_the_force_kill() {
+        // Mirror of run_stop_command_in_context's timeout contract: on
+        // "stop_command_timeout" the Child is dropped, the pid handed to the reaper,
+        // and the caller cgroup-kills the helper. Nothing may stay <defunct>.
+        start_child_reaper_thread();
+        let child = spawn_sh("sleep 30");
+        let pid = child.id();
+        drop(child);
+        disown_child_pid(pid);
+        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+        assert!(
+            wait_reaped(pid, Duration::from_secs(5)),
+            "timed-out stop helper not reaped (state={:?})",
+            proc_state(pid)
+        );
+    }
+
+    #[test]
+    fn daemonizing_child_is_reaped_when_it_exits_immediately() {
+        // A service that double-forks: the direct child exits at once, the grandchild
+        // is reparented to init and is not ours to reap. The direct child must not
+        // linger as a zombie.
+        start_child_reaper_thread();
+        let child = spawn_sh("sleep 2 & exit 0");
+        let pid = child.id();
+        disown_service_child(child);
+        assert!(
+            wait_reaped(pid, Duration::from_secs(5)),
+            "daemonizing child not reaped (state={:?})",
+            proc_state(pid)
+        );
+    }
+
+    #[test]
+    fn restart_storm_of_mixed_behaviors_leaves_no_zombies() {
+        // A reload cycling many services at once, with every temperament in the mix:
+        // instant exits (clean and failing), long sleepers, TERM-ignorers. After
+        // TERM-then-KILL, every single one must be reaped and deregistered.
+        start_child_reaper_thread();
+        let behaviors = [
+            "exit 0",
+            "exit 3",
+            "sleep 30",
+            "trap '' TERM; sleep 30",
+            "sleep 2 & exit 0",
+        ];
+        let pids: Vec<u32> = (0..15)
+            .map(|i| {
+                let child = spawn_sh(behaviors[i % behaviors.len()]);
+                let pid = child.id();
+                disown_service_child(child);
+                pid
+            })
+            .collect();
+        for &pid in &pids {
+            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+        }
+        // The TERM-immune ones need the escalation; ESRCH on already-reaped pids is fine.
+        std::thread::sleep(Duration::from_millis(300));
+        for &pid in &pids {
+            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+        }
+        for &pid in &pids {
+            assert!(
+                wait_reaped(pid, Duration::from_secs(10)),
+                "pid {pid} left behind (state={:?}) after the restart storm",
+                proc_state(pid)
+            );
+        }
+        let set = disowned_pids().lock().unwrap();
+        for &pid in &pids {
+            assert!(!set.contains(&(pid as i32)), "pid {pid} still registered after reap");
+        }
+    }
+
+    #[test]
+    fn reaper_never_steals_an_owned_childs_exit_status() {
+        // The design constraint that forbids waitpid(-1): a scheduled job's Child is
+        // owned by spawn_process_waiter, which needs the real exit status. Even while
+        // that child sits as an un-waited zombie, the reaper must leave it alone.
+        start_child_reaper_thread();
+        let mut child = spawn_sh("exit 7");
+        let pid = child.id();
+        // Let it die and give the reaper several cycles over the zombie.
+        assert!(wait_zombie(pid, Duration::from_secs(3)));
+        std::thread::sleep(Duration::from_millis(1500));
+        let st = child.wait().expect("owner must still be able to wait on its child");
+        assert_eq!(st.code(), Some(7), "exit status must reach the owner, not the reaper");
     }
 
     // ---- parse_size_spec_bytes -------------------------------------------------
