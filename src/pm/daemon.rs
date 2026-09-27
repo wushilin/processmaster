@@ -6664,11 +6664,16 @@ fn spawn_supervisor_thread(
             waiter_epoch: &mut u64,
             waiter_cancel: &mut Option<Arc<AtomicBool>>,
             events: &Arc<Mutex<VecDeque<EventEntry>>>,
+            after_start: bool,
         ) {
             if *waiter_running {
                 return;
             }
-            if !cgroup_running_or_assume_running(cfg, app).await {
+            // Right after a start the process was just seen in its cgroup, but it may
+            // already have exited again. Attach anyway: the waiter reports an empty
+            // cgroup as an exit at once. Skipping it here left the exit unobserved and
+            // the service RUNNING forever with nothing running.
+            if !after_start && !cgroup_running_or_assume_running(cfg, app).await {
                 return;
             }
             *waiter_epoch = waiter_epoch.wrapping_add(1);
@@ -6704,6 +6709,7 @@ fn spawn_supervisor_thread(
             &mut waiter_epoch,
             &mut waiter_cancel,
             &events,
+            false,
         )
         .await;
 
@@ -6770,6 +6776,7 @@ fn spawn_supervisor_thread(
                             &mut waiter_epoch,
                             &mut waiter_cancel,
                             &events,
+                            false,
                         )
                         .await;
                         let _ = resp.send(Ok(()));
@@ -6821,6 +6828,7 @@ fn spawn_supervisor_thread(
                         &mut waiter_epoch,
                         &mut waiter_cancel,
                         &events,
+                        true,
                     )
                     .await;
                     set_phase_and_emit(&run_info, &events, &app, Phase::Running, "reload_start_completed");
@@ -6849,6 +6857,7 @@ fn spawn_supervisor_thread(
                             &mut waiter_epoch,
                             &mut waiter_cancel,
                             &events,
+                            false,
                         )
                         .await;
                         let _ = resp.send(Ok(()));
@@ -6943,6 +6952,7 @@ fn spawn_supervisor_thread(
                             &mut waiter_epoch,
                             &mut waiter_cancel,
                             &events,
+                            true,
                         )
                         .await;
                     }
@@ -7090,6 +7100,7 @@ fn spawn_supervisor_thread(
                             &mut waiter_epoch,
                             &mut waiter_cancel,
                             &events,
+                            false,
                         )
                         .await;
                         let _ = resp.send(Ok(()));
@@ -7150,6 +7161,7 @@ fn spawn_supervisor_thread(
                             &mut waiter_epoch,
                             &mut waiter_cancel,
                             &events,
+                            true,
                         )
                         .await;
                     }
@@ -7205,6 +7217,7 @@ fn spawn_supervisor_thread(
                             &mut waiter_epoch,
                             &mut waiter_cancel,
                             &events,
+                            false,
                         )
                         .await;
                         record_started_in_store(&run_info, &app, StartKind::Restart, SystemFlag::SystemStart);
@@ -7249,6 +7262,7 @@ fn spawn_supervisor_thread(
                         &mut waiter_epoch,
                         &mut waiter_cancel,
                         &events,
+                        true,
                     )
                     .await;
                     set_phase_and_emit(&run_info, &events, &app, Phase::Running, "reload_restart_completed");
@@ -7290,6 +7304,7 @@ fn spawn_supervisor_thread(
                             &mut waiter_epoch,
                             &mut waiter_cancel,
                             &events,
+                            false,
                         )
                         .await;
                         let _ = resp.send(Ok(()));
@@ -7325,6 +7340,7 @@ fn spawn_supervisor_thread(
                         &mut waiter_epoch,
                         &mut waiter_cancel,
                         &events,
+                        true,
                     )
                     .await;
                     set_phase_and_emit(&run_info, &events, &app, Phase::Running, "boot_start_completed");
@@ -7351,6 +7367,7 @@ fn spawn_supervisor_thread(
                             &mut waiter_epoch,
                             &mut waiter_cancel,
                             &events,
+                            false,
                         )
                         .await;
                         let _ = resp.send(Ok(()));
@@ -7448,6 +7465,7 @@ fn spawn_supervisor_thread(
                             &mut waiter_epoch,
                             &mut waiter_cancel,
                             &events,
+                            false,
                         )
                         .await;
                         continue;
@@ -7580,6 +7598,7 @@ fn spawn_supervisor_thread(
                         &mut waiter_epoch,
                         &mut waiter_cancel,
                         &events,
+                        true,
                     )
                     .await;
                     set_phase_and_emit(&run_info, &events, &app, Phase::Running, "failure_auto_restart_completed");
