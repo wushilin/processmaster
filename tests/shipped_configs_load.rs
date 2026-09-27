@@ -148,3 +148,23 @@ fn shipped_examples_do_not_configure_a_console_that_would_refuse_to_serve() {
         );
     }
 }
+
+#[test]
+fn a_relative_config_path_yields_absolute_directories() {
+    // Regression: `processmaster -c config.yaml` (and the default with no -c) left
+    // config_directory / auto_service_directory relative, which the root-controlled
+    // path checks refuse -- the daemon came up with no services at all.
+    // cargo runs integration tests from the package root, so this path is relative to it.
+    let rel = Path::new("config.yaml");
+    if !repo_root().join(rel).is_file() {
+        return;
+    }
+    assert_eq!(std::env::current_dir().unwrap(), repo_root());
+    let cfg = load_master_config(rel).expect("repo-root config.yaml loads via a relative path");
+    assert!(cfg.config_directory.is_absolute(), "{}", cfg.config_directory.display());
+    assert!(cfg.config_directory.starts_with(repo_root()));
+    assert!(cfg.sock.is_absolute(), "{}", cfg.sock.display());
+    if let Some(d) = &cfg.auto_service_directory {
+        assert!(d.is_absolute(), "{}", d.display());
+    }
+}

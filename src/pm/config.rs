@@ -756,8 +756,17 @@ pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
         }
     }
 
-    // Resolve relative paths against the config file directory.
-    let base = config_path.parent().unwrap_or_else(|| Path::new("."));
+    // Resolve relative paths against the config file directory, made absolute: with
+    // `-c config.yaml` the parent is empty, and the directories must come out absolute
+    // (safefs refuses relative paths, so config_directory and auto-services would not load).
+    let config_abs = if config_path.is_absolute() {
+        config_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("cannot resolve the relative config path: current directory unavailable")?
+            .join(config_path)
+    };
+    let base = config_abs.parent().unwrap_or_else(|| Path::new("/"));
     if cfg.sock.is_relative() {
         cfg.sock = base.join(&cfg.sock);
     }

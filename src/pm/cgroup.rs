@@ -524,23 +524,18 @@ pub(crate) fn resolve_device_major_minor(path: &Path) -> anyhow::Result<(u32, u3
 
 /// Look up a user's home directory from the passwd database.
 ///
-/// The `users` crate at the pinned version exposes no `home_dir()`, so go to libc.
-/// Called in the parent only — never between fork and exec.
+/// Goes through `users` (getpwnam_r into an owned buffer), not bare getpwnam: services
+/// are spawned concurrently, and getpwnam's static result buffer is process-wide under
+/// musl, so one spawn could read another's half-overwritten entry (seen as HOME with an
+/// interior NUL, failing the spawn). Called in the parent only — never between fork and exec.
 fn home_dir_of(user: &str) -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let cname = std::ffi::CString::new(user).ok()?;
-    // SAFETY: cname is NUL-terminated; the returned passwd is owned by libc and is only
-    // read before the next getpwnam call on this thread.
-    let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
-    if pw.is_null() {
+    use users::os::unix::UserExt as _;
+    let u = users::get_user_by_name(user)?;
+    let dir = u.home_dir();
+    if dir.as_os_str().is_empty() {
         return None;
     }
-    // SAFETY: pw is non-null and points at a valid passwd with a NUL-terminated pw_dir.
-    let dir = unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) };
-    if dir.to_bytes().is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
+    Some(dir.to_path_buf())
 }
 
 /// The minimal, explicit environment a supervised service starts with.
@@ -1032,6 +1027,34 @@ mod tests {
             is_io_not_found(&err),
             "expected a recoverable NotFound, got: {err:#}"
         );
+    }
+
+    #[test]
+    fn home_dir_lookup_is_safe_across_concurrent_spawns() {
+        // Regression: bare getpwnam shares one static buffer process-wide under musl, so
+        // concurrent spawns at boot read each other's entries (a HOME with an interior
+        // NUL failed a spawn). Every thread must always see its own user's home.
+        let Some(root_home) = home_dir_of("root") else { return };
+        let other = ["nobody", "daemon", "bin"]
+            .into_iter()
+            .find_map(|u| home_dir_of(u).map(|h| (u, h)));
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let root_home = root_home.clone();
+                let other = other.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..2000 {
+                        match (&other, i % 2) {
+                            (Some((u, h)), 1) => assert_eq!(home_dir_of(u).as_ref(), Some(h)),
+                            _ => assert_eq!(home_dir_of("root").as_ref(), Some(&root_home)),
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("home_dir_of returned another user's entry");
+        }
     }
 
     #[test]
