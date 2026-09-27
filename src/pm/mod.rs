@@ -8,6 +8,7 @@ pub mod daemon;
 pub mod pmctl_cli;
 pub mod web_console;
 pub mod rpc;
+pub(crate) mod safefs;
 
 pub fn main() -> anyhow::Result<()> {
     cli::run()

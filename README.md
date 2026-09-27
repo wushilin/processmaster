@@ -157,6 +157,20 @@ echo xyz | pmctl password verify --secure "$SECURE" --user hello --password
 
 Tip: if you pass `--password` with no value, pmctl reads the password from stdin (one line).
 
+Use the same bcrypt cost for every user (10 or more; 12 is a good default). Unknown usernames are
+timed against a dummy hash at the most common configured cost, so mixed costs let an attacker tell
+which usernames exist; the daemon logs a startup warning for mixed or low (< 10) costs. Costs above
+16 are refused (the console does not start), since each login would take minutes or more.
+
+Login hardening: after 10 failed logins from one source address (IPv6: per /64) with no 5-minute
+pause, that source gets `429` + `Retry-After` for 30s, and no password check is run for it.
+Requests during a lockout are refused without extending it, so an open console tab does not keep its
+own address locked. A failure after a lockout ends locks again for twice as long, up to 15 minutes.
+Successful logins do not clear the record (a logged-in admin behind the same NAT or proxy would
+otherwise keep resetting an attacker's count); it is forgotten after 5 minutes without failures. Concurrent
+bcrypt checks are capped at 2x the CPU count; beyond that the console answers `503` + `Retry-After: 1`.
+The source is the TCP peer, so behind a reverse proxy all clients share the proxy's record.
+
 # Operator-triggered commands (run as root; cwd="."; fire-and-forget). You can use this mechanism update processmaster binary even!
 # if you did not define any, then there is extra "admin action" admin can trigger remotely on the web UI. By default no action possible.
 admin_actions:
@@ -429,24 +443,26 @@ Environment values support indirections for secrets/config blobs:
 - `@base64://...`
 - `@hex://...`
 
-## Provisioning (one-time workdir setup)
+## Provisioning (workdir setup, re-applied on change)
 
-If you define `provisioning:`, it is applied **during definition load** (startup or “reload defs”).
-Provisioning is guarded by a marker file: `${working_directory}/.pm_provisioned`.
+If you define `provisioning:`, it is checked **during definition load** (startup or “reload defs”) **and before every service start**.
+Provisioning state is recorded in a marker file: `${working_directory}/.pm_provisioned`.
 
-- If the marker exists, provisioning is skipped.
+- The marker records each entry's spec plus a stat fingerprint (device, inode, size, mtime, ctime) of every regular-file target, taken after provisioning finished.
+- If the marker matches, provisioning is skipped.
+- Provisioning runs again when the marker is missing, when the `provisioning:` spec changed, or when a file target no longer matches its fingerprint — e.g. a redeployed binary, which loses its `setcap` capability when replaced.
+- Markers written by older releases (empty, or `provisioned_at_ms=...`) are accepted: they trigger one more provisioning pass and are replaced by the new format.
+- Directory targets are not fingerprinted (their timestamps change whenever files are created in them).
+- All provisioning actions are idempotent, so a spurious re-run (e.g. after `touch`) is harmless.
+- `mode` may not set setuid/setgid bits (`04000`/`02000`): provisioning re-applies automatically to whatever file sits at the target, so those bits would be stamped onto a binary the service user swapped in.
 - The marker is written **only after all provisioning entries succeed**.
-- If provisioning fails, the app is **not loaded**; fix the error and reload definitions to retry.
+- If provisioning fails at load, the app is **not loaded**; if it fails at start, the start is refused. Fix the error and reload definitions / start again to retry.
 - Relative `provisioning[].path` is resolved **under `process.working_directory`**.
 
 ### Re-provision (reapply) flow
 
-To re-apply provisioning for a service:
-
-- delete `${working_directory}/.pm_provisioned`
-- then reload definitions (web UI: “Reload Service Definition”, or `pmctl update`)
-
-On the next definition load, provisioning runs again and a new marker is written only on full success.
+Normally nothing is needed: replacing a provisioned file or editing `provisioning:` triggers a re-run on the next load or start.
+To force a re-run anyway, delete `${working_directory}/.pm_provisioned` and reload definitions (web UI: “Reload Service Definition”, or `pmctl update`) or start the service.
 
 Example:
 
@@ -473,7 +489,9 @@ Root requirements:
 Admin actions are configured in the master config under `admin_actions`.
 
 - Launched as **fire-and-forget** processes (RPC returns immediately)
-- Placed into the cgroup `${cgroup.name}/admin_actions`
+- Each action runs in its own cgroup `${cgroup.name}/admin_actions/<id>`; a second run of the same id is **refused while the previous one is still running** (different ids may run concurrently)
+- Action ids must be 1-64 chars of `[A-Za-z0-9_-]`; `run` is reserved
+- **Only root-controlled code may run.** `command[0]` must be an absolute path, and it plus every later argument that names an existing file (e.g. the script passed to `/bin/sh`) must be owned by root and not group/other-writable — as must every parent directory, both as written and after resolving symlinks. Otherwise the daemon **refuses to start**, and the check is repeated before every run. Files referenced only inside an inline `sh -c "..."` string cannot be checked; keep those root-owned yourself.
 - Stdio is appended to `./logs/admin_action_stdout.log` and `./logs/admin_action_stderr.log` (relative to daemon cwd)
 - Daemon must run as root to run admin actions
 
@@ -490,6 +508,33 @@ Web UI:
 
 - “Admin actions” button opens a modal listing configured actions + running PIDs, with “Kill all” and “Run”.
 
+## Testing
+
+- `cargo test`: unit and config tests; no root needed.
+- `tests/supervisor_scenarios.rs`: end-to-end supervision against a real daemon. Each test writes its own config in code, starts a private `processmaster` (own socket, own cgroup `pmtest-<pid>-<n>`) and cleans up afterwards. Scenarios: quick-failing service (restarted until the tolerance, then FAILED), `never` policy, daemonizing service (forks to the background and exits; tracked via its cgroup), background worker dying later, SIGTERM-immune service (force-killed after the grace period), graceful TERM handler, 20-child fan-out, output capture on both streams, and recovery of a FAILED service by manual start. They need root and cgroup v2, so they are `#[ignore]`d by default:
+
+  ```bash
+  cargo test --test supervisor_scenarios --no-run
+  sudo "$(ls -t target/debug/deps/supervisor_scenarios-* | grep -v '\.d$' | head -1)" --ignored
+  ```
+
+  CI runs them on every push and PR.
+
+## Security rules (root daemon)
+
+processmaster runs as root and works inside directories that service users can write (working directories, `logs/`, auto-service directories). It enforces these rules; configurations that break them are refused, not silently weakened:
+
+- **Service definitions must be root-controlled.** Every definition file (`config_directory/*.yaml`, auto-service `service.yml`) must be a regular file owned by root, with a single hard link, not writable by others, and group-writable only if its group is root. Otherwise it is not loaded, and the previously loaded definition (if any) is kept.
+- **Auto-services only load from root-controlled directories.** "Root-controlled" means the directory and every directory above it are owned by root and not writable by anyone else. An auto-service directory is also the service's working directory. If the service user can write it (for example, provisioning chowned it), nothing inside it can be trusted: the user could rename a root-owned file, even a log holding its own output, into `service.yml` or `.regen_pm_config`. Such directories are **skipped** with an `auto_service_dir_not_root_controlled` warning.
+
+  To run a service from a directory its user owns, define it in `config_directory` with `process.working_directory` pointing at that directory. A `config_directory` definition with the same name takes precedence over the skipped auto-service directory, with no conflict error.
+- **No symlinks below the root-controlled part of a path.** Log files and directories, log viewing (`pmctl logs`, the web console), provisioning targets, `@file://` environment values and admin-action logs are opened one component at a time without following symlinks. This applies anywhere below the deepest root-owned, non-group/other-writable directory. Symlinks that root placed in root-controlled directories (e.g. `/var/run -> /run`) keep working. A service that swaps `logs/` for a symlink gets a log pump error, not a root write elsewhere.
+- **Provisioning** refuses paths containing `..`, targets with multiple hard links, and setuid/setgid modes. Recursive chowns walk by descriptor and skip symlinks and hard-linked files. The capability is set on the opened file (no `setcap` binary is needed any more).
+- **Rotated logs** are gzip-compressed in-process (no `gzip` binary needed).
+- **Admin actions** whose program or script arguments a non-root user could modify are logged as a `WARNING` at startup and refused at run time. They no longer stop the daemon from starting. `command[0]` may not be `env`, and `/dev/...` arguments (e.g. `/dev/null`) are allowed.
+- **Limits:** `max_cpu` must be 10m–1024 cores (below 10m the kernel rejects the quota), checked when definitions load. Durations (`stop_grace_period_ms`, `restart_backoff_ms`, duration strings) are capped at 30 days, flag TTLs at 3650 days. User flags may only contain `[a-z0-9_.:-]`. The control socket closes connections that send no request within 10 s, and accepts at most 256 at once.
+- **Shutdown:** once the daemon is shutting down, requests that would start processes (start/restart/enable/update/admin actions) are refused on both the socket and the web console.
+
 ## Observability
 
 Useful commands:
@@ -500,6 +545,12 @@ pmctl events [-n 200] [<app>] [--format text|json]
 pmctl logs <app> -n 50
 pmctl logs -f [filename]
 ```
+
+When stdout is a terminal, `pmctl logs` and `pmctl events` print control characters and escape
+sequences from service output as visible text (`\x1b`, `\u{9b}`), keeping only newlines, tabs and
+SGR colours, so a service cannot drive the operator's terminal (clipboard writes, title changes,
+cursor movement). Unicode bidi controls (e.g. `\u{202e}`) and SGR conceal (`ESC[8m`) are escaped
+too, so text cannot be hidden or visually reordered; the CR of a CRLF line ending is dropped. Piped or redirected output is passed through byte-for-byte.
 
 `pmctl status --format json` includes provisioning visibility fields:
 

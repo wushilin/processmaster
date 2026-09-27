@@ -216,18 +216,37 @@ pub(crate) fn kill_with_signal(cgroup_dir: &Path, signal: Option<Signal>) -> any
 /// relative to the cgroup mount root. Fails closed: if anything cannot be determined,
 /// the caller skips the signal rather than risking an unrelated process.
 fn pid_is_in_cgroup(pid: u32, cgroup_dir: &Path) -> bool {
+    pid_cgroup_membership(pid, cgroup_dir).unwrap_or(false)
+}
+
+/// Is `pid` in `cgroup_dir` or below it? `None` when that cannot be determined (a
+/// non-standard cgroup mount point); `Some(false)` also covers "the pid is gone".
+fn pid_cgroup_membership(pid: u32, cgroup_dir: &Path) -> Option<bool> {
     const MOUNT_ROOT: &str = "/sys/fs/cgroup";
-    let Ok(target_rel) = cgroup_dir.strip_prefix(MOUNT_ROOT) else {
-        // Non-standard mount point: we cannot compare reliably, so do not guess.
-        return false;
-    };
+    // Non-standard mount point: we cannot compare reliably, so do not guess.
+    let target_rel = cgroup_dir.strip_prefix(MOUNT_ROOT).ok()?;
     let want = format!("/{}", target_rel.to_string_lossy());
-    let Ok(text) = fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
-        return false; // process is gone, or unreadable
+    let text = match fs::read_to_string(format!("/proc/{pid}/cgroup")) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Some(false), // gone
+        // Unreadable for another reason (e.g. a different pid namespace or /proc
+        // mount): we cannot tell. Saying "not a member" here would make the waiters
+        // skip the pid forever and spin.
+        Err(_) => return None,
     };
-    text.lines()
-        .filter_map(|l| l.strip_prefix("0::"))
-        .any(|path| path == want || path.starts_with(&format!("{want}/")))
+    Some(
+        text.lines()
+            .filter_map(|l| l.strip_prefix("0::"))
+            .any(|path| path == want || path.starts_with(&format!("{want}/"))),
+    )
+}
+
+/// After `pidfd_open(pid)`, confirm the pid still belongs to the cgroup. The pid was
+/// read from `cgroup.procs` earlier; if it exited and was reused by an unrelated
+/// process in between, the waiter would otherwise block on that process indefinitely
+/// and miss the service's exit. The pidfd pins the process, so the answer is stable.
+fn pidfd_still_in_cgroup(pid: u32, cgroup_dir: &Path) -> bool {
+    pid_cgroup_membership(pid, cgroup_dir) != Some(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -303,6 +322,13 @@ pub(crate) fn wait_all(cgroup_dir: &Path) -> anyhow::Result<()> {
                 return Err(anyhow::anyhow!("pidfd_open pid={pid} failed: {e}"));
             }
         };
+        if !pidfd_still_in_cgroup(pid, cgroup_dir) {
+            // SAFETY: fd came from pidfd_open.
+            unsafe {
+                let _ = libc::close(fd);
+            }
+            continue;
+        }
 
         let r = wait_pidfd(fd, -1);
         // SAFETY: fd came from pidfd_open.
@@ -338,6 +364,9 @@ pub(crate) fn wait_all_cancellable(cgroup_dir: &Path, cancel: &AtomicBool) -> an
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => return Err(anyhow::anyhow!("pidfd_open pid={pid} failed: {e}")),
         };
+        if !pidfd_still_in_cgroup(pid, cgroup_dir) {
+            continue; // reused pid: `fd` is closed on drop
+        }
 
         // Poll in intervals so we can observe cancellation without burning CPU.
         // Note: we don't have an eventfd to interrupt poll; cancellation is cooperative on timeout.

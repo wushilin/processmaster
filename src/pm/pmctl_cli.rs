@@ -1,6 +1,7 @@
 use crate::pm::{cli, rpc};
 use clap::Parser;
-use std::io::BufRead;
+use std::borrow::Cow;
+use std::io::{BufRead, IsTerminal};
 use std::path::PathBuf;
 use std::{env, fmt};
 
@@ -595,11 +596,12 @@ pub fn run() -> anyhow::Result<()> {
                     let t = s.trim().to_string();
                     if t.is_empty() { None } else { Some(t) }
                 });
+                let tty = std::io::stdout().is_terminal();
                 return rpc::client_follow(
                     &sock,
                     rpc::Request::LogsFollow { name, filename, n },
                     |line| {
-                        println!("{line}");
+                        println!("{}", for_stdout(line, tty));
                     },
                 );
             }
@@ -609,7 +611,7 @@ pub fn run() -> anyhow::Result<()> {
             };
             let resp = rpc::client_call(&sock, rpc::Request::Logs { name, n })?;
             if !resp.message.trim().is_empty() {
-                println!("{}", resp.message.trim_end());
+                println!("{}", for_stdout(resp.message.trim_end(), std::io::stdout().is_terminal()));
             }
             Ok(())
         }
@@ -625,12 +627,14 @@ pub fn run() -> anyhow::Result<()> {
             let resp = rpc::client_call(&sock, rpc::Request::Events { name, n })?;
             match format {
                 cli::OutputFormat::Text => {
+                    let tty = std::io::stdout().is_terminal();
                     for e in resp.events {
-                        if let Some(app) = e.app {
-                            println!("{} [{}] app={} {}", e.ts, e.component, app, e.message);
+                        let line = if let Some(app) = e.app {
+                            format!("{} [{}] app={} {}", e.ts, e.component, app, e.message)
                         } else {
-                            println!("{} [{}] {}", e.ts, e.component, e.message);
-                        }
+                            format!("{} [{}] {}", e.ts, e.component, e.message)
+                        };
+                        println!("{}", for_stdout(&line, tty));
                     }
                     Ok(())
                 }
@@ -677,6 +681,97 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 
+/// Service-controlled text (log lines, event messages) on its way to stdout.
+///
+/// On a terminal it is neutralised by `sanitize_for_terminal`; otherwise it passes
+/// through untouched, so `pmctl logs > file` stays lossless.
+pub(crate) fn for_stdout(s: &str, tty: bool) -> Cow<'_, str> {
+    if tty { sanitize_for_terminal(s) } else { Cow::Borrowed(s) }
+}
+
+/// Makes text safe to print to the operator's terminal.
+///
+/// A service can write anything into its own log, and those bytes would otherwise be
+/// interpreted by whoever runs `pmctl logs`: OSC 52 writes their clipboard, other OSC /
+/// CSI / C1 sequences retitle the window, move the cursor to overwrite earlier output,
+/// or worse on some emulators. Newline, tab and plain SGR colour (`ESC [ digits;... m`)
+/// are kept since real logs use them, except SGR 8 (conceal), which would hide text; a
+/// CR directly before LF (CRLF line endings) is dropped. Every other C0 control, DEL,
+/// C1 control and Unicode bidi control (which can visually reorder a line, "Trojan
+/// Source" style) is rendered as visible text (`\x1b`, `\u{9b}`, `\u{202e}`) instead
+/// of being emitted.
+fn sanitize_for_terminal(s: &str) -> Cow<'_, str> {
+    let is_control = |c: char| {
+        (matches!(c, '\0'..='\x1f' | '\x7f' | '\u{80}'..='\u{9f}') && c != '\n' && c != '\t')
+            || is_bidi_control(c)
+    };
+    if !s.chars().any(is_control) {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut rest = s;
+    while let Some(c) = rest.chars().next() {
+        if c == '\x1b' {
+            if let Some(len) = sgr_len(rest) {
+                out.push_str(&rest[..len]);
+                rest = &rest[len..];
+                continue;
+            }
+        }
+        if c == '\r' && rest[1..].starts_with('\n') {
+            rest = &rest[1..];
+            continue;
+        }
+        if is_control(c) {
+            if (c as u32) < 0x80 {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            } else {
+                out.push_str(&format!("\\u{{{:x}}}", c as u32));
+            }
+        } else {
+            out.push(c);
+        }
+        rest = &rest[c.len_utf8()..];
+    }
+    Cow::Owned(out)
+}
+
+/// Unicode bidirectional formatting controls: embeddings/overrides (U+202A-U+202E),
+/// isolates (U+2066-U+2069) and the LRM/RLM/ALM marks.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}' | '\u{61c}')
+}
+
+/// Length of the SGR sequence `ESC [ [0-9;]* m` at the start of `s`, if there is one
+/// and it does not select conceal (parameter 8), which would make log text invisible.
+fn sgr_len(s: &str) -> Option<usize> {
+    let body = s.strip_prefix("\x1b[")?;
+    let len = body.bytes().take_while(|b| b.is_ascii_digit() || *b == b';').count();
+    if body.as_bytes().get(len) != Some(&b'm') {
+        return None;
+    }
+    let mut params = body[..len].split(';').map(|p| p.parse::<u32>().unwrap_or(0));
+    while let Some(p) = params.next() {
+        match p {
+            8 => return None,
+            // Extended colour: `38;5;n` or `38;2;r;g;b` -- those numbers are colour
+            // values, not attributes, so an 8 among them is not conceal.
+            38 | 48 | 58 => {
+                let skip = match params.next() {
+                    Some(5) => 1,
+                    Some(2) => 3,
+                    _ => 0,
+                };
+                for _ in 0..skip {
+                    params.next();
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(2 + len + 1)
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -692,5 +787,74 @@ mod tests {
         // A difference in the last byte must be caught as reliably as the first.
         assert!(!ct_eq("aaaaaaaaZ", "aaaaaaaaY"));
         assert!(!ct_eq("Zaaaaaaaa", "Yaaaaaaaa"));
+    }
+
+    #[test]
+    fn terminal_output_keeps_colour_and_whitespace() {
+        let s = "\x1b[1;31merror\x1b[0m\tdone\n";
+        assert_eq!(sanitize_for_terminal(s), s);
+        assert!(matches!(sanitize_for_terminal("plain text"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn terminal_output_neutralises_osc_52_clipboard_writes() {
+        let out = sanitize_for_terminal("x\x1b]52;c;ZXZpbA==\x07y");
+        assert!(!out.contains('\x1b') && !out.contains('\x07'));
+        assert_eq!(out, "x\\x1b]52;c;ZXZpbA==\\x07y");
+    }
+
+    #[test]
+    fn terminal_output_neutralises_cursor_movement_and_other_csi() {
+        for s in ["\x1b[2J", "\x1b[1;1H", "\x1b[3A", "\x1b[?1049h", "\x1b[31", "\x1b", "a\rb", "\x08\x7f"] {
+            let out = sanitize_for_terminal(s);
+            assert!(!out.chars().any(|c| c.is_control()), "{s:?} -> {out:?}");
+        }
+        assert_eq!(sanitize_for_terminal("\x1b[2J"), "\\x1b[2J");
+    }
+
+    #[test]
+    fn terminal_output_neutralises_c1_controls() {
+        // U+009B is a single-character CSI on terminals that honour C1.
+        let out = sanitize_for_terminal("a\u{9b}2Jb\u{9d}0;title\u{9c}");
+        assert_eq!(out, "a\\u{9b}2Jb\\u{9d}0;title\\u{9c}");
+        // Ordinary non-ASCII text is untouched.
+        assert_eq!(sanitize_for_terminal("héllo 世界"), "héllo 世界");
+    }
+
+    #[test]
+    fn terminal_output_drops_cr_of_crlf_but_escapes_a_lone_cr() {
+        assert_eq!(sanitize_for_terminal("a\r\nb\r\n"), "a\nb\n");
+        assert_eq!(sanitize_for_terminal("a\rb"), "a\\x0db");
+        assert_eq!(sanitize_for_terminal("a\r\r\nb\r"), "a\\x0d\nb\\x0d");
+    }
+
+    #[test]
+    fn terminal_output_escapes_bidi_controls() {
+        for c in ['\u{202a}', '\u{202e}', '\u{2066}', '\u{2069}', '\u{200e}', '\u{200f}', '\u{61c}'] {
+            let out = sanitize_for_terminal(&format!("x{c}y")).into_owned();
+            assert!(!out.contains(c), "{c:?} -> {out:?}");
+            assert_eq!(out, format!("x\\u{{{:x}}}y", c as u32));
+        }
+        // Right-to-left text itself is not a control and is kept.
+        assert_eq!(sanitize_for_terminal("שלום"), "שלום");
+    }
+
+    #[test]
+    fn terminal_output_escapes_sgr_conceal() {
+        for s in ["\x1b[8m", "\x1b[1;8m", "\x1b[08m", "\x1b[31;8;1m"] {
+            let out = sanitize_for_terminal(s);
+            assert!(!out.contains('\x1b'), "{s:?} -> {out:?}");
+        }
+        // An 8 that is a colour value, or part of another number, is not conceal.
+        for s in ["\x1b[38;5;8m", "\x1b[48;2;8;8;8m", "\x1b[28m", "\x1b[18;1m"] {
+            assert_eq!(sanitize_for_terminal(s), s);
+        }
+    }
+
+    #[test]
+    fn non_terminal_output_is_passed_through_unchanged() {
+        let s = "\x1b]52;c;ZXZpbA==\x07\u{9b}";
+        assert_eq!(for_stdout(s, false), s);
+        assert_ne!(for_stdout(s, true), s);
     }
 }

@@ -111,9 +111,9 @@ process:
 
 Runs never overlap: if the previous run is still going at the next tick, that tick is skipped (no queueing).
 
-### Provisioning (one-time setup at load)
+### Provisioning (setup at load, re-applied on change)
 
-`provisioning:` entries run once per working_directory during definition load, guarded by the marker file `${working_directory}/.pm_provisioned`. The marker is written only if ALL entries succeed; on failure the app is not loaded — fix and `pmctl update` to retry. Relative paths resolve under working_directory.
+`provisioning:` entries are checked at definition load and before every start against the marker file `${working_directory}/.pm_provisioned`, which records the spec and a stat fingerprint (dev/inode/size/mtime/ctime) of each regular-file target. They re-run when the marker is missing or legacy (older empty/`provisioned_at_ms=` markers just cause one re-run), the spec changed, or a file target changed (e.g. a replaced binary, which loses its setcap). The marker is written only if ALL entries succeed; on failure at load the app is not loaded, at start the start is refused — fix and `pmctl update` / start to retry. Relative paths resolve under working_directory.
 
 ```yaml
 provisioning:
@@ -125,13 +125,13 @@ provisioning:
     add_net_bind_capability: true   # setcap cap_net_bind_service=+ep → bind :80/:443 without root
 ```
 
-To re-apply (e.g. after changing provisioning): delete `.pm_provisioned`, then `pmctl update`.
+Re-apply is automatic after editing `provisioning:` or replacing a target file. To force it: delete `.pm_provisioned`, then `pmctl update`.
 
 ### Updating a deployed app's binary/files
 
 1. `pmctl stop myapp` (deterministic — nothing survives)
 2. Replace the app's files in its working_directory
-3. `pmctl start myapp` — or `pmctl restart myapp` if you replaced files while running (most binaries tolerate this on Linux)
+3. `pmctl start myapp` — or `pmctl restart myapp` if you replaced files while running (most binaries tolerate this on Linux). Provisioning (mode, ownership, setcap) on replaced files is re-applied automatically before the start.
 4. If you changed the service YAML too: `pmctl update` first, then restart.
 
 ## pmctl: socket resolution (PMCTL_SOCK)
@@ -232,14 +232,16 @@ Run the daemon under systemd with `KillMode=process` so systemd doesn't kill the
 
 ### Remote/self-update via admin actions
 
-`admin_actions` in the master config are operator-triggered root commands (fire-and-forget, cwd = daemon cwd, placed in the `<cgroup>/admin_actions` cgroup, output appended to `./logs/admin_action_std{out,err}.log`). Because the RPC returns before the command runs, **the daemon can restart itself** — this is the intended way to push a new binary without shelling into the box:
+`admin_actions` in the master config are operator-triggered root commands (fire-and-forget, cwd = daemon cwd, placed in the `<cgroup>/admin_actions/<id>` cgroup, one run per id at a time, output appended to `./logs/admin_action_std{out,err}.log`). Because the RPC returns before the command runs, **the daemon can restart itself** — this is the intended way to push a new binary without shelling into the box:
 
 ```yaml
 admin_actions:
   update-pm:
     label: "Update ProcessMaster"
-    command: ["/bin/sh", "-lc", "cd /opt/processmaster && ./fetch-latest.sh && systemctl restart processmaster"]
+    command: ["/bin/sh", "/opt/processmaster/update.sh"]   # update.sh: fetch, install, systemctl restart processmaster
 ```
+
+Security rule (enforced; daemon refuses to start otherwise, re-checked on every run): `command[0]` must be absolute, and it plus any argument naming an existing file — and all their parent dirs — must be root-owned and not group/other-writable. Pass scripts as their own argument (as above) so they get checked; a path buried inside an inline `sh -c "..."` string cannot be. Ids: `[A-Za-z0-9_-]{1,64}`, `run` reserved.
 
 Trigger with `pmctl admin-run update-pm` or the web UI "Admin actions" modal. `admin-ps` shows running action PIDs; `admin-kill` cgroup-kills them all. No actions are defined by default.
 
@@ -250,4 +252,5 @@ Trigger with `pmctl admin-run update-pm` or the web UI "Admin actions" modal. `a
 - `pmctl is not co-built with this daemon` → deploy matching pair; check `pmctl version` vs `pmctl server-version` output in the error.
 - Daemon won't start: must be root; must be cgroup v2; a live socket at the path means another daemon is running.
 - Service marked FAILED and not restarting → restart tolerance exceeded (`restart_policy.tolerance`); `pmctl start <app>` to retry manually.
-- Provisioning failed → app not loaded; fix the error, then `pmctl update` (delete `.pm_provisioned` first to force re-apply).
+- Definition not loading (`read_failed ... not root` / `auto_service_yml_missing ... directory_not_root_controlled`) → definition files must be root-owned, 0644-ish, single hard link; an auto-service dir the service user can write is skipped (`auto_service_dir_not_root_controlled`) — move its definition to config_directory with `process.working_directory` pointing at it. Log pump error `... symlink ... refusing to follow` → something below the root-owned part of the log path is a symlink.
+- Provisioning failed → app not loaded; fix the error, then `pmctl update` or start it again (re-apply is automatic on spec/file change; delete `.pm_provisioned` to force).

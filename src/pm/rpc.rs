@@ -463,6 +463,20 @@ fn fmt_uptime_ms(ms: i64) -> String {
 /// smaller; a `status --format json` over many services is still well under this.
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// `read_line`, but refusing a line longer than `max` bytes.
+///
+/// The bound is per line, not per stream: a hostile or wedged peer -- including an
+/// impostor socket pointed at via PMCTL_SOCK, which is accepted with no ownership check
+/// -- could otherwise stream bytes without a newline until the client OOMs, while a
+/// long-running `logs -f` legitimately carries an unbounded number of lines.
+fn read_bounded_line<R: BufRead>(reader: &mut R, buf: &mut String, max: u64) -> anyhow::Result<usize> {
+    let n = reader.by_ref().take(max).read_line(buf)?;
+    if n as u64 >= max && !buf.ends_with('\n') {
+        anyhow::bail!("response line from daemon exceeds {max} bytes");
+    }
+    Ok(n)
+}
+
 pub fn client_call(sock: &Path, req: Request) -> anyhow::Result<Response> {
     let mut stream = UnixStream::connect(sock).map_err(|e| {
         anyhow::anyhow!(
@@ -479,12 +493,10 @@ pub fn client_call(sock: &Path, req: Request) -> anyhow::Result<Response> {
     stream.write_all(line.as_bytes())?;
     stream.flush()?;
 
-    // Bound the response like the daemon bounds requests. A hostile or wedged peer --
-    // including an impostor socket pointed at via PMCTL_SOCK, which is accepted with no
-    // ownership check -- could otherwise stream bytes without a newline until pmctl OOMs.
-    let mut reader = BufReader::new(stream).take(MAX_RESPONSE_BYTES);
+    // Bound the response like the daemon bounds requests (see read_bounded_line).
+    let mut reader = BufReader::new(stream);
     let mut resp_line = String::new();
-    reader.read_line(&mut resp_line)?;
+    read_bounded_line(&mut reader, &mut resp_line, MAX_RESPONSE_BYTES)?;
     if resp_line.trim().is_empty() {
         anyhow::bail!("empty response from daemon");
     }
@@ -514,9 +526,9 @@ where
     stream.write_all(line.as_bytes())?;
     stream.flush()?;
 
-    let mut reader = BufReader::new(stream).take(MAX_RESPONSE_BYTES);
+    let mut reader = BufReader::new(stream);
     let mut first = String::new();
-    reader.read_line(&mut first)?;
+    read_bounded_line(&mut reader, &mut first, MAX_RESPONSE_BYTES)?;
     if first.trim().is_empty() {
         anyhow::bail!("empty response from daemon");
     }
@@ -525,11 +537,12 @@ where
         anyhow::bail!("{}", resp.message);
     }
 
-    // Stream subsequent lines until EOF.
+    // Stream subsequent lines until EOF. Each line is bounded; the stream is not, so
+    // `logs -f` keeps following no matter how much it has already printed.
     let mut buf = String::new();
     loop {
         buf.clear();
-        let n = reader.read_line(&mut buf)?;
+        let n = read_bounded_line(&mut reader, &mut buf, MAX_RESPONSE_BYTES)?;
         if n == 0 {
             break;
         }
@@ -539,3 +552,35 @@ where
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn the_line_bound_applies_per_line_not_per_stream() {
+        // Far more bytes in total than the limit, but every line is short.
+        let data = "0123456789\n".repeat(100);
+        let mut r = BufReader::new(Cursor::new(data.into_bytes()));
+        let mut buf = String::new();
+        let mut lines = 0;
+        loop {
+            buf.clear();
+            if read_bounded_line(&mut r, &mut buf, 16).unwrap() == 0 {
+                break;
+            }
+            assert_eq!(buf, "0123456789\n");
+            lines += 1;
+        }
+        assert_eq!(lines, 100);
+    }
+
+    #[test]
+    fn a_single_overlong_line_is_refused() {
+        let mut r = BufReader::new(Cursor::new(vec![b'x'; 100]));
+        let mut buf = String::new();
+        assert!(read_bounded_line(&mut r, &mut buf, 16).is_err());
+        assert!(buf.len() <= 16, "must stop reading at the bound");
+    }
+}

@@ -77,6 +77,9 @@ web_console:
 # Operator-triggered admin commands (run as root, cwd=".", fire-and-forget).
 # - The web UI shows them under the "Admin actions" modal.
 # - Output is appended to ./logs/admin_action_stdout.log and ./logs/admin_action_stderr.log (daemon cwd).
+# - command[0] must be absolute; it and any script/file argument (plus all parent dirs) must be
+#   root-owned and not group/other-writable, or the daemon refuses to start.
+# - One run per id at a time (cgroup admin_actions/<id>); ids use [A-Za-z0-9_-].
 admin_actions:
   update-processmaster:
     label: "Restart ProcessMaster (systemd)"

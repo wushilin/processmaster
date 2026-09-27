@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -455,6 +456,193 @@ pub(crate) fn parse_mode_str(s: &str) -> Result<u32, String> {
     Ok(v)
 }
 
+/// Admin action ids name a cgroup (`admin_actions/<id>`), so they must be a single safe
+/// path segment. No '.' allowed: every cgroup interface file (`memory.max`,
+/// `cgroup.procs`, ...) contains one, so a dotless id can never collide with them. `run` is reserved: it is the leaf older releases attached every action
+/// to, and may still hold processes after an upgrade.
+pub(crate) fn validate_admin_action_id(id: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !id.is_empty()
+            && id.len() <= 64
+            && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        "admin_actions: action id {id:?} must be 1-64 chars of [A-Za-z0-9_-]"
+    );
+    anyhow::ensure!(id != "run", "admin_actions: action id \"run\" is reserved");
+    Ok(())
+}
+
+/// Refuse an admin action whose code could be changed by anyone but root.
+///
+/// Admin actions run as root when *any* console or socket user clicks them. If the
+/// program, a script it is given, or any directory above either is writable by a
+/// non-root user, that user can swap in their own code and wait for the click -- a
+/// privilege escalation that provisioning makes easy, since it chowns working
+/// directories to service users.
+///
+/// Checked: `argv[0]` (must be absolute), plus every later argument that names an
+/// existing regular file (resolved against the daemon's cwd, which is the action's
+/// cwd). Each must be owned by a trusted uid with no group/other write bit, and so must
+/// every ancestor directory, on both the path as written and its symlink-resolved form.
+/// Files referenced only *inside* an inline script string (`sh -c "..."`) cannot be
+/// seen here; keeping those root-owned remains the operator's job.
+pub(crate) fn ensure_admin_action_trusted(
+    id: &str,
+    argv: &[String],
+    trusted_uids: &[u32],
+) -> anyhow::Result<()> {
+    let program = argv
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("admin_actions.{id}.command must not be empty"))?;
+    let program = Path::new(program);
+    // `env` picks the real program from PATH, which is not checked here.
+    anyhow::ensure!(
+        program.file_name() != Some(std::ffi::OsStr::new("env")),
+        "admin_actions.{id}: command[0] must be the program itself, not `env` (its PATH lookup \
+         would hide which file runs as root)"
+    );
+    anyhow::ensure!(
+        program.is_absolute(),
+        "admin_actions.{id}: command[0] {program:?} must be an absolute path (it runs as root; \
+         a PATH lookup would hide which file is executed)"
+    );
+    anyhow::ensure!(
+        program.is_file(),
+        "admin_actions.{id}: command[0] {} is not an existing regular file",
+        program.display()
+    );
+    ensure_trusted_path(program, trusted_uids)
+        .with_context(|| format!("admin_actions.{id}: refusing command[0]"))?;
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    for (i, arg) in argv.iter().enumerate().skip(1) {
+        let Some(candidate) = path_candidate(arg) else { continue };
+        // Device paths (/dev/null, /dev/stdout, ...) are output sinks, not code, and /dev
+        // is kernel/root-managed.
+        if candidate.starts_with("/dev/") {
+            continue;
+        }
+        let p = cwd.join(candidate); // join() keeps an absolute candidate as-is
+        // Bare words ("restart", "-lc") are only paths if something by that name exists.
+        if !candidate.contains('/') && fs_lexists(&p).is_none() {
+            continue;
+        }
+        ensure_trusted_arg_path(&p, trusted_uids)
+            .with_context(|| format!("admin_actions.{id}: refusing command[{i}] ({arg:?})"))?;
+    }
+    Ok(())
+}
+
+/// The path an argument refers to, if it plausibly refers to one: the argument itself,
+/// the value of `--opt=value`, the tail of `-f/path`, or `@/path`. Arguments containing
+/// whitespace (inline scripts) or `://` (URLs) are skipped -- they cannot be resolved,
+/// which is why the docs ask for scripts to be passed as their own argument.
+fn path_candidate(arg: &str) -> Option<&str> {
+    if arg.is_empty() || arg.contains('\0') || arg.chars().any(char::is_whitespace) || arg.contains("://") {
+        return None;
+    }
+    let c = if arg.starts_with('-') {
+        if let Some((_, v)) = arg.split_once('=') {
+            v
+        } else {
+            &arg[arg.find('/')?..]
+        }
+    } else {
+        arg.strip_prefix('@').unwrap_or(arg)
+    };
+    (!c.is_empty()).then_some(c)
+}
+
+fn fs_lexists(p: &Path) -> Option<std::fs::Metadata> {
+    std::fs::symlink_metadata(p).ok()
+}
+
+/// An argument path must be root-controlled whatever it is: a script, a directory an
+/// interpreter will load code from (`git -C dir`, `make -C dir`, `run-parts dir`), or
+/// a path that does not exist yet -- then its nearest existing ancestor must be
+/// trusted, so nobody else can create it later. FIFOs, sockets and devices are refused
+/// outright: a FIFO would let its writer feed root a script on every run.
+fn ensure_trusted_arg_path(p: &Path, trusted_uids: &[u32]) -> anyhow::Result<()> {
+    match fs_lexists(p) {
+        Some(md) => {
+            let ft = md.file_type();
+            anyhow::ensure!(
+                ft.is_file() || ft.is_dir() || ft.is_symlink(),
+                "{} is not a regular file or directory",
+                p.display()
+            );
+            ensure_trusted_path(p, trusted_uids)?;
+            let resolved = std::fs::metadata(p).with_context(|| format!("stat {}", p.display()))?;
+            anyhow::ensure!(
+                resolved.is_file() || resolved.is_dir(),
+                "{} does not resolve to a regular file or directory",
+                p.display()
+            );
+            Ok(())
+        }
+        None => {
+            let anchor = p
+                .ancestors()
+                .skip(1)
+                .find(|a| !a.as_os_str().is_empty() && fs_lexists(a).is_some())
+                .ok_or_else(|| anyhow::anyhow!("no existing ancestor for {}", p.display()))?;
+            ensure_trusted_path(anchor, trusted_uids).with_context(|| {
+                format!("{} does not exist, and its nearest existing ancestor is not root-controlled", p.display())
+            })
+        }
+    }
+}
+
+/// The action's working directory is the daemon's cwd; `python -m`, `make`, `npm` and
+/// friends load code from it implicitly. Checked at run time only, because client
+/// subcommands load the same config from arbitrary directories.
+pub(crate) fn ensure_admin_cwd_trusted(trusted_uids: &[u32]) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir().context("determine daemon working directory")?;
+    ensure_trusted_path(&cwd, trusted_uids)
+        .context("admin actions run in the daemon's working directory, which is not root-controlled")
+}
+
+/// `path` and every ancestor directory must be trusted-owned and not group/other
+/// writable. Checked both as written (a symlink's own directory decides who can repoint
+/// it) and fully resolved (the file that actually runs).
+fn ensure_trusted_path(path: &Path, trusted_uids: &[u32]) -> anyhow::Result<()> {
+    check_trusted_chain(path, trusted_uids)?;
+    let resolved = std::fs::canonicalize(path)
+        .with_context(|| format!("resolve {}", path.display()))?;
+    if resolved != path {
+        check_trusted_chain(&resolved, trusted_uids)?;
+    }
+    Ok(())
+}
+
+fn check_trusted_chain(path: &Path, trusted_uids: &[u32]) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    for p in path.ancestors() {
+        if p.as_os_str().is_empty() {
+            continue;
+        }
+        let md = std::fs::symlink_metadata(p).with_context(|| format!("stat {}", p.display()))?;
+        // A symlink's own bits are meaningless; who can replace it is decided by its
+        // parent directory, which is the next ancestor checked.
+        if md.file_type().is_symlink() {
+            continue;
+        }
+        anyhow::ensure!(
+            trusted_uids.contains(&md.uid()),
+            "{} is owned by uid {}, not root; a non-root owner could replace what runs as root",
+            p.display(),
+            md.uid()
+        );
+        anyhow::ensure!(
+            crate::pm::safefs::mode_is_trusted(md.mode(), md.gid()),
+            "{} is writable by a non-root group or by others (mode {:o}); anyone with that access \
+             could replace what runs as root",
+            p.display(),
+            md.mode() & 0o7777
+        );
+    }
+    Ok(())
+}
+
 pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
     let raw = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("failed to read config {}: {e}", config_path.display()))?;
@@ -532,10 +720,14 @@ pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
                 name.trim() == name,
                 "admin_actions: action name must not have leading/trailing whitespace: {name:?}"
             );
+            validate_admin_action_id(&name)?;
             anyhow::ensure!(
                 !a.command.is_empty(),
                 "admin_actions.{name}.command must not be empty"
             );
+            // Trust (who can modify what the action runs) is checked by the daemon at
+            // startup (a loud warning) and again before every run (a refusal), not here:
+            // one untrustworthy action must not stop the daemon supervising everything.
             if let Some(label) = a.label.as_deref() {
                 anyhow::ensure!(
                     !label.trim().is_empty(),
@@ -606,6 +798,119 @@ pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- admin action trust ------------------------------------------------------
+    //
+    // Security regression: an admin action runs as root when any console user clicks
+    // it, so a program or script that a non-root user can modify is a privilege
+    // escalation. These must be refused at load, not just discouraged.
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("pm-cfg-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn admin_action_with_root_owned_program_is_accepted() {
+        ensure_admin_action_trusted("ok", &argv(&["/bin/sh", "-lc", "systemctl restart x"]), &[0])
+            .expect("/bin/sh is root-owned on every sane system");
+    }
+
+    #[test]
+    fn admin_action_program_must_be_absolute() {
+        let e = ensure_admin_action_trusted("rel", &argv(&["sh", "-c", "true"]), &[0]).unwrap_err();
+        assert!(format!("{e:#}").contains("absolute"), "{e:#}");
+    }
+
+    #[test]
+    fn admin_action_script_argument_writable_by_others_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = scratch("script");
+        let script = d.join("deploy.sh");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // Owned by the test user, i.e. not root: the classic service-user escalation.
+        let e = ensure_admin_action_trusted(
+            "deploy",
+            &argv(&["/bin/sh", script.to_str().unwrap()]),
+            &[0],
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("command[1]"), "{e:#}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn admin_action_writable_file_is_refused_even_for_a_trusted_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let me = nix::unistd::geteuid().as_raw();
+        let d = scratch("mode");
+        let script = d.join("tool");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let e = ensure_trusted_path(&script, &[0, me]).unwrap_err();
+        assert!(format!("{e:#}").contains("writable by a non-root group or by others"), "{e:#}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn admin_action_symlink_in_untrusted_dir_is_refused_despite_trusted_target() {
+        let d = scratch("link");
+        let link = d.join("sh");
+        std::os::unix::fs::symlink("/bin/sh", &link).unwrap();
+        // The target is root's /bin/sh, but whoever owns the link's directory can
+        // repoint it at their own binary.
+        assert!(ensure_admin_action_trusted("l", &argv(&[link.to_str().unwrap()]), &[0]).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn admin_action_path_candidates() {
+        assert_eq!(path_candidate("/srv/app"), Some("/srv/app"));
+        assert_eq!(path_candidate("--file=/x/y"), Some("/x/y"));
+        assert_eq!(path_candidate("-f/x/y"), Some("/x/y"));
+        assert_eq!(path_candidate("@/x/y"), Some("/x/y"));
+        assert_eq!(path_candidate("./deploy.sh"), Some("./deploy.sh"));
+        assert_eq!(path_candidate("-lc"), None);
+        assert_eq!(path_candidate("systemctl restart x"), None);
+        assert_eq!(path_candidate("https://example.com/a"), None);
+    }
+
+    #[test]
+    fn admin_action_directory_missing_and_fifo_args_are_checked() {
+        let d = scratch("argkinds");
+        let dir = d.join("repo");
+        std::fs::create_dir(&dir).unwrap();
+        let fifo = d.join("pipe.sh");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        let missing = d.join("later.sh");
+        let flagged = format!("--file={}", dir.display());
+        for arg in [dir.to_str().unwrap(), fifo.to_str().unwrap(), missing.to_str().unwrap(), flagged.as_str()] {
+            let r = ensure_admin_action_trusted("x", &argv(&["/bin/sh", arg]), &[0]);
+            assert!(r.is_err(), "{arg} must be refused (user-owned / fifo / untrusted parent)");
+        }
+        // A FIFO is refused even when its owner is trusted.
+        let me = nix::unistd::geteuid().as_raw();
+        let e = ensure_trusted_arg_path(&fifo, &[0, me]).unwrap_err();
+        assert!(format!("{e:#}").contains("not a regular file or directory"), "{e:#}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn admin_action_ids_must_be_cgroup_safe() {
+        for ok in ["update-pm", "backup_db", "v1_2"] {
+            assert!(validate_admin_action_id(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "..", ".hidden", "a/b", "has space", "run", "memory.max", "cgroup.procs"] {
+            assert!(validate_admin_action_id(bad).is_err(), "{bad}");
+        }
+    }
 
     fn sock_mode_from_yaml(y: &str) -> Result<u32, String> {
         #[derive(Deserialize)]

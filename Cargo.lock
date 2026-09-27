@@ -1091,6 +1091,7 @@ dependencies = [
  "chrono",
  "clap",
  "cron",
+ "flate2",
  "libc",
  "log",
  "log4rs",

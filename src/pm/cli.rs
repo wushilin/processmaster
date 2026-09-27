@@ -256,6 +256,9 @@ pub fn run() -> anyhow::Result<()> {
             Ok(())
         }
         Some(Cmd::Logs { name, n, f }) => {
+            // Service-controlled bytes: neutralise terminal escapes (see pmctl_cli).
+            let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+            let out = |s: &str| crate::pm::pmctl_cli::for_stdout(s, tty).into_owned();
             if f.is_some() {
                 let filename = f.and_then(|s| {
                     let t = s.trim().to_string();
@@ -265,7 +268,7 @@ pub fn run() -> anyhow::Result<()> {
                     &cfg.sock,
                     rpc::Request::LogsFollow { name, filename, n },
                     |line| {
-                    println!("{line}");
+                        println!("{}", out(line));
                     },
                 );
             }
@@ -275,7 +278,7 @@ pub fn run() -> anyhow::Result<()> {
             };
             let resp = rpc::client_call(&cfg.sock, rpc::Request::Logs { name, n })?;
             if !resp.message.trim().is_empty() {
-                println!("{}", resp.message.trim_end());
+                println!("{}", out(resp.message.trim_end()));
             }
             Ok(())
         }
@@ -291,11 +294,13 @@ pub fn run() -> anyhow::Result<()> {
             let resp = rpc::client_call(&cfg.sock, rpc::Request::Events { name, n })?;
             match format {
                 OutputFormat::Text => {
+                    let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+                    let out = |s: &str| crate::pm::pmctl_cli::for_stdout(s, tty).into_owned();
                     for e in resp.events {
                         if let Some(app) = e.app {
-                            println!("{} [{}] app={} {}", e.ts, e.component, app, e.message);
+                            println!("{} [{}] app={} {}", e.ts, e.component, app, out(&e.message));
                         } else {
-                            println!("{} [{}] {}", e.ts, e.component, e.message);
+                            println!("{} [{}] {}", e.ts, e.component, out(&e.message));
                         }
                     }
                     Ok(())

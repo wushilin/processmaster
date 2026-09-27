@@ -105,8 +105,17 @@ fn parse_duration_str(s: &str) -> Result<u64, String> {
         "h" => 3_600_000.0,
         _ => return Err(format!("unknown duration unit {unit_s:?} (use ms/s/m/h)")),
     };
-    Ok((num * mult).round() as u64)
+    let ms = (num * mult).round();
+    // `as u64` saturates silently; reject anything that is not a sane duration instead.
+    if !ms.is_finite() || ms > MAX_DURATION_MS as f64 {
+        return Err(format!("duration {s:?} is out of range (max 30 days)"));
+    }
+    Ok(ms as u64)
 }
+
+/// Upper bound for configured durations and delays. Larger values overflow
+/// `Instant + Duration` (a panic) or `as i64` conversions further down.
+pub(crate) const MAX_DURATION_MS: u64 = 30 * 24 * 3_600_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -402,16 +411,31 @@ where
     use serde::de::Error as _;
     let v = Option::<serde_yaml::Value>::deserialize(deserializer)?;
     let Some(v) = v else { return Ok(None) };
+    let mode = parse_mode_value(v).map_err(D::Error::custom)?;
+    // Provisioning runs as root against files the service user can usually replace,
+    // and it is re-applied automatically whenever a target changes. A setuid/setgid
+    // bit would therefore be stamped onto whatever binary the service swaps in.
+    if let Some(m) = mode {
+        if m & 0o6000 != 0 {
+            return Err(D::Error::custom(format!(
+                "mode 0o{m:o} sets setuid/setgid; provisioning refuses those bits"
+            )));
+        }
+    }
+    Ok(mode)
+}
+
+fn parse_mode_value(v: serde_yaml::Value) -> Result<Option<u32>, String> {
     match v {
         serde_yaml::Value::Number(n) => {
             let u = n
                 .as_u64()
-                .ok_or_else(|| D::Error::custom("mode must be a non-negative integer or octal string like \"0700\""))?;
+                .ok_or_else(|| "mode must be a non-negative integer or octal string like \"0700\"".to_string())?;
             // Shared with the socket mode: unquoted YAML integers are decimal, but a
             // file mode is octal by convention. See config::parse_mode_number.
             crate::pm::config::parse_mode_number(u)
                 .map(Some)
-                .map_err(D::Error::custom)
+                .map_err(|e| e.to_string())
         }
         serde_yaml::Value::String(s) => {
             if s.trim().is_empty() {
@@ -419,9 +443,9 @@ where
             }
             crate::pm::config::parse_mode_str(&s)
                 .map(Some)
-                .map_err(D::Error::custom)
+                .map_err(|e| e.to_string())
         }
-        _ => Err(D::Error::custom("mode must be an integer or octal string like \"0700\"")),
+        _ => Err("mode must be an integer or octal string like \"0700\"".to_string()),
     }
 }
 
@@ -793,6 +817,13 @@ impl AppConfigFile {
                             );
                         }
                     }
+                    if let Some(b) = rp.restart_backoff_ms {
+                        anyhow::ensure!(
+                            b <= MAX_DURATION_MS,
+                            "service {}: restart_policy.restart_backoff_ms={b} exceeds {MAX_DURATION_MS} (30 days)",
+                            application
+                        );
+                    }
                     Some(RestartConfig {
                         policy: RestartPolicy::String(rp.policy),
                         restart_backoff_ms: rp.restart_backoff_ms.unwrap_or_else(default_restart_backoff_ms),
@@ -845,6 +876,20 @@ impl AppConfigFile {
             None
         };
 
+        // Validate cpu at load, not first at start, so a bad value is reported by
+        // `pmctl update` instead of surfacing as a start failure later.
+        if let Some(cpu) = resources.max_cpu.as_deref() {
+            let t = cpu.trim();
+            if !t.is_empty() && !t.eq_ignore_ascii_case("max") {
+                parse_cpu_millicores(t).map_err(|e| anyhow::anyhow!("service {application}: resources.max_cpu: {e}"))?;
+            }
+        }
+        if let Some(g) = self.process.stop_grace_period_ms {
+            anyhow::ensure!(
+                g <= MAX_DURATION_MS,
+                "service {application}: stop_grace_period_ms={g} exceeds {MAX_DURATION_MS} (30 days)"
+            );
+        }
         Ok(AppDefinition {
             application,
             working_directory,
@@ -1077,15 +1122,30 @@ pub(crate) fn render_auto_service_yaml(
 
 pub fn parse_cpu_millicores(s: &str) -> anyhow::Result<u64> {
     let s = s.trim();
-    if let Some(m) = s.strip_suffix('m').or_else(|| s.strip_suffix('M')) {
-        return Ok(m.trim().parse()?);
-    }
-    let v: f64 = s.parse()?;
-    if v < 0.0 {
-        anyhow::bail!("cpu must be >= 0");
-    }
-    Ok((v * 1000.0).round() as u64)
+    let mc: u64 = if let Some(m) = s.strip_suffix('m').or_else(|| s.strip_suffix('M')) {
+        m.trim().parse()?
+    } else {
+        let v: f64 = s.parse()?;
+        if !v.is_finite() || v < 0.0 {
+            anyhow::bail!("cpu must be a finite number >= 0");
+        }
+        let mc = (v * 1000.0).round();
+        anyhow::ensure!(mc <= MAX_CPU_MILLICORES as f64, "cpu {s:?} is out of range");
+        mc as u64
+    };
+    // Below 10m the cpu.max quota (100ms period) drops under the kernel's 1ms minimum
+    // and is rejected; a huge value overflows the quota arithmetic (period * millicores).
+    anyhow::ensure!(
+        (MIN_CPU_MILLICORES..=MAX_CPU_MILLICORES).contains(&mc),
+        "cpu {s:?} must be between {MIN_CPU_MILLICORES}m and {MAX_CPU_MILLICORES}m"
+    );
+    Ok(mc)
 }
+
+/// 1024 cores: far above any real machine, far below overflowing `100_000 * mc`.
+const MAX_CPU_MILLICORES: u64 = 1024 * 1000;
+/// 10m = a 1000us quota per 100ms period, the smallest cpu.max the kernel accepts.
+const MIN_CPU_MILLICORES: u64 = 10;
 
 pub fn normalize_swap_string(swap: Option<&str>) -> anyhow::Result<String> {
     // For historical compatibility with earlier examples, treat "0" as "no swap".
@@ -1218,6 +1278,22 @@ mod tests {
         assert!(parse_cpu_millicores("").is_err());
         assert!(parse_cpu_millicores("abc").is_err());
         assert!(parse_cpu_millicores("-1").is_err());
+        // Zero is a kernel-rejected quota; huge values overflowed period * millicores.
+        assert!(parse_cpu_millicores("0").is_err());
+        assert!(parse_cpu_millicores("0m").is_err());
+        assert!(parse_cpu_millicores("9m").is_err(), "below the kernel's 1ms quota");
+        assert_eq!(parse_cpu_millicores("10m").unwrap(), 10);
+        assert!(parse_cpu_millicores("18446744073709551615m").is_err());
+        assert!(parse_cpu_millicores("1e300").is_err());
+        assert!(parse_cpu_millicores("inf").is_err());
+    }
+
+    #[test]
+    fn durations_are_bounded() {
+        assert_eq!(parse_duration_str("10s"), Ok(10_000));
+        assert!(parse_duration_str("1e300h").is_err());
+        assert!(parse_duration_str("31d").is_err(), "unknown unit");
+        assert!(parse_duration_str("1000h").is_err(), "over 30 days");
     }
 
     // ---- provisioning mode parsing ---------------------------------------------
@@ -1237,5 +1313,8 @@ mod tests {
         assert_eq!(parse("mode: \"0o755\"").unwrap(), Some(0o755));
         assert_eq!(parse("other: 1").unwrap(), None);
         assert!(parse("mode: 799").is_err(), "9 is not an octal digit");
+        assert!(parse("mode: \"4755\"").is_err(), "setuid is refused");
+        assert!(parse("mode: \"2755\"").is_err(), "setgid is refused");
+        assert!(parse("mode: \"1777\"").is_ok(), "sticky is fine");
     }
 }

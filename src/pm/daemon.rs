@@ -26,7 +26,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio, ChildStdout, ChildStderr};
+use std::process::{Stdio, ChildStdout, ChildStderr};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -83,7 +83,6 @@ const MAX_APPSTATE_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB (guard against corru
 const MAX_ENV_FILE_BYTES: u64 = 64 * 1024; // 64 KiB per env indirection file
 const RESTARTS_WINDOW_MS: i64 = 10 * 60 * 1000; // 10 minutes
 
-static GZIP_MISSING_WARNED: AtomicBool = AtomicBool::new(false);
 
 // Daemon log file defaults (independent of per-app stdout/stderr logs).
 const DAEMON_LOG_NAME: &str = "processmaster";
@@ -702,6 +701,18 @@ fn start_daemon_log_file(cfg: &MasterConfig) {
     );
 
     tasks().spawn(async move {
+        let log = match pin_log(&base_path, true) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!(
+                    "{} [log] failed to open daemon log directory for {} err={e:#}",
+                    Local::now().format("%Y-%m-%d_%H:%M:%S%.3f"),
+                    base_path.display()
+                );
+                return;
+            }
+        };
+        let base_path = log.base.clone();
         let mut f = match open_append_log_async(&base_path).await {
             Ok(f) => f,
             Err(e) => {
@@ -742,7 +753,7 @@ fn start_daemon_log_file(cfg: &MasterConfig) {
                 let _ = f.flush().await;
                 if let Ok(rr) = rotate_numbered_reopen_async(&base_path, DAEMON_LOG_BACKUPS).await {
                     if let Some(rotated) = rr.rotated.as_deref() {
-                        maybe_compress_rotated_best_effort(DAEMON_LOG_NAME, true, rotated);
+                        maybe_compress_rotated_best_effort(DAEMON_LOG_NAME, true, &log.dir, rotated);
                     }
                     f = rr.f;
                     bytes_written = 0;
@@ -762,7 +773,7 @@ fn start_daemon_log_file(cfg: &MasterConfig) {
                 let _ = f.flush().await;
                 if let Ok(rr) = rotate_numbered_reopen_async(&base_path, DAEMON_LOG_BACKUPS).await {
                     if let Some(rotated) = rr.rotated.as_deref() {
-                        maybe_compress_rotated_best_effort(DAEMON_LOG_NAME, true, rotated);
+                        maybe_compress_rotated_best_effort(DAEMON_LOG_NAME, true, &log.dir, rotated);
                     }
                     f = rr.f;
                     bytes_written = 0;
@@ -944,15 +955,34 @@ pub async fn run_daemon_async(cfg: MasterConfig) -> anyhow::Result<()> {
     start_signal_listener_async(Arc::clone(&shutting_down));
 
     pm_event("rpc", None, format!("listening sock={}", sock.display()));
+    // Admin actions whose code a non-root user could modify are refused at run time;
+    // say so loudly at startup rather than when someone clicks.
+    for (id, a) in &cfg.admin_actions {
+        if let Err(e) = crate::pm::config::ensure_admin_action_trusted(id, &a.command, &[0])
+            .and_then(|()| crate::pm::config::ensure_admin_cwd_trusted(&[0]))
+        {
+            pm_event("admin_action", None, format!("WARNING action={id} will_be_refused=true err={e:#}"));
+        }
+    }
 
-    // Async accept loop.
+    // Async accept loop. Each connection holds a permit: without a cap, a client that
+    // opens thousands of idle connections exhausts the root daemon's descriptors, and
+    // then log reopen, spawns and cgroup reads start failing for every service.
+    const MAX_RPC_CONNECTIONS: usize = 256;
+    let conn_permits = Arc::new(tokio::sync::Semaphore::new(MAX_RPC_CONNECTIONS));
     while !shutting_down.load(Ordering::Relaxed) {
         tokio::select! {
             r = listener.accept() => {
                 match r {
                     Ok((stream, _addr)) => {
+                        let Ok(permit) = Arc::clone(&conn_permits).try_acquire_owned() else {
+                            // Saturated: drop the connection rather than queue it.
+                            drop(stream);
+                            continue;
+                        };
                         let st = Arc::clone(&state);
                         tasks().spawn(async move {
+                            let _permit = permit;
                             if let Err(e) = handle_connection_async(st, stream).await {
                                 eprintln!("rpc error: {e}");
                             }
@@ -1742,11 +1772,17 @@ async fn run_log_maintenance_tick_async(state: &Arc<Mutex<DaemonState>>) -> anyh
 }
 
 async fn cleanup_or_prune_rotated_logs_async(def: &AppDefinition, base_path: &Path, now: std::time::SystemTime) -> anyhow::Result<()> {
+    // Deletes files as root in a directory the service can usually write: go through
+    // the pinned directory, never through a path it could redirect.
+    let log = match pin_log(base_path, false) {
+        Ok(l) => l,
+        Err(_) => return Ok(()), // no log directory yet: nothing to prune
+    };
     match def.rotation_mode {
-        LogRotationMode::Time => cleanup_rotated_logs_async(base_path, def.rotation_max_age_ms, now).await,
+        LogRotationMode::Time => cleanup_rotated_logs_async(&log.base, def.rotation_max_age_ms, now).await,
         LogRotationMode::Size => {
             let keep = def.rotation_backups.unwrap_or(10);
-            prune_numbered_backups_async(base_path, keep).await
+            prune_numbered_backups_async(&log.base, keep).await
         }
     }
 }
@@ -2028,17 +2064,14 @@ fn enable_all_subtree_controllers(parent: &Path) -> anyhow::Result<()> {
 /// turns the log viewer into an arbitrary root-file read for every console user.
 /// Absolute paths and `..` traversal are both rejected.
 fn resolve_hint_under_workdir(workdir: &Path, hint: &Path) -> Option<PathBuf> {
-    let candidate = resolve_under_workdir(workdir, hint);
-    // Compare canonical forms so symlinks and `..` cannot smuggle the path outside.
-    // Fall back to the lexical path when the file does not exist yet: a hint may
-    // legitimately point at a log the application has not created.
-    let base = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
-    let resolved = candidate.canonicalize().unwrap_or_else(|_| candidate.clone());
-    if resolved.starts_with(&base) {
-        Some(candidate)
-    } else {
-        None
+    // Lexical containment only; symlinks are handled at open time, where
+    // open_regular_for_read refuses to follow any link below the root-controlled
+    // prefix. (Canonicalizing here and opening later was a check-then-use race.)
+    if hint.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return None;
     }
+    let candidate = resolve_under_workdir(workdir, hint);
+    candidate.starts_with(workdir).then_some(candidate)
 }
 
 /// Write `contents` to `path` atomically, without ever following a symlink.
@@ -2599,7 +2632,11 @@ async fn handle_connection_async(
     let n = {
         use tokio::io::AsyncReadExt as _;
         let mut limited = (&mut reader).take(MAX_REQUEST_BYTES);
-        let n = limited.read_line(&mut line).await?;
+        // And bound it in time: a silent client must not hold a connection forever.
+        const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
+        let n = tokio_time::timeout(REQUEST_READ_TIMEOUT, limited.read_line(&mut line))
+            .await
+            .map_err(|_| anyhow::anyhow!("no request within {REQUEST_READ_TIMEOUT:?}"))??;
         anyhow::ensure!(
             n < MAX_REQUEST_BYTES as usize,
             "request exceeds {MAX_REQUEST_BYTES} byte limit"
@@ -2696,6 +2733,29 @@ Fix: use the `pmctl` binary built from the same build/release as the running dae
 }
 
 pub(crate) async fn dispatch_async(state: Arc<Mutex<DaemonState>>, req: Request) -> anyhow::Result<Response> {
+    // Once shutdown has begun (stop everything, then drain the cgroups), refuse anything
+    // that would start processes: the web console can still be serving requests, and a
+    // start or admin action landing mid-drain would be spawned and then cut off.
+    let spawns = matches!(
+        req,
+        Request::Update
+            | Request::AdminAction { .. }
+            | Request::Start { .. }
+            | Request::Restart { .. }
+            | Request::StartAll { .. }
+            | Request::RestartAll { .. }
+            | Request::Enable { .. }
+    );
+    if spawns {
+        let shutting_down = state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shutting_down
+            .load(Ordering::Relaxed);
+        if shutting_down {
+            return Ok(admin_refusal("processmaster is shutting down; refusing to start anything".to_string()));
+        }
+    }
     match req {
         Request::Update => do_update_async(&state).await,
         Request::AdminAction { name } => do_admin_action_async(&state, &name).await,
@@ -2869,18 +2929,43 @@ fn admin_actions_cgroup_dir(cfg: &MasterConfig) -> anyhow::Result<PathBuf> {
     Ok(effective_master_cgroup_path(cfg)?.join("admin_actions"))
 }
 
+/// Running admin-action pids grouped by action id (the child cgroup name). Processes
+/// left in the pre-per-id `run` leaf by an older release are reported under "run".
+pub(crate) fn admin_action_pids_by_id(cfg: &MasterConfig) -> anyhow::Result<Vec<(String, Vec<u32>)>> {
+    let root = admin_actions_cgroup_dir(cfg)?;
+    let mut out = Vec::new();
+    let rd = match fs::read_dir(&root) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e).with_context(|| format!("read_dir {}", root.display())),
+    };
+    for ent in rd.flatten() {
+        if !ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let pids = crate::pm::cgroup::list_pids(&ent.path()).unwrap_or_default();
+        if !pids.is_empty() {
+            out.push((ent.file_name().to_string_lossy().into_owned(), pids));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 fn do_admin_ps(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Response> {
     let cfg = {
         let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
         st.cfg.clone()
     };
-    let cg = admin_actions_cgroup_dir(&cfg)?;
-    let mut pids = crate::pm::cgroup::list_pids(&cg).unwrap_or_default();
-    pids.sort();
-    let msg = if pids.is_empty() {
+    let running = admin_action_pids_by_id(&cfg)?;
+    let msg = if running.is_empty() {
         "(none)".to_string()
     } else {
-        pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join("\n")
+        running
+            .iter()
+            .flat_map(|(id, pids)| pids.iter().map(move |p| format!("{id}\t{p}")))
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     Ok(Response {
         ok: true,
@@ -2941,6 +3026,19 @@ fn do_admin_kill(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Response> {
     })
 }
 
+/// A plain `ok: false` response carrying `message`.
+fn admin_refusal(message: String) -> Response {
+    Response {
+        ok: false,
+        message,
+        restarted: vec![],
+        statuses: vec![],
+        events: vec![],
+        admin_actions: vec![],
+        perf_metrics: None,
+    }
+}
+
 async fn do_admin_action_async(state: &Arc<Mutex<DaemonState>>, name: &str) -> anyhow::Result<Response> {
     if !geteuid().is_root() {
         return Ok(Response {
@@ -2988,6 +3086,42 @@ async fn do_admin_action_async(state: &Arc<Mutex<DaemonState>>, name: &str) -> a
         });
     }
 
+    // Re-check at run time too: the config is read once at startup, and ownership or
+    // permissions may have been changed since.
+    if let Err(e) = crate::pm::config::ensure_admin_action_trusted(name, &argv, &[0])
+        .and_then(|()| crate::pm::config::ensure_admin_cwd_trusted(&[0]))
+    {
+        pm_event_state(state, "admin_action", None, format!("decision=refuse name={name} err={e:#}"));
+        return Ok(admin_refusal(format!("admin_action {name} refused: {e:#}")));
+    }
+
+    // One cgroup per action id, and at most one run of an id at a time. The lock covers
+    // the emptiness check *and* the spawn (the child joins its cgroup before spawn()
+    // returns), so two concurrent clicks cannot both see an empty cgroup.
+    let action_cg = admin_actions_cgroup_dir(&cfg)?.join(name);
+    static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = SPAWN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // Fail closed: if the cgroup cannot be read we cannot prove the action is idle.
+    let running = match crate::pm::cgroup::list_pids(&action_cg) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(admin_refusal(format!(
+                "admin_action {name}: cannot tell whether it is already running ({e:#}); refusing"
+            )));
+        }
+    };
+    if !running.is_empty() {
+        pm_event_state(
+            state,
+            "admin_action",
+            None,
+            format!("decision=refuse name={name} reason=already_running pids={running:?}"),
+        );
+        return Ok(admin_refusal(format!(
+            "admin_action {name} is already running (pids {running:?}); wait for it or use admin-kill"
+        )));
+    }
+
     pm_event_state(
         state,
         "admin_action",
@@ -2996,32 +3130,27 @@ async fn do_admin_action_async(state: &Arc<Mutex<DaemonState>>, name: &str) -> a
     );
 
     // Capture output for debugging (best-effort, but fail fast if we can't open the files).
-    let logs_dir = PathBuf::from("./logs");
-    fs::create_dir_all(&logs_dir).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to create admin_action logs dir {}: {e}",
-            logs_dir.display()
+    // Root-written output: symlink-safe directory, O_NOFOLLOW file, 0640 (an action's
+    // output can carry secrets), same as service logs.
+    let cwd = std::env::current_dir().context("determine daemon working directory")?;
+    let logs_dir = crate::pm::safefs::open_dir_safely(&cwd.join("logs"), true)
+        .context("open admin_action logs dir")?;
+    let open_log = |file: &str| -> anyhow::Result<fs::File> {
+        let fd = crate::pm::safefs::openat(
+            &logs_dir,
+            std::ffi::OsStr::new(file),
+            libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT | libc::O_NOFOLLOW,
+            0o640,
         )
-    })?;
-    let stdout_path = logs_dir.join("admin_action_stdout.log");
-    let stderr_path = logs_dir.join("admin_action_stderr.log");
-    let stdout_file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&stdout_path)
-        .map_err(|e| anyhow::anyhow!("failed to open {}: {e}", stdout_path.display()))?;
-    let stderr_file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&stderr_path)
-        .map_err(|e| anyhow::anyhow!("failed to open {}: {e}", stderr_path.display()))?;
+        .with_context(|| format!("open logs/{file} (refusing to follow a symlink is intentional)"))?;
+        Ok(fs::File::from(fd))
+    };
+    let stdout_file = open_log("admin_action_stdout.log")?;
+    let stderr_file = open_log("admin_action_stderr.log")?;
 
-    // Place all admin actions under a dedicated cgroup so operators can inspect/kill them.
-    // Example (default config): /sys/fs/cgroup/processmaster/admin_actions
-    let admin_cg = effective_master_cgroup_path(&cfg)?.join("admin_actions");
-
+    // Example (default config): /sys/fs/cgroup/processmaster/admin_actions/<id>
     let argv_os: Vec<OsString> = argv.iter().map(OsString::from).collect();
-    let mut p = cgroup::LaunchParams::new(argv_os, PathBuf::from("."), admin_cg);
+    let mut p = cgroup::LaunchParams::new(argv_os, PathBuf::from("."), action_cg);
     p.environment.push((
         OsString::from("PROCESSMASTER_ADMIN_ACTION"),
         OsString::from(name),
@@ -3122,11 +3251,9 @@ async fn do_set_enabled_async(state: &Arc<Mutex<DaemonState>>, name: &str, enabl
 
 fn set_enabled_in_yaml(path: &Path, enabled: bool) -> anyhow::Result<()> {
     // `pmctl enable/disable` makes root rewrite a file inside a service-owned tree.
-    // Refuse to do that through a symlink, which would let a service redirect the
-    // rewrite at an arbitrary YAML file elsewhere on the host.
-    ensure_not_symlink(path)?;
-    let raw = fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+    // Read it under the same rules as loading it: no symlinks anywhere below the
+    // root-controlled prefix, root-owned, single link.
+    let raw = crate::pm::safefs::read_trusted_file(path, MAX_APP_CONFIG_BYTES)?;
     let mut v: serde_yaml::Value = serde_yaml::from_str(&raw)
         .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", path.display()))?;
 
@@ -3178,7 +3305,7 @@ fn do_logs(state: &Arc<Mutex<DaemonState>>, name: &str, n: usize) -> anyhow::Res
 
     let mut out = String::new();
     for p in files {
-        if !p.exists() {
+        if fs::symlink_metadata(&p).is_err() {
             continue;
         }
         let display_path = canonicalize_for_display(&p);
@@ -3350,7 +3477,9 @@ fn handle_logs_follow(
 
     let mut fs = vec![];
     for p in selected {
-        let len = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+        let len = crate::pm::safefs::open_regular_for_read(&p)
+            .and_then(|f| Ok(f.metadata()?.len()))
+            .unwrap_or(0);
         fs.push(FollowState {
             display: p.display().to_string(),
             path: p,
@@ -3361,7 +3490,13 @@ fn handle_logs_follow(
 
     loop {
         for st in fs.iter_mut() {
-            let len = match fs::metadata(&st.path) {
+            // Read as root from a directory the service may control: never through a
+            // symlink (it could point at /etc/shadow) and never block on a FIFO.
+            let mut f = match crate::pm::safefs::open_regular_for_read(&st.path) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let len = match f.metadata() {
                 Ok(m) => m.len(),
                 Err(_) => continue,
             };
@@ -3373,10 +3508,6 @@ fn handle_logs_follow(
             if len == st.offset {
                 continue;
             }
-            let mut f = match std::fs::OpenOptions::new().read(true).open(&st.path) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
             f.seek(SeekFrom::Start(st.offset))?;
             // Read the appended delta in bounded chunks to avoid allocating (len - offset) all at once.
             // This also keeps memory bounded if a file grows very quickly.
@@ -3436,7 +3567,8 @@ fn tail_lines(path: &Path, n: usize) -> anyhow::Result<String> {
     if n == 0 {
         return Ok(String::new());
     }
-    let mut f = std::fs::OpenOptions::new().read(true).open(path)?;
+    // Root reading a service-controlled directory: see open_regular_for_read.
+    let mut f = crate::pm::safefs::open_regular_for_read(path)?;
     let len = f.metadata()?.len();
     if len == 0 {
         return Ok(String::new());
@@ -3896,6 +4028,103 @@ fn record_cron_failed_start_in_store(
 }
 
 // record_started removed: controller uses `record_started_in_store` directly after spawning.
+
+/// A service's processes are gone right after a start: its cgroup never became
+/// non-empty within the start window, because the process exited (or crashed) almost
+/// immediately. That is a crash like any other, so apply the restart policy instead
+/// of declaring the service FAILED on the first attempt: `never` fails it; `always`
+/// counts it against the tolerance window and schedules a restart after the backoff,
+/// failing it only once the tolerance is used up. Returns the operator-facing message.
+#[allow(clippy::too_many_arguments)]
+fn handle_exit_during_start(
+    app: &str,
+    def: &AppDefinition,
+    run_info: &Arc<Mutex<HashMap<String, RunInfo>>>,
+    events: &Arc<Mutex<VecDeque<EventEntry>>>,
+    restart_times: &mut VecDeque<Instant>,
+    pending_failure_restart_at: &mut Option<Instant>,
+    origin: &str,
+) -> String {
+    // Cron jobs have no restart policy, and a short job legitimately finishes before
+    // the cgroup poll sees it; its process waiter reports the real exit code.
+    if def.schedule.is_some() {
+        push_event(events, "schedule", Some(app), format!("event=start_timeout scope=cron origin={origin} detail=cgroup_stayed_empty"));
+        set_phase_and_emit(run_info, events, app, Phase::Stopped, &format!("{origin}_timeout"));
+        return format!("{app}: finished (or exited) right after start");
+    }
+    // An operator start or a definition reload is a fresh attempt: drop any FAILED /
+    // BACKOFF left from before, so the policy below starts from a clean budget (a
+    // successful start clears them through the flag rules; an instant exit must too).
+    if origin.starts_with("manual") || origin.starts_with("reload") {
+        let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+        let e = ri.entry(app.to_string()).or_default();
+        sysflag_clear(&mut e.system_flags, SystemFlag::Failed);
+        sysflag_clear(&mut e.system_flags, SystemFlag::Backoff);
+    }
+    record_system_crash_in_store(run_info, app);
+    let restart = def.restart.clone().unwrap_or_default();
+    let fail = |reason: &str| {
+        {
+            let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+            let e = ri.entry(app.to_string()).or_default();
+            sysflag_set_with_rules(app, &mut e.system_flags, SystemFlag::Failed, None);
+        }
+        set_phase_and_emit(run_info, events, app, Phase::Failed, reason);
+    };
+    match restart.policy.parsed() {
+        Ok(RestartPolicyParsed::Always) => {
+            let now = Instant::now();
+            while let Some(front) = restart_times.front() {
+                if now.duration_since(*front).as_millis() as u64 > restart.tolerance.duration {
+                    restart_times.pop_front();
+                } else {
+                    break;
+                }
+            }
+            restart_times.push_back(now);
+            if restart_times.len() > restart.tolerance.max_restarts {
+                push_event(
+                    events,
+                    "restart",
+                    Some(app),
+                    format!(
+                        "decision=suppress reason=tolerance_exceeded outcome=exited_during_start origin={origin} max_restarts={} window_ms={}",
+                        restart.tolerance.max_restarts, restart.tolerance.duration
+                    ),
+                );
+                fail(&format!("{origin}_exited_tolerance_exceeded"));
+                return format!("{app}: exited right after start; restart tolerance exceeded, marked FAILED");
+            }
+            let backoff_ms = restart.restart_backoff_ms;
+            push_event(
+                events,
+                "restart",
+                Some(app),
+                format!(
+                    "decision=backoff outcome=exited_during_start origin={origin} backoff_ms={backoff_ms} recent_restarts_in_window={}",
+                    restart_times.len()
+                ),
+            );
+            {
+                let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+                let e = ri.entry(app.to_string()).or_default();
+                let until_ms = Local::now().timestamp_millis() + backoff_ms as i64;
+                sysflag_set(&mut e.system_flags, SystemFlag::Backoff, Some(until_ms));
+            }
+            set_phase_and_emit(run_info, events, app, Phase::Backoff, &format!("{origin}_exited_backoff"));
+            *pending_failure_restart_at = Some(Instant::now() + Duration::from_millis(backoff_ms));
+            format!("{app}: exited right after start; retrying in {backoff_ms}ms per restart policy")
+        }
+        Ok(RestartPolicyParsed::Never) => {
+            fail(&format!("{origin}_exited_policy_never"));
+            format!("{app}: exited right after start (restart policy never), marked FAILED")
+        }
+        Err(e) => {
+            fail("restart_policy_parse_error");
+            format!("{app}: exited right after start; restart policy invalid ({e}), marked FAILED")
+        }
+    }
+}
 
 fn set_phase_and_emit(
     run_info: &Arc<Mutex<HashMap<String, RunInfo>>>,
@@ -4513,8 +4742,11 @@ fn do_flag(state: &Arc<Mutex<DaemonState>>, name: &str, flags: &[String], ttl: O
     let expires_at_ms: Option<i64> = match ttl {
         None => None,
         Some(spec) => {
-            let dur = parse_flag_ttl_ms(spec)? as i64;
-            Some(Local::now().timestamp_millis() + dur)
+            // Bounded so the deadline arithmetic cannot overflow.
+            const MAX_FLAG_TTL_MS: u64 = 3650 * 86_400_000;
+            let dur = parse_flag_ttl_ms(spec)?;
+            anyhow::ensure!(dur <= MAX_FLAG_TTL_MS, "ttl {spec:?} exceeds 3650 days");
+            Some(Local::now().timestamp_millis() + dur as i64)
         }
     };
     // Enforce user flag limits (avoid unbounded memory from operator input).
@@ -4529,6 +4761,7 @@ fn do_flag(state: &Arc<Mutex<DaemonState>>, name: &str, flags: &[String], ttl: O
         if t.len() > MAX_USER_FLAG_LEN {
             anyhow::bail!("service {name}: flag {t:?} exceeds max length {MAX_USER_FLAG_LEN}");
         }
+        validate_flag_chars(&t)?;
         to_set.push(t);
     }
     to_set.sort();
@@ -4572,7 +4805,19 @@ fn do_flag(state: &Arc<Mutex<DaemonState>>, name: &str, flags: &[String], ttl: O
     })
 }
 
+/// Flags are echoed into the event log and the web UI. Restricting them to a plain
+/// token alphabet keeps a newline (a forged audit line) or markup out of both.
+fn validate_flag_chars(flag: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        flag.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b':' | b'-')),
+        "flag {flag:?} may only contain [a-z0-9_.:-]"
+    );
+    Ok(())
+}
+
 fn do_unflag(state: &Arc<Mutex<DaemonState>>, name: &str, flags: &[String]) -> anyhow::Result<Response> {
+    // No charset check here: removing is harmless, and flags saved before the charset
+    // rule existed must stay removable.
     let (run_info, events) = {
         let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
         if name != "all" && !st.defs.contains_key(name) {
@@ -5030,7 +5275,9 @@ fn resolve_targets(
 }
 
 fn master_cgroup_dir(cfg: &MasterConfig) -> PathBuf {
-    PathBuf::from(&cfg.cgroup_root).join(&cfg.cgroup_name)
+    // Same normalization as effective_master_cgroup_path: `join` with a leading '/'
+    // would *replace* the root, putting app cgroups on the root filesystem.
+    PathBuf::from(&cfg.cgroup_root).join(cfg.cgroup_name.trim().trim_start_matches('/'))
 }
 
 fn app_cgroup_dir(cfg: &MasterConfig, app: &str) -> PathBuf {
@@ -5066,26 +5313,22 @@ fn decode_hex(s: &str) -> anyhow::Result<Vec<u8>> {
 fn decode_env_value(value: &str) -> anyhow::Result<std::ffi::OsString> {
     let v = value.trim();
     if let Some(path) = v.strip_prefix("@file://") {
-        // Must be a regular file. The old size guard was `if m.is_file() && too_big`,
-        // so it simply did not apply to anything else: `@file:///dev/zero` skipped the
-        // cap entirely and read until the root daemon was OOM-killed, and a fifo
-        // blocked the launch path forever.
-        let md = fs::metadata(path).with_context(|| format!("stat env file {path:?}"))?;
-        anyhow::ensure!(
-            md.is_file(),
-            "env file {path:?} is not a regular file (character devices, fifos and \
-             directories are refused: reading one can hang or exhaust memory)"
-        );
+        // Read as root, often from a service-writable directory: no symlink anywhere
+        // below the root-controlled prefix (it could point at a root-only key), only a
+        // regular file (a FIFO would hang the launch path, /dev/zero would exhaust
+        // memory), and no hard link to someone else's file.
+        use std::io::Read as _;
+        let abs = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")).join(path);
+        let f = crate::pm::safefs::open_regular_for_read(&abs)
+            .with_context(|| format!("read env file {path:?}"))?;
+        // (open_regular_for_read also refuses a file with more than one hard link.)
+        let md = f.metadata()?;
         anyhow::ensure!(
             md.len() <= MAX_ENV_FILE_BYTES,
             "env file {path:?} too large ({} bytes > {} bytes limit)",
             md.len(),
             MAX_ENV_FILE_BYTES
         );
-        // Enforce the cap *during* the read as well: the metadata call above is a
-        // separate syscall, so the file may have grown since.
-        use std::io::Read as _;
-        let f = fs::File::open(path).with_context(|| format!("read env file {path:?}"))?;
         let mut bytes = Vec::new();
         f.take(MAX_ENV_FILE_BYTES + 1)
             .read_to_end(&mut bytes)
@@ -5125,6 +5368,12 @@ fn spawn_launcher_child(cfg: &MasterConfig, def: &AppDefinition) -> anyhow::Resu
             def.application
         );
     }
+
+    // Re-check provisioning on every start, not only at definition load: replacing a
+    // provisioned binary (a redeploy) silently drops its file capability, and without
+    // this the service would fail to bind until someone deleted the marker by hand.
+    maybe_provision_workdir(def)
+        .with_context(|| format!("provisioning for {} (refuse to start)", def.application))?;
 
     // processmaster is now self-contained: we launch directly and self-attach into the app cgroup.
     // Keep the start/stop launch path consistent by using the shared LaunchParams builder.
@@ -5174,31 +5423,26 @@ fn maybe_provision_workdir(def: &AppDefinition) -> anyhow::Result<()> {
         return Ok(());
     }
     let marker = def.working_directory.join(".pm_provisioned");
-    // symlink_metadata: a *dangling* symlink makes exists() false, which would let a
-    // service re-trigger provisioning and have root create the link's target.
-    if fs::symlink_metadata(&marker).is_ok() {
-        pm_event(
-            "provision",
-            Some(&def.application),
-            format!("decision=skip reason=marker_exists marker={}", marker.display()),
-        );
-        return Ok(());
-    }
+    let reason = match provisioning_staleness(def, &marker) {
+        None => {
+            pm_event(
+                "provision",
+                Some(&def.application),
+                format!("decision=skip reason=marker_current marker={}", marker.display()),
+            );
+            return Ok(());
+        }
+        Some(r) => r,
+    };
     pm_event(
         "provision",
         Some(&def.application),
         format!(
-            "decision=attempt marker_missing marker={} workdir={} entries={}",
+            "decision=run reason={reason} marker={} workdir={} entries={}",
             marker.display(),
             def.working_directory.display(),
             def.provisioning.len()
         ),
-    );
-
-    pm_event(
-        "provision",
-        Some(&def.application),
-        format!("decision=run reason=marker_missing marker={}", marker.display()),
     );
 
     // If we need root-only actions, fail fast with a clear error.
@@ -5218,121 +5462,112 @@ fn maybe_provision_workdir(def: &AppDefinition) -> anyhow::Result<()> {
         }
     }
 
+    use crate::pm::safefs;
+    // (dev, ino) of the working directory: a recursive chown of it must skip the
+    // definition files, which have to stay root-owned (see load_trusted_definition).
+    let workdir_id = {
+        use std::os::unix::fs::MetadataExt as _;
+        fs::metadata(&def.working_directory).ok().map(|m| (m.dev(), m.ino()))
+    };
     for (idx, p) in def.provisioning.iter().enumerate() {
         let target = resolve_under_workdir(&def.working_directory, &p.path);
+        let what = |msg: &str| {
+            format!("service {} provisioning[{}]: {msg} {}", def.application, idx, target.display())
+        };
+        anyhow::ensure!(
+            !p.path.components().any(|c| matches!(c, std::path::Component::ParentDir)),
+            "{}",
+            what("path must not contain '..':")
+        );
 
-        // symlink_metadata, not exists(): exists() follows links, so a dangling or
-        // redirecting symlink would look like "already there" (or like "missing" and
-        // get created through).
-        let target_lstat = fs::symlink_metadata(&target);
-        if let Ok(md) = &target_lstat {
-            anyhow::ensure!(
-                !md.file_type().is_symlink(),
-                "service {} provisioning[{}]: target {} is a symlink; refusing to provision through it",
-                def.application,
-                idx,
-                target.display()
-            );
-        }
-        if target_lstat.is_err() {
-            if p.add_net_bind_capability {
-                anyhow::bail!(
-                    "service {} provisioning[{}]: target {} does not exist (needed for setcap)",
-                    def.application,
-                    idx,
-                    target.display()
-                );
+        // Everything below goes through descriptors (see safefs): a symlink in *any*
+        // component below the root-controlled prefix is refused, not just in the last
+        // one, and nothing can be swapped between check and use.
+        let (parent, name) = safefs::open_parent_safely(&target, !p.add_net_bind_capability)
+            .with_context(|| what("cannot safely open the parent of"))?;
+        match safefs::lstat_at(&parent, &name)? {
+            Some(st) if safefs::is_lnk_mode(st.st_mode) => {
+                anyhow::bail!("{}", what("target is a symlink; refusing to provision through it:"))
             }
-            fs::create_dir_all(&target).map_err(|e| {
-                anyhow::anyhow!(
-                    "service {} provisioning[{}]: failed to create directory {}: {e}",
-                    def.application,
-                    idx,
-                    target.display()
-                )
-            })?;
+            Some(_) => {}
+            None => {
+                anyhow::ensure!(!p.add_net_bind_capability, "{}", what("target does not exist (needed for setcap):"));
+                match safefs::mkdirat(&parent, &name, 0o755) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e).with_context(|| what("failed to create directory")),
+                }
+            }
         }
+        // O_PATH names the inode without opening it for I/O, so a FIFO or device node
+        // at the target has no side effects.
+        let fd = safefs::openat(&parent, &name, libc::O_PATH | libc::O_NOFOLLOW, 0)
+            .with_context(|| what("open"))?;
+        let st = safefs::fstat(&fd)?;
+        anyhow::ensure!(!safefs::is_lnk_mode(st.st_mode), "{}", what("target became a symlink:"));
+        // A hard link to a root file (possible where protected_hardlinks is off) would
+        // otherwise hand that file to the service.
+        anyhow::ensure!(
+            !safefs::is_reg_mode(st.st_mode) || st.st_nlink == 1,
+            "{}",
+            what("target has multiple hard links; refusing:")
+        );
 
         // Ownership (optional)
         if let Some(own) = p.ownership.as_ref() {
-            let uid_opt: Option<Uid> = match own.owner.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let uid_opt: Option<u32> = match own.owner.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 None => None,
-                Some(s) => {
-                    if let Ok(n) = s.parse::<u32>() {
-                        Some(Uid::from_raw(n))
-                    } else {
-                        let usr = get_user_by_name(s).ok_or_else(|| anyhow::anyhow!("unknown user: {s}"))?;
-                        Some(Uid::from_raw(usr.uid()))
-                    }
-                }
+                Some(s) => Some(match s.parse::<u32>() {
+                    Ok(n) => n,
+                    Err(_) => get_user_by_name(s).ok_or_else(|| anyhow::anyhow!("unknown user: {s}"))?.uid(),
+                }),
             };
-            let gid_opt: Option<Gid> = match own.group.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let gid_opt: Option<u32> = match own.group.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 None => None,
-                Some(s) => {
-                    if let Ok(n) = s.parse::<u32>() {
-                        Some(Gid::from_raw(n))
-                    } else {
-                        let grp = get_group_by_name(s).ok_or_else(|| anyhow::anyhow!("unknown group: {s}"))?;
-                        Some(Gid::from_raw(grp.gid()))
-                    }
-                }
+                Some(s) => Some(match s.parse::<u32>() {
+                    Ok(n) => n,
+                    Err(_) => get_group_by_name(s).ok_or_else(|| anyhow::anyhow!("unknown group: {s}"))?.gid(),
+                }),
             };
             if uid_opt.is_some() || gid_opt.is_some() {
-                if own.recursive {
-                    chown_recursive(&target, uid_opt, gid_opt)
-                        .with_context(|| format!("service {} provisioning[{}]: chown_recursive {}", def.application, idx, target.display()))?;
-                } else {
-                    lchown_no_follow(&target, uid_opt, gid_opt).with_context(|| {
-                        format!(
-                            "service {} provisioning[{}]: chown failed for {}",
-                            def.application,
-                            idx,
-                            target.display()
-                        )
-                    })?;
+                safefs::chown_fd(&fd, uid_opt, gid_opt).with_context(|| what("chown failed for"))?;
+                if own.recursive && safefs::is_dir_mode(st.st_mode) {
+                    let is_workdir = workdir_id == Some((st.st_dev as u64, st.st_ino as u64));
+                    let skip: &[&str] = if is_workdir { DEFINITION_FILE_NAMES } else { &[] };
+                    let dir = safefs::openat(&fd, std::ffi::OsStr::new("."), libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+                    let skipped = chown_tree(&dir, uid_opt, gid_opt, skip, 0)
+                        .with_context(|| what("recursive chown failed under"))?;
+                    if skipped > 0 {
+                        pm_event(
+                            "provision",
+                            Some(&def.application),
+                            format!("chown_skipped_hardlinked_files count={skipped} target={}", target.display()),
+                        );
+                    }
                 }
             }
         }
 
         // Mode (optional; non-recursive)
         if let Some(mode) = p.mode {
-            fchmod_no_follow(&target, mode).with_context(|| {
-                format!(
-                    "service {} provisioning[{}]: chmod {:o} failed for {}",
-                    def.application,
-                    idx,
-                    mode,
-                    target.display()
-                )
-            })?;
+            safefs::chmod_fd(&fd, mode).with_context(|| what(&format!("chmod {mode:o} failed for")))?;
         }
 
         // Capabilities (optional)
         if p.add_net_bind_capability {
-            // setcap takes a path and follows symlinks, and has no fd-based form, so
-            // the best available guard is to refuse a symlinked target outright. A
-            // pre-planted symlink -- the realistic attack -- is blocked; a residual
-            // race remains only for an attacker who can win the window between this
-            // check and exec.
-            ensure_not_symlink(&target).with_context(|| {
-                format!(
-                    "service {} provisioning[{}]: refusing setcap on {}",
-                    def.application, idx, target.display()
-                )
-            })?;
-            let status = Command::new("setcap")
-                .arg("cap_net_bind_service=+ep")
-                .arg(&target)
-                .status()
-                .map_err(|e| anyhow::anyhow!("service {} provisioning[{}]: setcap exec failed: {e}", def.application, idx))?;
-            if !status.success() {
-                anyhow::bail!(
-                    "service {} provisioning[{}]: setcap failed for {} (status={status})",
-                    def.application,
-                    idx,
-                    target.display()
-                );
-            }
+            anyhow::ensure!(safefs::is_reg_mode(st.st_mode), "{}", what("setcap target is not a regular file:"));
+            // Set the capability on the pinned inode itself. The setcap binary only takes
+            // a path (and refuses a /proc/<pid>/fd magic link), which reopens the
+            // check-then-use window this descriptor exists to close.
+            let file = safefs::openat(&parent, &name, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK, 0)
+                .with_context(|| what("open for setcap"))?;
+            let fst = safefs::fstat(&file)?;
+            anyhow::ensure!(
+                (fst.st_dev, fst.st_ino) == (st.st_dev, st.st_ino),
+                "{}",
+                what("target changed during provisioning:")
+            );
+            safefs::set_net_bind_capability(&file).with_context(|| what("setting cap_net_bind_service failed for"))?;
         }
 
         pm_event(
@@ -5342,32 +5577,21 @@ fn maybe_provision_workdir(def: &AppDefinition) -> anyhow::Result<()> {
         );
     }
 
-    // O_CREAT|O_EXCL|O_NOFOLLOW: never write through a symlink a service planted, and
-    // never silently reuse an existing file.
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&marker)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "service {}: failed to create marker {}: {e}",
-                    def.application,
-                    marker.display()
-                )
-            })?;
-        f.write_all(format!("provisioned_at_ms={}\n", Local::now().timestamp_millis()).as_bytes())
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "service {}: failed to write marker {}: {e}",
-                    def.application,
-                    marker.display()
-                )
-            })?;
-    }
+    // Fingerprint *after* every chown/chmod/setcap, since each of those bumps ctime.
+    let record = ProvisioningMarker {
+        version: PROVISIONING_MARKER_VERSION,
+        provisioned_at_ms: Local::now().timestamp_millis(),
+        entries: def
+            .provisioning
+            .iter()
+            .map(|p| ProvisionedEntryRecord {
+                spec: serde_json::to_value(p).unwrap_or(serde_json::Value::Null),
+                file: file_fingerprint(&resolve_under_workdir(&def.working_directory, &p.path)),
+            })
+            .collect(),
+    };
+    write_marker_atomically(&marker, &record)
+        .with_context(|| format!("service {}: failed to write marker {}", def.application, marker.display()))?;
 
     pm_event(
         "provision",
@@ -5377,107 +5601,197 @@ fn maybe_provision_workdir(def: &AppDefinition) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---------------- symlink-safe primitives for root-privileged file operations ----
+// ---------------- provisioning marker ------------------------------------------------
 //
-// Provisioning runs as root against paths inside a working directory that is often
-// owned by the *service* user — provisioning itself chowns it there. Every operation
-// below therefore has to refuse to traverse a final symlink, otherwise the service can
-// point one at /etc/shadow and have root chown, chmod or setcap it.
+// The marker records what was provisioned and a stat fingerprint of every regular-file
+// target, taken after provisioning finished. Provisioning is re-run when the spec
+// changes or a file target no longer matches its fingerprint.
+//
+// Why stat identity rather than a content hash: file capabilities (and mode/owner) live
+// on the *inode*, not the bytes. Deploying a byte-identical build via copy-and-rename
+// yields a matching hash but a fresh inode with no capability; an in-place write keeps
+// the inode but the kernel strips `security.capability` and bumps ctime. (dev, ino,
+// ctime) catches both; size and mtime are recorded for readable diagnostics. A false
+// positive (e.g. `touch`) only costs an idempotent reprovision.
+//
+// Directory targets are not fingerprinted: their mtime/ctime move whenever an entry is
+// created inside them, which would reprovision on every start.
 
-/// `lchown(2)`: change ownership without following a final symlink.
-///
-/// `nix::unistd::chown` is `chown(2)`, which *does* follow, so it cannot be used on any
-/// path an unprivileged user can influence.
-fn lchown_no_follow(path: &Path, uid: Option<Uid>, gid: Option<Gid>) -> anyhow::Result<()> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| anyhow::anyhow!("path contains an interior NUL: {}", path.display()))?;
-    let uid_raw = uid.map(|u| u.as_raw()).unwrap_or(u32::MAX); // -1 == "leave unchanged"
-    let gid_raw = gid.map(|g| g.as_raw()).unwrap_or(u32::MAX);
-    // SAFETY: c is a valid NUL-terminated path; lchown does not retain the pointer.
-    let rc = unsafe { libc::lchown(c.as_ptr(), uid_raw, gid_raw) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("lchown {}", path.display()));
-    }
-    Ok(())
+const PROVISIONING_MARKER_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct FileFingerprint {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime_ns: i128,
+    ctime_ns: i128,
 }
 
-/// Open a path for metadata work without following a final symlink.
-///
-/// Works for both regular files and directories (`O_RDONLY` on a directory is fine on
-/// Linux). Returning a file descriptor lets callers use `f*` syscalls, which act on the
-/// opened inode and so cannot be redirected by a concurrent rename.
-fn open_no_follow(path: &Path) -> anyhow::Result<fs::File> {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ProvisionedEntryRecord {
+    spec: serde_json::Value,
+    #[serde(default)]
+    file: Option<FileFingerprint>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ProvisioningMarker {
+    version: u32,
+    provisioned_at_ms: i64,
+    entries: Vec<ProvisionedEntryRecord>,
+}
+
+/// Fingerprint a regular-file target without following a final symlink. `None` for
+/// directories, symlinks and missing paths.
+fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
+    use std::os::unix::fs::MetadataExt as _;
+    let md = fs::symlink_metadata(path).ok()?;
+    if !md.file_type().is_file() {
+        return None;
+    }
+    Some(FileFingerprint {
+        dev: md.dev(),
+        ino: md.ino(),
+        size: md.size(),
+        mtime_ns: md.mtime() as i128 * 1_000_000_000 + md.mtime_nsec() as i128,
+        ctime_ns: md.ctime() as i128 * 1_000_000_000 + md.ctime_nsec() as i128,
+    })
+}
+
+/// Why provisioning must (re)run, or `None` when the marker still matches reality.
+fn provisioning_staleness(def: &AppDefinition, marker: &Path) -> Option<String> {
+    use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;
-    fs::OpenOptions::new()
+    // The marker sits in a service-writable workdir, so treat it as hostile input:
+    // O_NOFOLLOW (no planted symlink), O_NONBLOCK (a FIFO would otherwise block this
+    // open forever -- at daemon boot, on every reload and every start), a regular-file
+    // check on the opened fd, and a hard size cap (a sparse 200G file must not OOM the
+    // daemon). Any unreadable, legacy or malformed marker just means "reprovision".
+    const MAX_MARKER_BYTES: u64 = 64 * 1024;
+    let mut text = String::new();
+    match fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .with_context(|| {
-            format!(
-                "open {} without following symlinks (refusing to traverse one is intentional)",
-                path.display()
-            )
-        })
-}
-
-/// `fchmod(2)` on an fd opened with `O_NOFOLLOW` — race-free, unlike path-based chmod.
-fn fchmod_no_follow(path: &Path, mode: u32) -> anyhow::Result<()> {
-    let f = open_no_follow(path)?;
-    // SAFETY: f owns a valid fd for the duration of the call.
-    let rc = unsafe { libc::fchmod(f.as_raw_fd(), mode as libc::mode_t) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("fchmod {:o} {}", mode, path.display()));
-    }
-    Ok(())
-}
-
-/// Reject a path whose final component is a symlink, for operations that have no
-/// `*at`/`f*` equivalent (currently only `setcap`, which takes a path).
-fn ensure_not_symlink(path: &Path) -> anyhow::Result<()> {
-    let md = fs::symlink_metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?;
-    anyhow::ensure!(
-        !md.file_type().is_symlink(),
-        "{} is a symlink; refusing to operate on it as root",
-        path.display()
-    );
-    Ok(())
-}
-
-fn chown_recursive(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> anyhow::Result<()> {
-    // Apply to root itself. lchown, not chown: the root target is exactly what an
-    // attacker replaces with a symlink, and the old code followed it.
-    lchown_no_follow(root, uid, gid)?;
-    let md = fs::symlink_metadata(root)?;
-    if md.file_type().is_symlink() {
-        // Never descend through a symlinked root.
-        return Ok(());
-    }
-    if !md.is_dir() {
-        return Ok(());
-    }
-    fn walk(path: &Path, uid: Option<Uid>, gid: Option<Gid>) -> anyhow::Result<()> {
-        for ent in fs::read_dir(path)? {
-            let ent = ent?;
-            let p = ent.path();
-            let md = fs::symlink_metadata(&p)?;
-            if md.file_type().is_symlink() {
-                // Do not follow symlinks (avoid loops / unexpected ownership changes).
-                continue;
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(marker)
+    {
+        Ok(f) => {
+            let regular = f.metadata().map(|m| m.file_type().is_file()).unwrap_or(false);
+            if !regular {
+                return Some("marker_not_regular_file".to_string());
             }
-            // lchown even here: between the lstat above and this call the entry could
-            // have been swapped for a symlink, and chown would follow it.
-            lchown_no_follow(&p, uid, gid)?;
-            if md.is_dir() {
-                walk(&p, uid, gid)?;
+            if f.take(MAX_MARKER_BYTES + 1).read_to_string(&mut text).is_err()
+                || text.len() as u64 > MAX_MARKER_BYTES
+            {
+                return Some("marker_unreadable".to_string());
             }
         }
-        Ok(())
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Some("marker_missing".to_string());
+        }
+        Err(_) => return Some("marker_unreadable".to_string()),
     }
-    walk(root, uid, gid)
+    let Ok(rec) = serde_json::from_str::<ProvisioningMarker>(&text) else {
+        return Some("marker_legacy_or_malformed".to_string());
+    };
+    if rec.version != PROVISIONING_MARKER_VERSION {
+        return Some(format!("marker_version={}", rec.version));
+    }
+    if rec.entries.len() != def.provisioning.len() {
+        return Some("spec_changed".to_string());
+    }
+    for (idx, (p, r)) in def.provisioning.iter().zip(&rec.entries).enumerate() {
+        if serde_json::to_value(p).ok().as_ref() != Some(&r.spec) {
+            return Some(format!("spec_changed idx={idx}"));
+        }
+        let target = resolve_under_workdir(&def.working_directory, &p.path);
+        let now = file_fingerprint(&target);
+        // Only compare when a file was fingerprinted; a directory target stays None.
+        if r.file.is_some() && now != r.file {
+            return Some(format!("target_changed idx={idx} target={}", target.display()));
+        }
+        // A target that was a directory (or absent) but is now a regular file also
+        // needs a fresh pass, e.g. a setcap entry whose binary was replaced by a file.
+        if r.file.is_none() && now.is_some() {
+            return Some(format!("target_changed idx={idx} target={}", target.display()));
+        }
+    }
+    None
+}
+
+/// Write the marker via a fresh temp file + rename. The temp file is opened
+/// `O_CREAT|O_EXCL|O_NOFOLLOW`, so a planted symlink is never written through, and
+/// `rename(2)` replaces a symlink at the destination rather than following it.
+fn write_marker_atomically(marker: &Path, rec: &ProvisioningMarker) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = format!(
+        ".pm_provisioned.tmp.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let tmp = marker.with_file_name(name);
+    let body = serde_json::to_string_pretty(rec)?;
+    let res = (|| -> anyhow::Result<()> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(0o644)
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(body.as_bytes())?;
+        f.write_all(b"\n")?;
+        fs::rename(&tmp, marker).with_context(|| format!("rename {} -> {}", tmp.display(), marker.display()))?;
+        Ok(())
+    })();
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    res
+}
+
+/// Files in a working directory that the daemon loads as trusted service definitions
+/// (auto services). They must stay root-owned, so a recursive chown of the working
+/// directory leaves them alone.
+const DEFINITION_FILE_NAMES: &[&str] = &["service.yml", "service.yaml", ".regen_pm_config"];
+
+/// Recursive chown below the directory `dir`, entirely through descriptors: each
+/// subdirectory is opened `O_NOFOLLOW` relative to its parent's descriptor, so swapping
+/// a directory for a symlink mid-walk cannot redirect it. Symlinks are skipped, and so
+/// are regular files with more than one hard link. Returns how many of those were
+/// skipped. `skip` names are ignored at the top level only.
+fn chown_tree(dir: &OwnedFd, uid: Option<u32>, gid: Option<u32>, skip: &[&str], depth: usize) -> anyhow::Result<usize> {
+    use crate::pm::safefs;
+    anyhow::ensure!(depth < 256, "directory tree deeper than 256 levels");
+    let mut skipped = 0;
+    for name in safefs::list_dir(dir)? {
+        if depth == 0 && skip.iter().any(|s| name == std::ffi::OsStr::new(s)) {
+            continue;
+        }
+        // Pin the entry first, then decide from the pinned inode: checking by name and
+        // chowning by name leaves a window to swap in a hard link to a root file.
+        let fd = match safefs::openat(dir, &name, libc::O_PATH | libc::O_NOFOLLOW, 0) {
+            Ok(fd) => fd,
+            Err(_) => continue, // vanished meanwhile
+        };
+        let st = safefs::fstat(&fd)?;
+        if safefs::is_lnk_mode(st.st_mode) {
+            continue;
+        }
+        if !safefs::is_dir_mode(st.st_mode) && st.st_nlink > 1 {
+            skipped += 1;
+            continue;
+        }
+        safefs::chown_fd(&fd, uid, gid)?;
+        if safefs::is_dir_mode(st.st_mode) {
+            // Recurse through the pinned directory itself, never by name.
+            let sub = safefs::openat(&fd, std::ffi::OsStr::new("."), libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            skipped += chown_tree(&sub, uid, gid, skip, depth + 1)?;
+        }
+    }
+    Ok(skipped)
 }
 
 /// Open a service log file for appending, as root.
@@ -5488,21 +5802,21 @@ fn chown_recursive(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> anyhow::R
 /// `/etc/cron.d/x` or `/root/.ssh/authorized_keys` and have the root daemon append
 /// application-controlled bytes there. `O_NOFOLLOW` makes such an open fail with
 /// `ELOOP` instead.
+///
+/// `path` must be inside a directory pinned with [`pin_log`]: `O_NOFOLLOW` covers only
+/// the final component, and the pin is what covers the directories above it.
 async fn open_append_log_async(path: &Path) -> anyhow::Result<tokio::fs::File> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("create_dir_all {}", parent.display()))?;
-    }
     let f = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .write(true)
-        .custom_flags(libc::O_NOFOLLOW)
         // 0640, not the umask default of 0644: a service's stdout routinely carries
         // connection strings and tokens, and every other local user could read them.
         // Group is kept readable so an operator group can tail logs without root.
         .mode(0o640)
+        // O_NONBLOCK: a FIFO planted at the log path would otherwise block this open
+        // forever, pinning a blocking-pool thread on every restart.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .await
         .with_context(|| {
@@ -5511,6 +5825,22 @@ async fn open_append_log_async(path: &Path) -> anyhow::Result<tokio::fs::File> {
                 path.display()
             )
         })?;
+    let md = f.metadata().await?;
+    anyhow::ensure!(md.is_file(), "log {} is not a regular file; refusing to write to it", path.display());
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        // A hard link to a root file (hosts without fs.protected_hardlinks) would have
+        // root append service output to it.
+        anyhow::ensure!(md.nlink() == 1, "log {} has {} hard links; refusing to write to it", path.display(), md.nlink());
+    }
+    // SAFETY: valid fd; regular-file I/O ignores O_NONBLOCK, but clear it anyway.
+    unsafe {
+        let fd = f.as_raw_fd();
+        let fl = libc::fcntl(fd, libc::F_GETFL);
+        if fl >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, fl & !libc::O_NONBLOCK);
+        }
+    }
     Ok(f)
 }
 
@@ -5519,48 +5849,100 @@ struct RotatedReopen {
     rotated: Option<PathBuf>,
 }
 
-fn maybe_compress_rotated_best_effort(app: &str, enabled: bool, rotated: &Path) {
+/// A log file whose parent directory is pinned by descriptor. `base` is the log's path
+/// through `/proc/self/fd/N`, so every rename/unlink/open done with it lands in the
+/// pinned directory even if the service later swaps a path component for a symlink.
+/// Keep `dir` alive for as long as `base` is used.
+struct PinnedLog {
+    dir: Arc<OwnedFd>,
+    base: PathBuf,
+}
+
+fn pin_log(path: &Path, create: bool) -> anyhow::Result<PinnedLog> {
+    let (dir, name) = crate::pm::safefs::open_parent_safely(path, create)
+        .with_context(|| format!("open log directory for {}", path.display()))?;
+    let base = crate::pm::safefs::proc_fd_path(&dir).join(name);
+    Ok(PinnedLog { dir: Arc::new(dir), base })
+}
+
+fn maybe_compress_rotated_best_effort(app: &str, enabled: bool, dir: &Arc<OwnedFd>, rotated: &Path) {
     if !enabled {
         return;
     }
     if rotated.extension().and_then(|s| s.to_str()) == Some("gz") {
         return;
     }
+    let Some(name) = rotated.file_name().map(|n| n.to_os_string()) else { return };
     let app = app.to_string();
-    let rotated = rotated.to_path_buf();
+    let dir = Arc::clone(dir);
     tasks().spawn_blocking(move || {
-        if !rotated.exists() {
-            return;
-        }
-        let res = Command::new("gzip").arg("-f").arg(&rotated).status();
-        match res {
-            Ok(st) => {
-                if !st.success() {
-                    pm_event(
-                        "logrotate",
-                        Some(&app),
-                        format!("gzip_failed file={} status={st}", rotated.display()),
-                    );
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if !GZIP_MISSING_WARNED.swap(true, Ordering::Relaxed) {
-                    pm_event(
-                        "logrotate",
-                        None,
-                        "gzip not found; rotated logs will not be compressed (install gzip to enable)",
-                    );
-                }
-            }
-            Err(e) => {
-                pm_event(
-                    "logrotate",
-                    Some(&app),
-                    format!("gzip_error file={} err={e}", rotated.display()),
-                );
-            }
+        if let Err(e) = gzip_in_dir(&dir, &name) {
+            pm_event(
+                "logrotate",
+                Some(&app),
+                format!("gzip_failed file={} err={e:#}", Path::new(&name).display()),
+            );
         }
     });
+}
+
+/// gzip `name` inside `dir` to `name.gz`, then remove `name` (what `gzip -f` did).
+///
+/// In-process rather than exec'ing gzip: `gzip -f` follows a symlink, so a service
+/// that swapped its rotated log for a link to /etc/shadow got root to compress that
+/// file into the service's own directory.
+fn gzip_in_dir(dir: &OwnedFd, name: &std::ffi::OsStr) -> anyhow::Result<()> {
+    use crate::pm::safefs;
+    let src = safefs::openat(dir, name, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK, 0)
+        .context("open rotated log")?;
+    let st = safefs::fstat(&src)?;
+    anyhow::ensure!(safefs::is_reg_mode(st.st_mode), "rotated log is not a regular file");
+    anyhow::ensure!(st.st_nlink == 1, "rotated log has {} hard links", st.st_nlink);
+    let mut gz_name = name.to_os_string();
+    gz_name.push(".gz");
+    let create = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW;
+    let dst = match safefs::openat(dir, &gz_name, create, 0o640) {
+        Ok(fd) => fd,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // `gzip -f` semantics: replace. unlinkat never follows a link.
+            let c = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(gz_name.as_os_str()))?;
+            // SAFETY: valid dirfd and NUL-terminated name.
+            unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) };
+            safefs::openat(dir, &gz_name, create, 0o640).context("create .gz")?
+        }
+        Err(e) => return Err(e).context("create .gz"),
+    };
+    let mut src = fs::File::from(src);
+    let dst = fs::File::from(dst);
+    let mut enc = flate2::write::GzEncoder::new(dst, flate2::Compression::default());
+    let compressed = std::io::copy(&mut src, &mut enc)
+        .context("compress")
+        .and_then(|_| enc.finish().context("finish gzip"));
+    let dst = match compressed {
+        Ok(f) => f,
+        Err(e) => {
+            // Never leave a truncated .gz beside the original (e.g. on ENOSPC); rotation
+            // would shift it along as if it were a good backup.
+            if let Ok(c) = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(gz_name.as_os_str())) {
+                // SAFETY: valid dirfd and NUL-terminated name.
+                unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) };
+            }
+            return Err(e);
+        }
+    };
+    // Keep the rotated file's mtime: time-based cleanup ages logs by it.
+    let times = [
+        libc::timespec { tv_sec: st.st_atime, tv_nsec: st.st_atime_nsec },
+        libc::timespec { tv_sec: st.st_mtime, tv_nsec: st.st_mtime_nsec },
+    ];
+    // SAFETY: valid fd and a two-element timespec array.
+    unsafe { libc::futimens(dst.as_raw_fd(), times.as_ptr()) };
+    let c = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(name))?;
+    // SAFETY: valid dirfd and NUL-terminated name.
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("remove uncompressed rotated log");
+    }
+    Ok(())
 }
 
 async fn rotate_rename_reopen_async(base_path: &Path) -> anyhow::Result<RotatedReopen> {
@@ -5641,7 +6023,7 @@ fn log_rotation_key(rot: LogRotation, now: chrono::DateTime<Local>) -> String {
 fn spawn_log_pump_stdout_async(def: AppDefinition, base_path: PathBuf, pipe: ChildStdout) {
     tasks().spawn(async move {
         if let Err(e) = log_pump_async(def.clone(), base_path, pipe).await {
-            pm_event("logpump", Some(&def.application), format!("stream=stdout outcome=error err={e}"));
+            pm_event("logpump", Some(&def.application), format!("stream=stdout outcome=error err={e:#}"));
         }
     });
 }
@@ -5649,7 +6031,7 @@ fn spawn_log_pump_stdout_async(def: AppDefinition, base_path: PathBuf, pipe: Chi
 fn spawn_log_pump_stderr_async(def: AppDefinition, base_path: PathBuf, pipe: ChildStderr) {
     tasks().spawn(async move {
         if let Err(e) = log_pump_async(def.clone(), base_path, pipe).await {
-            pm_event("logpump", Some(&def.application), format!("stream=stderr outcome=error err={e}"));
+            pm_event("logpump", Some(&def.application), format!("stream=stderr outcome=error err={e:#}"));
         }
     });
 }
@@ -5704,7 +6086,27 @@ async fn log_pump_async<P: IntoRawFd>(
     let owned = unsafe { OwnedFd::from_raw_fd(raw) };
     let afd = AsyncFd::new(owned)?;
 
-    let mut f = open_append_log_async(&base_path).await?;
+    // Pin the log directory for the life of the pump; `base_path` below goes through it.
+    // If the log cannot be opened safely, keep draining the pipe anyway: dropping the
+    // read end would SIGPIPE the service on its first write and restart-loop it.
+    let opened = match pin_log(&base_path, true) {
+        Ok(log) => open_append_log_async(&log.base).await.map(|f| (log, f)),
+        Err(e) => Err(e),
+    };
+    let (log, mut f) = match opened {
+        Ok(x) => x,
+        Err(e) => {
+            pm_event(
+                "logpump",
+                Some(&def.application),
+                format!("outcome=discarding_output log={} err={e:#}", base_path.display()),
+            );
+            let mut sink = vec![0u8; 16 * 1024];
+            while read_from_asyncfd(&afd, &mut sink).await? > 0 {}
+            return Ok(());
+        }
+    };
+    let base_path = log.base.clone();
     let mut buf = vec![0u8; 16 * 1024];
     let mut bytes_written: u64 = 0;
     let mut last_key = log_rotation_key(def.rotation_frequency, Local::now());
@@ -5727,6 +6129,7 @@ async fn log_pump_async<P: IntoRawFd>(
                         maybe_compress_rotated_best_effort(
                             &def.application,
                             def.log_compression_enabled,
+                            &log.dir,
                             rotated,
                         );
                     }
@@ -5744,6 +6147,7 @@ async fn log_pump_async<P: IntoRawFd>(
                             maybe_compress_rotated_best_effort(
                                 &def.application,
                                 def.log_compression_enabled,
+                                &log.dir,
                                 rotated,
                             );
                         }
@@ -5772,6 +6176,7 @@ async fn log_pump_async<P: IntoRawFd>(
                     maybe_compress_rotated_best_effort(
                         &def.application,
                         def.log_compression_enabled,
+                        &log.dir,
                         rotated,
                     );
                 }
@@ -6401,13 +6806,10 @@ fn spawn_supervisor_thread(
                     }
 
                     if !wait_for_cgroup_nonempty(&cfg, &app, Duration::from_secs(3)).await {
-                        {
-                            let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
-                            let e = ri.entry(app.clone()).or_default();
-                            sysflag_set_with_rules(&app, &mut e.system_flags, SystemFlag::Failed, None);
-                        }
-                        set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "reload_start_timeout");
-                        let _ = resp.send(Err(anyhow::anyhow!("{app}: start timeout (cgroup stayed empty)")));
+                        let msg = handle_exit_during_start(
+                            &app, &def, &run_info, &events, &mut restart_times, &mut pending_failure_restart_at, "reload_start",
+                        );
+                        let _ = resp.send(Err(anyhow::anyhow!(msg)));
                         continue;
                     }
                     record_started_in_store(&run_info, &app, StartKind::Start, SystemFlag::SystemStart);
@@ -6522,15 +6924,13 @@ fn spawn_supervisor_thread(
                                 "event=start_timeout scope=cron detail=cgroup_stayed_empty",
                             );
                             set_phase_and_emit(&run_info, &events, &app, Phase::Stopped, "manual_start_timeout");
+                            let _ = resp.send(Err(anyhow::anyhow!("{app}: start timeout (cgroup stayed empty)")));
                         } else {
-                            {
-                                let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
-                                let e = ri.entry(app.clone()).or_default();
-                                sysflag_set_with_rules(&app, &mut e.system_flags, SystemFlag::Failed, None);
-                            }
-                            set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "manual_start_timeout");
+                            let msg = handle_exit_during_start(
+                                &app, &def, &run_info, &events, &mut restart_times, &mut pending_failure_restart_at, "manual_start",
+                            );
+                            let _ = resp.send(Err(anyhow::anyhow!(msg)));
                         }
-                        let _ = resp.send(Err(anyhow::anyhow!("{app}: start timeout (cgroup stayed empty)")));
                         continue;
                     }
                     record_started_in_store(&run_info, &app, StartKind::Start, SYSFLAG_USER_START);
@@ -6554,6 +6954,16 @@ fn spawn_supervisor_thread(
                     // If already stopped, do NOT update markers OR clear FAILED/BACKOFF/history.
                     // "Stop" should be a no-op if nothing is running; keeping FAILED makes sense for failed/stopped services.
                     if !cgroup_running_or_assume_running(&cfg, &app).await {
+                        // Nothing running -- but a restart may be scheduled (BACKOFF). A stop
+                        // must cancel it, or the service comes back after the operator
+                        // stopped it.
+                        if pending_failure_restart_at.take().is_some() {
+                            restart_times.clear();
+                            let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+                            let e = ri.entry(app.clone()).or_default();
+                            sysflag_clear(&mut e.system_flags, SystemFlag::Backoff);
+                            sysflag_set_with_rules(&app, &mut e.system_flags, SYSFLAG_USER_STOP, None);
+                        }
                         set_phase_and_emit(&run_info, &events, &app, Phase::Stopped, "stop_noop_already_stopped");
                         let _ = resp.send(Ok(()));
                         continue;
@@ -6598,6 +7008,8 @@ fn spawn_supervisor_thread(
                 }
                 SupervisorCmd::ShutdownStop { resp } => {
                     // System stop should not persist operator intent.
+                    // A restart scheduled during backoff must not fire mid-shutdown.
+                    pending_failure_restart_at = None;
                     if !cgroup_running_or_assume_running(&cfg, &app).await {
                         set_phase_and_emit(&run_info, &events, &app, Phase::Stopped, "stop_noop_already_stopped");
                         let _ = resp.send(Ok(()));
@@ -6722,13 +7134,10 @@ fn spawn_supervisor_thread(
                         }
                     }
                     if !wait_for_cgroup_nonempty(&cfg, &app, Duration::from_secs(3)).await {
-                        {
-                            let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
-                            let e = ri.entry(app.clone()).or_default();
-                            sysflag_set_with_rules(&app, &mut e.system_flags, SystemFlag::Failed, None);
-                        }
-                        set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "manual_restart_start_timeout");
-                        let _ = resp.send(Err(anyhow::anyhow!("{app}: restart timeout (cgroup stayed empty)")));
+                        let msg = handle_exit_during_start(
+                            &app, &def, &run_info, &events, &mut restart_times, &mut pending_failure_restart_at, "manual_restart",
+                        );
+                        let _ = resp.send(Err(anyhow::anyhow!(msg)));
                         continue;
                     }
                     record_started_in_store(&run_info, &app, StartKind::Restart, SYSFLAG_USER_START);
@@ -6825,13 +7234,10 @@ fn spawn_supervisor_thread(
                         }
                     }
                     if !wait_for_cgroup_nonempty(&cfg, &app, Duration::from_secs(3)).await {
-                        {
-                            let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
-                            let e = ri.entry(app.clone()).or_default();
-                            sysflag_set_with_rules(&app, &mut e.system_flags, SystemFlag::Failed, None);
-                        }
-                        set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "reload_restart_timeout");
-                        let _ = resp.send(Err(anyhow::anyhow!("{app}: restart timeout (cgroup stayed empty)")));
+                        let msg = handle_exit_during_start(
+                            &app, &def, &run_info, &events, &mut restart_times, &mut pending_failure_restart_at, "reload_restart",
+                        );
+                        let _ = resp.send(Err(anyhow::anyhow!(msg)));
                         continue;
                     }
                     record_started_in_store(&run_info, &app, StartKind::Restart, SystemFlag::SystemStart);
@@ -6868,6 +7274,13 @@ fn spawn_supervisor_thread(
                             continue;
                         }
                     }
+                    // A restart is already scheduled (e.g. a reload start just exited and
+                    // backed off): starting again now would skip the backoff and burn a
+                    // second tolerance slot.
+                    if pending_failure_restart_at.is_some() {
+                        let _ = resp.send(Ok(()));
+                        continue;
+                    }
                     if cgroup_running_or_assume_running(&cfg, &app).await {
                         ensure_waiter_attached(
                             &cfg,
@@ -6897,13 +7310,10 @@ fn spawn_supervisor_thread(
                         }
                     }
                     if !wait_for_cgroup_nonempty(&cfg, &app, Duration::from_secs(3)).await {
-                        {
-                            let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
-                            let e = ri.entry(app.clone()).or_default();
-                            sysflag_set_with_rules(&app, &mut e.system_flags, SystemFlag::Failed, None);
-                        }
-                        set_phase_and_emit(&run_info, &events, &app, Phase::Failed, "boot_start_timeout");
-                        let _ = resp.send(Err(anyhow::anyhow!("{app}: start timeout (cgroup stayed empty)")));
+                        let msg = handle_exit_during_start(
+                            &app, &def, &run_info, &events, &mut restart_times, &mut pending_failure_restart_at, "boot_start",
+                        );
+                        let _ = resp.send(Err(anyhow::anyhow!(msg)));
                         continue;
                     }
                     record_started_in_store(&run_info, &app, StartKind::Start, SystemFlag::SystemStart);
@@ -7513,7 +7923,9 @@ fn load_app_definitions_best_effort(
                 continue;
             }
         }
-        let raw = match fs::read_to_string(path) {
+        // Definitions are executed as root (they choose `user:`, commands, paths), so
+        // only a root-owned, single-link, non-group/other-writable file is loaded.
+        let raw = match crate::pm::safefs::read_trusted_file(path, MAX_APP_CONFIG_BYTES) {
             Ok(s) => s,
             Err(e) => {
                 // Keep old definition for this file if possible.
@@ -7523,13 +7935,13 @@ fn load_app_definitions_best_effort(
                 {
                     defs.insert(app.clone(), old.clone());
                     warnings.push(format!(
-                        "read_failed file={} kept_previous_app={} err={e}",
+                        "read_failed file={} kept_previous_app={} err={e:#}",
                         path.display(),
                         app
                     ));
                     outdated.push(app.clone());
                 } else {
-                    warnings.push(format!("read_failed file={} err={e}", path.display()));
+                    warnings.push(format!("read_failed file={} err={e:#}", path.display()));
                 }
                 continue;
             }
@@ -7773,6 +8185,28 @@ fn merge_auto_services_best_effort(
         if app.ends_with(".disabled") {
             continue;
         }
+        // The auto-service directory is also the service's working directory, and a
+        // definition inside a directory the service user can write can never be trusted:
+        // the user can rename any root-owned file into place -- including a log the
+        // daemon wrote with the service's own output. Such directories are not loaded;
+        // their definition belongs in config_directory (root-controlled), with
+        // working_directory pointing here.
+        let dir_trusted = crate::pm::safefs::is_root_controlled_dir(&path);
+        if !dir_trusted {
+            if defs.contains_key(app) {
+                // Already migrated: the config_directory definition is the one to use.
+                continue;
+            }
+            warnings.push(format!(
+                "auto_service_dir_not_root_controlled app={} dir={} not_loaded=true \
+                 hint=\"a directory a non-root user can write cannot hold a trusted definition; \
+                 move it to config_directory with process.working_directory: {}\"",
+                app,
+                path.display(),
+                path.display()
+            ));
+            continue;
+        }
         if defs.contains_key(app) {
             anyhow::bail!(
                 "auto_service_directory conflict: application {} is already defined in config_directory",
@@ -7793,7 +8227,24 @@ fn merge_auto_services_best_effort(
         } else {
             None
         };
-        if regen_marker.is_file() {
+        // Regeneration writes a definition with the *default* user (root unless
+        // configured otherwise), so only honour a marker root placed.
+        let regen_requested = match fs::symlink_metadata(&regen_marker) {
+            Ok(m) => {
+                use std::os::unix::fs::MetadataExt as _;
+                let ok = m.is_file() && crate::pm::safefs::trusted_uids().contains(&m.uid());
+                if !ok {
+                    warnings.push(format!(
+                        "auto_service_regen_marker_ignored app={} file={} reason=not_a_root_owned_file",
+                        app,
+                        regen_marker.display()
+                    ));
+                }
+                ok
+            }
+            Err(_) => false,
+        };
+        if regen_requested {
             fn next_bak_path(dir: &Path) -> PathBuf {
                 let base = dir.join("service.yml.bak");
                 if !base.exists() {
@@ -7923,7 +8374,7 @@ fn merge_auto_services_best_effort(
                     continue;
                 }
                 _ => {
-                    match fs::read_to_string(sf) {
+                    match crate::pm::safefs::read_trusted_file(sf, MAX_APP_CONFIG_BYTES) {
                         Ok(raw) => match parse_app_definition_yaml(&raw, sf, Some(dir)) {
                             Ok(def) => {
                                 if def.application != app {
@@ -7972,14 +8423,14 @@ fn merge_auto_services_best_effort(
                             if let Some(old) = old_defs.get(app) {
                                 defs.insert(app.to_string(), old.clone());
                                 warnings.push(format!(
-                                    "auto_service_yml_read_failed app={} file={} err={e} kept_previous=true",
+                                    "auto_service_yml_read_failed app={} file={} err={e:#} kept_previous=true",
                                     app,
                                     sf.display()
                                 ));
                                 outdated.push(app.to_string());
                             } else {
                                 warnings.push(format!(
-                                    "auto_service_yml_read_failed app={} file={} err={e} kept_previous=false",
+                                    "auto_service_yml_read_failed app={} file={} err={e:#} kept_previous=false",
                                     app,
                                     sf.display()
                                 ));
@@ -8016,9 +8467,14 @@ fn merge_auto_services_best_effort(
             if let Some(yaml_text) = yaml_text {
                 // Best-effort write: only if missing (no overwrite).
                 if !target.exists() {
+                    use std::os::unix::fs::OpenOptionsExt as _;
                     match std::fs::OpenOptions::new()
                         .write(true)
                         .create_new(true)
+                        // Must come out root-owned and not group/other-writable, or the
+                        // next load refuses it (read_trusted_file).
+                        .mode(0o644)
+                        .custom_flags(libc::O_NOFOLLOW)
                         .open(&target)
                     {
                         Ok(mut f) => {
@@ -8186,6 +8642,7 @@ fn enforce_app_user_group_rules(def: &AppDefinition) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     // ---- child reaping ---------------------------------------------------------
     // Regression: every non-scheduled service start dropped its `Child` and relied on
@@ -8591,55 +9048,223 @@ mod tests {
         p
     }
 
-    #[test]
-    fn open_no_follow_refuses_a_symlink() {
-        let d = tmpdir("nofollow");
-        let real = d.join("real");
-        std::fs::write(&real, b"x").unwrap();
-        let link = d.join("link");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-
-        assert!(open_no_follow(&real).is_ok(), "a regular file must open");
-        assert!(open_no_follow(&link).is_err(), "a symlink must be refused");
-        let _ = std::fs::remove_dir_all(&d);
+    fn provision_test_def(workdir: &Path, entries_yaml: &str) -> AppDefinition {
+        let yaml = format!(
+            "application: provtest\nprocess:\n  working_directory: {}\n  start_command: [\"/bin/true\"]\nprovisioning:\n{entries_yaml}",
+            workdir.display()
+        );
+        crate::pm::app::parse_app_definition_yaml(&yaml, &workdir.join("provtest.yaml"), None)
+            .expect("parse test def")
     }
 
+    // Regression: the marker used to be a bare "provisioned once" flag, so replacing a
+    // setcap'd binary (a redeploy) silently lost the capability until the marker was
+    // deleted by hand. Mode is used here as the observable stand-in for setcap, since
+    // tests do not run as root; both are dropped the same way by a file replacement.
     #[test]
-    fn ensure_not_symlink_distinguishes_links_from_files() {
-        let d = tmpdir("notlink");
-        let real = d.join("real");
-        std::fs::write(&real, b"x").unwrap();
-        let link = d.join("link");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        let dangling = d.join("dangling");
-        std::os::unix::fs::symlink(d.join("nope"), &dangling).unwrap();
-
-        assert!(ensure_not_symlink(&real).is_ok());
-        assert!(ensure_not_symlink(&link).is_err());
-        // A dangling link must be caught too: exists() would report false for it.
-        assert!(ensure_not_symlink(&dangling).is_err());
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn fchmod_no_follow_changes_the_file_not_the_link_target() {
+    fn replacing_a_provisioned_file_triggers_reprovision() {
         use std::os::unix::fs::PermissionsExt as _;
-        let d = tmpdir("fchmod");
+        let d = tmpdir("reprov");
+        let bin = d.join("server");
+        std::fs::write(&bin, b"v1").unwrap();
+        let def = provision_test_def(&d, "  - path: ./server\n    mode: \"0750\"\n  - path: ./data\n");
+        let marker = d.join(".pm_provisioned");
+
+        assert_eq!(provisioning_staleness(&def, &marker).as_deref(), Some("marker_missing"));
+        maybe_provision_workdir(&def).unwrap();
+        assert_eq!(std::fs::metadata(&bin).unwrap().permissions().mode() & 0o7777, 0o750);
+        assert_eq!(provisioning_staleness(&def, &marker), None, "fresh marker must be current");
+
+        // A file created inside a directory target must not count as a change.
+        std::fs::write(d.join("data").join("x"), b"x").unwrap();
+        assert_eq!(provisioning_staleness(&def, &marker), None);
+
+        // Redeploy: new build written to a temp name and renamed over the old one.
+        let staged = d.join("server.new");
+        std::fs::write(&staged, b"v2").unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::rename(&staged, &bin).unwrap();
+        let why = provisioning_staleness(&def, &marker).expect("replacement must be detected");
+        assert!(why.starts_with("target_changed idx=0"), "{why}");
+
+        maybe_provision_workdir(&def).unwrap();
+        assert_eq!(std::fs::metadata(&bin).unwrap().permissions().mode() & 0o7777, 0o750);
+        assert_eq!(provisioning_staleness(&def, &marker), None);
+
+        // Byte-identical redeploy still gets a fresh inode, so it is still detected:
+        // this is why the fingerprint is stat identity rather than a content hash.
+        let staged = d.join("server.new");
+        std::fs::write(&staged, b"v2").unwrap();
+        std::fs::rename(&staged, &bin).unwrap();
+        assert!(provisioning_staleness(&def, &marker).is_some());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn spec_change_and_legacy_marker_trigger_reprovision() {
+        let d = tmpdir("reprov-spec");
+        std::fs::write(d.join("server"), b"v1").unwrap();
+        let marker = d.join(".pm_provisioned");
+
+        let def = provision_test_def(&d, "  - path: ./server\n    mode: \"0750\"\n");
+        // Markers from older releases (empty, or "provisioned_at_ms=...") are accepted
+        // and simply trigger one more, idempotent, provisioning pass.
+        std::fs::write(&marker, "").unwrap();
+        assert_eq!(
+            provisioning_staleness(&def, &marker).as_deref(),
+            Some("marker_legacy_or_malformed")
+        );
+        maybe_provision_workdir(&def).unwrap();
+        assert_eq!(provisioning_staleness(&def, &marker), None);
+        std::fs::write(&marker, "provisioned_at_ms=1\n").unwrap();
+        assert_eq!(
+            provisioning_staleness(&def, &marker).as_deref(),
+            Some("marker_legacy_or_malformed")
+        );
+        maybe_provision_workdir(&def).unwrap();
+        assert_eq!(provisioning_staleness(&def, &marker), None);
+
+        let def2 = provision_test_def(&d, "  - path: ./server\n    mode: \"0700\"\n");
+        assert_eq!(provisioning_staleness(&def2, &marker).as_deref(), Some("spec_changed idx=0"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---- symlink-safe provisioning ------------------------------------------------
+    //
+    // Regression: provisioning checked only the *final* path component, so a service
+    // that replaced `app` with a symlink to /usr got root to chown/chmod `/usr/bin`
+    // for an entry like `./app/bin`.
+
+    #[test]
+    fn provisioning_refuses_a_symlinked_intermediate_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = tmpdir("prov-midlink");
+        let outside = tmpdir("prov-outside");
+        std::fs::create_dir(outside.join("bin")).unwrap();
+        std::fs::set_permissions(outside.join("bin"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&outside, d.join("app")).unwrap();
+        let def = provision_test_def(&d, "  - path: ./app/bin\n    mode: \"0700\"\n");
+
+        let e = maybe_provision_workdir(&def).unwrap_err();
+        assert!(format!("{e:#}").contains("symlink"), "{e:#}");
+        let mode = std::fs::metadata(outside.join("bin")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "chmod must not have gone through the symlink");
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn provisioning_refuses_a_final_symlink_and_parent_escapes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = tmpdir("prov-link");
         let victim = d.join("victim");
         std::fs::write(&victim, b"secret").unwrap();
         std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let link = d.join("link");
-        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        std::os::unix::fs::symlink(&victim, d.join("link")).unwrap();
 
-        // Through the link: refused, and the victim keeps its mode.
-        assert!(fchmod_no_follow(&link, 0o777).is_err());
-        let mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "chmod must not have followed the symlink");
+        let def = provision_test_def(&d, "  - path: ./link\n    mode: \"0777\"\n");
+        assert!(maybe_provision_workdir(&def).is_err());
+        assert_eq!(std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777, 0o600);
 
-        // Directly: applied.
-        fchmod_no_follow(&victim, 0o640).unwrap();
-        let mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o640);
+        let def = provision_test_def(&d, "  - path: ../x\n");
+        assert!(format!("{:#}", maybe_provision_workdir(&def).unwrap_err()).contains(".."));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn chown_tree_does_not_follow_links_or_hardlinks_and_keeps_definitions() {
+        let d = tmpdir("chown-tree");
+        std::fs::create_dir_all(d.join("sub/deeper")).unwrap();
+        std::fs::write(d.join("sub/f"), b"x").unwrap();
+        std::os::unix::fs::symlink("/etc", d.join("etc-link")).unwrap();
+        std::fs::write(d.join("a"), b"x").unwrap();
+        std::fs::hard_link(d.join("a"), d.join("b")).unwrap();
+        // service.yml hard-linked to a backup: if it were visited it would count as a
+        // skipped hard link, so the count below proves it was skipped *by name*.
+        std::fs::write(d.join("service.yml"), b"x").unwrap();
+        std::fs::hard_link(d.join("service.yml"), d.join("service.yml.bak")).unwrap();
+        let dir = crate::pm::safefs::open_dir_safely(&d, false).unwrap();
+        // chown to our own ids: permitted unprivileged, and exercises the full walk.
+        let (uid, gid) = (nix::unistd::getuid().as_raw(), nix::unistd::getgid().as_raw());
+        let skipped = chown_tree(&dir, Some(uid), Some(gid), DEFINITION_FILE_NAMES, 0).unwrap();
+        assert_eq!(skipped, 3, "a, b and service.yml.bak (service.yml itself is skipped by name)");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // Regression: an auto service's definition lives in its working directory. If the
+    // service user can write that directory, no file in it can be trusted -- the user
+    // can rename a root-owned log (holding its own output) into service.yml, or any
+    // root-owned file into .regen_pm_config. Such directories are not loaded at all.
+    #[test]
+    fn auto_service_dirs_a_user_can_write_are_never_loaded() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let auto = tmpdir("auto-trust");
+        let app_dir = auto.join("svc");
+        std::fs::create_dir(&app_dir).unwrap();
+        let yml = app_dir.join("service.yml");
+        std::fs::write(&yml, "application: svc\nprocess:\n  start_command: [\"/bin/true\"]\n").unwrap();
+        std::fs::set_permissions(&yml, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(app_dir.join(".regen_pm_config"), b"").unwrap();
+        let load = |defs: &mut HashMap<String, AppDefinition>| {
+            let (mut warnings, mut outdated) = (vec![], vec![]);
+            merge_auto_services_best_effort(
+                defs, &HashMap::new(), Some(&auto), "root", "root", &mut warnings, &mut outdated,
+            )
+            .unwrap();
+            warnings
+        };
+
+        // /tmp is world-writable, so nothing below it is root-controlled: even a
+        // well-formed 0644 definition (and a regen marker) is ignored, nothing is
+        // generated, and the file is left alone.
+        let mut defs = HashMap::new();
+        let warnings = load(&mut defs);
+        assert!(defs.is_empty(), "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("auto_service_dir_not_root_controlled")), "{warnings:?}");
+        assert!(app_dir.join(".regen_pm_config").exists(), "regen must not have run");
+        assert!(!app_dir.join("service.yml.bak").exists());
+
+        // Migration path: a config_directory definition for the same app takes over
+        // quietly instead of the auto directory being a hard conflict.
+        let mut defs = HashMap::new();
+        defs.insert("svc".to_string(), provision_test_def(&app_dir, "  - path: ./x\n"));
+        let warnings = load(&mut defs);
+        assert!(!warnings.iter().any(|w| w.contains("svc") && w.contains("not_root_controlled")), "{warnings:?}");
+        let _ = std::fs::remove_dir_all(&auto);
+    }
+
+    // Regression: the marker read used a blocking open with no size cap, so a service
+    // could hang the daemon (at boot, too) with a FIFO, or OOM it with a sparse file.
+    #[test]
+    fn hostile_marker_cannot_hang_or_exhaust_the_daemon() {
+        let d = tmpdir("reprov-fifo");
+        let marker = d.join(".pm_provisioned");
+        let def = provision_test_def(&d, "  - path: ./sub\n");
+        nix::unistd::mkfifo(&marker, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        // Would block forever before the fix.
+        assert_eq!(provisioning_staleness(&def, &marker).as_deref(), Some("marker_not_regular_file"));
+        std::fs::remove_file(&marker).unwrap();
+        let f = std::fs::File::create(&marker).unwrap();
+        f.set_len(8 << 30).unwrap(); // 8 GiB sparse
+        assert_eq!(provisioning_staleness(&def, &marker).as_deref(), Some("marker_unreadable"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn symlinked_marker_is_replaced_not_written_through() {
+        let d = tmpdir("reprov-link");
+        let victim = d.join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        std::fs::create_dir(d.join("w")).unwrap();
+        let marker = d.join("w").join(".pm_provisioned");
+        std::os::unix::fs::symlink(&victim, &marker).unwrap();
+        let def = provision_test_def(&d.join("w"), "  - path: ./sub\n");
+
+        assert_eq!(provisioning_staleness(&def, &marker).as_deref(), Some("marker_unreadable"));
+        maybe_provision_workdir(&def).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        assert!(!std::fs::symlink_metadata(&marker).unwrap().file_type().is_symlink());
+        assert_eq!(provisioning_staleness(&def, &marker), None);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -8715,10 +9340,17 @@ mod tests {
         assert!(resolve_hint_under_workdir(&workdir, Path::new("/etc/shadow")).is_none());
         // Traversal: rejected.
         assert!(resolve_hint_under_workdir(&workdir, Path::new("../../../etc/passwd")).is_none());
-        // A symlink pointing outside is rejected via canonicalization.
+        // A symlink pointing outside is refused when it is *read* (checking at resolve
+        // time and opening later was a race): tail_lines opens without following it.
         let escape = workdir.join("logs/escape.log");
         std::os::unix::fs::symlink("/etc/hostname", &escape).unwrap();
-        assert!(resolve_hint_under_workdir(&workdir, Path::new("./logs/escape.log")).is_none());
+        let p = resolve_hint_under_workdir(&workdir, Path::new("./logs/escape.log")).unwrap();
+        assert!(tail_lines(&p, 10).is_err(), "must not read through the symlink");
+        // Nor through a symlinked directory component.
+        std::os::unix::fs::symlink("/etc", workdir.join("etc")).unwrap();
+        let p = resolve_hint_under_workdir(&workdir, Path::new("./etc/hostname")).unwrap();
+        assert!(tail_lines(&p, 10).is_err(), "must not read through a symlinked directory");
+        assert!(tail_lines(&workdir.join("logs/app.log"), 10).is_ok());
 
         let _ = std::fs::remove_dir_all(&d);
     }

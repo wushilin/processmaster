@@ -29,9 +29,12 @@ use tokio::process::Command;
 #[derive(Clone)]
 struct WebState {
     daemon: Arc<Mutex<DaemonState>>,
-    users: Arc<HashMap<String, String>>, // username -> bcrypt hash
-    auth_cache: Arc<Mutex<AuthCache>>,
+    auth: Arc<Authenticator>,
     auth_failures: Arc<Mutex<AuthFailureLimiter>>,
+    auth_throttle: Arc<Mutex<AuthThrottle>>,
+    // Separate from auth_failures so lockout notices are not swallowed by the failure
+    // burst that caused them.
+    auth_lockouts: Arc<Mutex<AuthFailureLimiter>>,
     tls_enabled: bool,
 }
 
@@ -218,15 +221,32 @@ pub(super) fn start_web_console(state: Arc<Mutex<DaemonState>>) {
         return;
     }
 
-    let st = WebState {
-        daemon: Arc::clone(&state),
-        users: Arc::new(users),
-        auth_cache: Arc::new(Mutex::new(AuthCache::new())),
-        auth_failures: Arc::new(Mutex::new(AuthFailureLimiter::new())),
-        tls_enabled: cfg.tls.enabled,
-    };
+    let (dummy_cost, cost_warning) = dummy_bcrypt_cost(&users);
+    if let Some(w) = cost_warning {
+        crate::pm::daemon::pm_event("web", None, format!("web_console warning: {w}"));
+    }
 
     crate::pm::daemon::tasks().spawn(async move {
+        // Hashing at a real cost takes up to a second or so; keep it off the async workers.
+        let dummy_hash = match tokio::task::spawn_blocking(move || make_dummy_bcrypt_hash(dummy_cost))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r)
+        {
+            Ok(h) => h,
+            Err(e) => {
+                crate::pm::daemon::pm_event("web", None, format!("web_console disabled: {e}"));
+                return;
+            }
+        };
+        let st = WebState {
+            daemon: Arc::clone(&state),
+            auth: Arc::new(Authenticator::new(users, dummy_hash, bcrypt_verify_permits())),
+            auth_failures: Arc::new(Mutex::new(AuthFailureLimiter::new())),
+            auth_throttle: Arc::new(Mutex::new(AuthThrottle::new())),
+            auth_lockouts: Arc::new(Mutex::new(AuthFailureLimiter::new())),
+            tls_enabled: cfg.tls.enabled,
+        };
         let app = build_router(st);
         if let Err(e) = serve(cfg, bind_addr, app, shutting_down).await {
             crate::pm::daemon::pm_event("web", None, format!("web_console stopped: {e}"));
@@ -260,6 +280,15 @@ fn parse_htpasswd_users(cfg: &WebConsoleConfig) -> anyhow::Result<HashMap<String
         anyhow::ensure!(!hash.is_empty(), "invalid htpasswd entry (empty hash): {t:?}");
         // htpasswd -B often emits $2y$...; normalize once so we don't allocate per request.
         let normalized = hash.replace("$2y$", "$2b$");
+        if let Some(cost) = bcrypt_cost(&normalized) {
+            anyhow::ensure!(
+                cost <= MAX_SUPPORTED_BCRYPT_COST,
+                "bcrypt cost {cost} for user {user:?} exceeds the supported maximum of \
+                 {MAX_SUPPORTED_BCRYPT_COST} (each login would take minutes or more, and startup \
+                 must hash a dummy at the same cost) -- re-hash with e.g. \
+                 `htpasswd -nbB -C 12 {user} password`"
+            );
+        }
         out.insert(user.to_string(), normalized);
     }
     anyhow::ensure!(
@@ -287,7 +316,13 @@ fn build_router(state: WebState) -> Router {
         .with_state(state)
         .layer(middleware::from_fn_with_state(auth_state, basic_auth_middleware))
         .layer(middleware::from_fn_with_state(csrf_state, csrf_middleware));
+    mount_console(inner)
+}
 
+/// Mounts the (already authenticated) console routes under `/processmaster` and adds
+/// the root-level aliases and the outermost response layers. Split from build_router so
+/// the outer wiring can be tested without a daemon.
+fn mount_console(inner: Router) -> Router {
     // Mount the entire web console under a stable context path for reverse proxies.
     Router::new()
         .route("/", get(|| async { Redirect::temporary("/processmaster/status") }))
@@ -300,6 +335,22 @@ fn build_router(state: WebState) -> Router {
         // Compatibility alias (common misspelling): /procressmaster/static/logo.png
         .route("/procressmaster/static/logo.png", get(static_logo_png))
         .nest("/processmaster", inner)
+        // Outermost, so it also covers redirects and the 401/429/503 auth replies.
+        .layer(middleware::map_response(security_headers))
+}
+
+/// Anti-framing (clickjacking a root console into clicking "run admin action"), no MIME
+/// sniffing, and no Referer leaking console URLs to anything linked from the page.
+///
+/// The CSP is deliberately *only* `frame-ancestors`: the status page relies on inline
+/// scripts and styles, so a script-src policy would break it without a nonce scheme.
+async fn security_headers(mut resp: AxumResponse) -> AxumResponse {
+    let h = resp.headers_mut();
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("frame-ancestors 'none'"));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    resp
 }
 
 // ---------------- Embedded static assets (icons) ----------------
@@ -429,16 +480,158 @@ impl AuthFailureLimiter {
     }
 }
 
-/// Client address for logging only.
+// ---------------- per-source login throttle ----------------
+
+// AuthFailureLimiter only decides what gets *logged*; this decides what gets *tried*.
+// Without it every request carrying a Basic header costs a full bcrypt verify, so one
+// source could guess passwords as fast as the host has cores. After
+// THROTTLE_MAX_FAILURES failures with no THROTTLE_WINDOW-long gap between them, the
+// source is refused with 429 -- without running bcrypt -- for THROTTLE_BASE_LOCKOUT.
+// Requests made while locked are refused but neither counted nor extend the lockout (an
+// admin's open console tab polls every second or two and would otherwise hold its own
+// address locked forever). A failure after a lockout has run out locks again for twice
+// as long, up to THROTTLE_MAX_LOCKOUT.
+//
+// A successful login deliberately does *not* clear the record: behind NAT or a reverse
+// proxy the admin and an attacker share one source, and a logged-in tab's polling would
+// otherwise reset the attacker's count every second. The only reset is decay -- a
+// source quiet for THROTTLE_WINDOW is forgotten.
+const THROTTLE_MAX_FAILURES: u32 = 10;
+const THROTTLE_WINDOW: Duration = Duration::from_secs(5 * 60);
+const THROTTLE_BASE_LOCKOUT: Duration = Duration::from_secs(30);
+const THROTTLE_MAX_LOCKOUT: Duration = Duration::from_secs(15 * 60);
+// Bounded so that a sweep from many addresses cannot exhaust memory.
+const THROTTLE_MAX_SOURCES: usize = 4096;
+
+/// Throttle key for a peer. IPv6 is collapsed to its /64: a single host is routinely
+/// handed a whole /64, so keying on the full address would let it rotate through 2^64
+/// "sources" (and flush every genuine lockout out of the bounded map while doing so).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct ThrottleKey(IpAddr);
+
+impl ThrottleKey {
+    fn from_ip(ip: IpAddr) -> Self {
+        match ip {
+            IpAddr::V4(_) => Self(ip),
+            IpAddr::V6(v6) => {
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    return Self(IpAddr::V4(v4));
+                }
+                let s = v6.segments();
+                Self(IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0)))
+            }
+        }
+    }
+}
+
+struct AuthThrottle {
+    sources: HashMap<ThrottleKey, ThrottleState>,
+}
+
+struct ThrottleState {
+    failures: u32,
+    /// Length of the current (or most recent) lockout; zero until the first one.
+    backoff: Duration,
+    locked_until: Option<Instant>,
+    /// The later of the last failure and the end of the last lockout. A source that
+    /// stays quiet for THROTTLE_WINDOW past this is forgotten, escalation included.
+    quiet_since: Instant,
+}
+
+impl ThrottleState {
+    fn is_locked(&self, now: Instant) -> bool {
+        self.locked_until.is_some_and(|u| now < u)
+    }
+
+    fn is_stale(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.quiet_since) >= THROTTLE_WINDOW
+    }
+
+    /// Starts a lockout, doubling the previous one. Returns its length.
+    fn lock(&mut self, now: Instant) -> Duration {
+        self.backoff = if self.backoff.is_zero() {
+            THROTTLE_BASE_LOCKOUT
+        } else {
+            (self.backoff * 2).min(THROTTLE_MAX_LOCKOUT)
+        };
+        let until = now + self.backoff;
+        self.locked_until = Some(until);
+        self.quiet_since = until;
+        self.backoff
+    }
+}
+
+impl AuthThrottle {
+    fn new() -> Self {
+        Self { sources: HashMap::new() }
+    }
+
+    /// Consulted before any credential check. Returns how long the source must still
+    /// wait if it is locked out. Read-only: a request refused here is not a guess (no
+    /// credential was checked), so it neither counts nor extends the lockout.
+    fn check(&self, key: ThrottleKey, now: Instant) -> Option<Duration> {
+        let until = self.sources.get(&key)?.locked_until.filter(|u| now < *u)?;
+        Some(until.saturating_duration_since(now).max(Duration::from_secs(1)))
+    }
+
+    /// Records one rejected credential. Returns the lockout length when this failure
+    /// starts one (or, after an earlier lockout ran out, starts a longer one).
+    fn record_failure(&mut self, key: ThrottleKey, now: Instant) -> Option<Duration> {
+        if self.sources.get(&key).is_some_and(|st| st.is_stale(now)) {
+            self.sources.remove(&key);
+        }
+        if !self.sources.contains_key(&key) {
+            self.make_room(now);
+            self.sources.insert(
+                key,
+                ThrottleState { failures: 0, backoff: Duration::ZERO, locked_until: None, quiet_since: now },
+            );
+        }
+        let st = self.sources.get_mut(&key)?;
+        st.failures = st.failures.saturating_add(1);
+        st.quiet_since = st.quiet_since.max(now);
+        (st.failures >= THROTTLE_MAX_FAILURES).then(|| st.lock(now))
+    }
+
+    fn make_room(&mut self, now: Instant) {
+        if self.sources.len() < THROTTLE_MAX_SOURCES {
+            return;
+        }
+        self.sources.retain(|_, st| !st.is_stale(now));
+        while self.sources.len() >= THROTTLE_MAX_SOURCES {
+            // Evict sources that are not locked out before ones that are, oldest first,
+            // so a flood of fresh addresses cannot cheaply lift an active lockout.
+            let victim = self
+                .sources
+                .iter()
+                .min_by_key(|(_, st)| (st.is_locked(now), st.quiet_since))
+                .map(|(k, _)| *k);
+            match victim {
+                Some(k) => {
+                    self.sources.remove(&k);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+/// TCP peer of the request, from `ConnectInfo`.
 ///
-/// Deliberately reads just the TCP peer from `ConnectInfo` and never `X-Forwarded-For` /
-/// `X-Real-IP`: those are caller-supplied and would let an attacker attribute their own
-/// failures to someone else's address, or evade the per-source rate limit by rotating a
-/// header. Behind a reverse proxy this correctly reports the proxy.
-fn client_ip(req: &axum::http::Request<axum::body::Body>) -> String {
+/// Deliberately never `X-Forwarded-For` / `X-Real-IP`: those are caller-supplied and
+/// would let an attacker attribute their own failures to someone else's address, or
+/// evade the per-source throttle by rotating a header. Behind a reverse proxy this is
+/// the proxy, so every client behind it shares one throttle record.
+fn peer_ip(req: &axum::http::Request<axum::body::Body>) -> Option<IpAddr> {
     req.extensions()
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0.ip().to_string())
+        .map(|ci| ci.0.ip())
+}
+
+/// Client address for logging; see `peer_ip`.
+fn client_ip(req: &axum::http::Request<axum::body::Body>) -> String {
+    peer_ip(req)
+        .map(|ip| ip.to_string())
         .unwrap_or_else(|| "unknown".to_string())
 }
 
@@ -446,19 +639,53 @@ async fn basic_auth_middleware(
     State(st): State<WebState>,
     mut req: axum::http::Request<axum::body::Body>,
     next: middleware::Next,
-) -> impl IntoResponse {
+) -> AxumResponse {
+    let ip = client_ip(&req);
+    let key = peer_ip(&req).map(ThrottleKey::from_ip);
+    // Only requests carrying credentials are throttled: the bare browser challenge is
+    // not a guess, and counting it would lock people out on page loads.
+    if req.headers().contains_key(header::AUTHORIZATION) {
+        if let Some(key) = key {
+            let locked = st
+                .auth_throttle
+                .lock()
+                .ok()
+                .and_then(|t| t.check(key, Instant::now()));
+            if let Some(wait) = locked {
+                note_lockout(&st, &ip, wait);
+                return too_many_attempts(wait);
+            }
+        }
+    }
+
     let headers = req.headers().clone();
-    match check_basic_auth(&st.users, &st.auth_cache, &headers).await {
+    match check_basic_auth(&st.auth, &headers).await {
         Ok(user) => {
+            // No throttle reset on success: see the per-source login throttle notes.
             req.extensions_mut().insert(Principal(user));
             next.run(req).await
         }
+        Err(denied) if denied.busy => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "1")],
+            denied.client_message,
+        )
+            .into_response(),
         Err(denied) => {
-            let ip = client_ip(&req);
             // A request with no Authorization header at all is the ordinary browser
             // challenge handshake, not an attempt at anything -- logging it would bury
             // the real rejections under one line per first page load.
             let emit = if denied.attempted {
+                if let Some(key) = key {
+                    let locked = st
+                        .auth_throttle
+                        .lock()
+                        .ok()
+                        .and_then(|mut t| t.record_failure(key, Instant::now()));
+                    if let Some(wait) = locked {
+                        note_lockout(&st, &ip, wait);
+                    }
+                }
                 st.auth_failures
                     .lock()
                     .ok()
@@ -489,6 +716,36 @@ async fn basic_auth_middleware(
     }
 }
 
+/// Logs a lockout (rate-limited per source, like auth failures).
+fn note_lockout(st: &WebState, ip: &str, wait: Duration) {
+    let emit = st
+        .auth_lockouts
+        .lock()
+        .ok()
+        .and_then(|mut l| l.note(ip, Instant::now()));
+    if let Some(suppressed) = emit {
+        crate::pm::daemon::pm_event(
+            "web",
+            None,
+            format!(
+                "auth_lockout ip={} retry_after_s={} suppressed_since_last={}",
+                ip,
+                wait.as_secs(),
+                suppressed
+            ),
+        );
+    }
+}
+
+fn too_many_attempts(wait: Duration) -> AxumResponse {
+    let secs = wait.as_secs().max(1).to_string();
+    let mut resp = (StatusCode::TOO_MANY_REQUESTS, "too many failed logins; retry later").into_response();
+    if let Ok(v) = HeaderValue::from_str(&secs) {
+        resp.headers_mut().insert(header::RETRY_AFTER, v);
+    }
+    resp
+}
+
 struct AuthDenied {
     /// Returned to the client and used as the logged reason; a fixed set of strings.
     client_message: String,
@@ -499,33 +756,130 @@ struct AuthDenied {
     known_user: Option<String>,
     /// False only when the request carried no credentials at all.
     attempted: bool,
+    /// Every bcrypt slot was taken, so the credential was never checked. Not a failure.
+    busy: bool,
 }
 
 impl AuthDenied {
     /// A rejected attempt whose username is not one we know.
     fn anonymous(msg: &str) -> Self {
-        Self { client_message: msg.to_string(), known_user: None, attempted: true }
+        Self { client_message: msg.to_string(), known_user: None, attempted: true, busy: false }
     }
     fn for_user(user: &str, msg: &str) -> Self {
-        Self { client_message: msg.to_string(), known_user: Some(user.to_string()), attempted: true }
+        Self { client_message: msg.to_string(), known_user: Some(user.to_string()), attempted: true, busy: false }
     }
     /// No Authorization header: the client is being challenged, not refused.
     fn unchallenged(msg: &str) -> Self {
-        Self { client_message: msg.to_string(), known_user: None, attempted: false }
+        Self { client_message: msg.to_string(), known_user: None, attempted: false, busy: false }
+    }
+    fn busy() -> Self {
+        Self { client_message: "server busy, retry shortly".to_string(), known_user: None, attempted: true, busy: true }
     }
 }
 
-// bcrypt hash of a fixed throwaway password, generated at bcrypt::DEFAULT_COST.
-// Verified against when the username is unknown so that unknown and known users cost
-// the same wall-clock time (otherwise the response time enumerates valid usernames).
-const DUMMY_BCRYPT_HASH: &str = "$2b$12$BZCGuMAbOe5rXqoieAs5aOxvCRLsq5VaFUSiKk/7xlEM305d63GN6";
+/// Credential store plus the resources needed to check against it. Kept apart from
+/// WebState so it can be exercised without a daemon.
+struct Authenticator {
+    users: HashMap<String, String>, // username -> bcrypt hash
+    /// Verified against when the username is unknown, so that unknown and known users
+    /// cost the same wall-clock time (otherwise the response time enumerates valid
+    /// usernames). Generated at startup at the configured cost; see dummy_bcrypt_cost.
+    dummy_hash: String,
+    cache: Mutex<AuthCache>,
+    /// Caps concurrent bcrypt verifies. Callers never queue for a slot: a flood of
+    /// logins would otherwise pile up on the blocking pool and starve the supervisor.
+    bcrypt_slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl Authenticator {
+    fn new(users: HashMap<String, String>, dummy_hash: String, permits: usize) -> Self {
+        Self {
+            users,
+            dummy_hash,
+            cache: Mutex::new(AuthCache::new()),
+            bcrypt_slots: Arc::new(tokio::sync::Semaphore::new(permits)),
+        }
+    }
+}
+
+/// Concurrent bcrypt verifies allowed: enough to keep every core busy with logins
+/// without letting them monopolise the blocking pool.
+fn bcrypt_verify_permits() -> usize {
+    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    (2 * cpus).max(2)
+}
+
+/// Highest bcrypt cost accepted for a configured user. Each step doubles the work: cost
+/// 16 is already seconds per verify, while cost 31 is days -- and startup hashes a dummy
+/// at the configured cost, so an unbounded cost would hang console startup (and daemon
+/// shutdown, which waits for it). Higher costs are rejected by parse_htpasswd_users.
+const MAX_SUPPORTED_BCRYPT_COST: u32 = 16;
+
+/// Parses the cost out of a `$2?$NN$...` bcrypt hash.
+fn bcrypt_cost(hash: &str) -> Option<u32> {
+    let mut parts = hash.strip_prefix('$')?.splitn(3, '$');
+    if !matches!(parts.next()?, "2a" | "2b" | "2x" | "2y") {
+        return None;
+    }
+    let cost: u32 = parts.next()?.parse().ok()?;
+    (4..=31).contains(&cost).then_some(cost)
+}
+
+/// Picks the cost for the unknown-user dummy hash: the most common configured cost
+/// (ties go to the higher, conservative one), so a made-up username takes as long as a
+/// typical real one. Also returns a warning for configurations that weaken this.
+fn dummy_bcrypt_cost(users: &HashMap<String, String>) -> (u32, Option<String>) {
+    let mut counts: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
+    let mut unparseable = 0usize;
+    for hash in users.values() {
+        match bcrypt_cost(hash) {
+            Some(c) => *counts.entry(c).or_default() += 1,
+            None => unparseable += 1,
+        }
+    }
+    let cost = counts
+        .iter()
+        .max_by_key(|(c, n)| (**n, **c))
+        .map(|(c, _)| *c)
+        .unwrap_or(bcrypt::DEFAULT_COST)
+        // parse_htpasswd_users already rejects higher costs; never hash for days regardless.
+        .min(MAX_SUPPORTED_BCRYPT_COST);
+
+    let costs: Vec<String> = counts.keys().map(|c| c.to_string()).collect();
+    let mut warnings = Vec::new();
+    if counts.len() > 1 {
+        warnings.push(format!(
+            "basic auth users have mixed bcrypt costs ({}); login response time reveals which \
+             usernames exist -- re-hash all users at one cost",
+            costs.join(",")
+        ));
+    }
+    if counts.keys().any(|c| *c < 10) {
+        warnings.push(format!(
+            "basic auth users include bcrypt cost < 10 ({}); such hashes are cheap to brute-force \
+             -- re-hash with e.g. `htpasswd -nbB -C 12 user password`",
+            costs.join(",")
+        ));
+    }
+    if unparseable > 0 {
+        warnings.push(format!(
+            "{unparseable} basic auth user(s) have a hash that is not bcrypt ($2a$/$2b$/$2y$); \
+             they can never log in"
+        ));
+    }
+    (cost, (!warnings.is_empty()).then(|| warnings.join("; ")))
+}
+
+/// bcrypt hash of a random throwaway password, at `cost`.
+fn make_dummy_bcrypt_hash(cost: u32) -> anyhow::Result<String> {
+    let mut pw = [0u8; 24];
+    rand::rngs::OsRng.fill_bytes(&mut pw);
+    let pw: String = pw.iter().map(|b| format!("{b:02x}")).collect();
+    bcrypt::hash(pw, cost).map_err(|e| anyhow::anyhow!("failed to generate dummy bcrypt hash: {e}"))
+}
 
 /// Returns the authenticated username on success.
-async fn check_basic_auth(
-    users: &HashMap<String, String>,
-    auth_cache: &Arc<Mutex<AuthCache>>,
-    headers: &axum::http::HeaderMap,
-) -> Result<String, AuthDenied> {
+async fn check_basic_auth(auth: &Authenticator, headers: &axum::http::HeaderMap) -> Result<String, AuthDenied> {
     let Some(v) = headers.get(header::AUTHORIZATION) else {
         return Err(AuthDenied::unchallenged("missing Authorization header"));
     };
@@ -541,45 +895,44 @@ async fn check_basic_auth(
         .map_err(|_| AuthDenied::anonymous("invalid base64 in Authorization"))?;
     // Wipe the decoded "user:pass" as soon as the verdict is in, so the plaintext is not
     // left lying in the heap for a core dump to pick up (see FIX 3 / password_digest).
-    let out = check_decoded_basic_auth(users, auth_cache, &decoded).await;
+    let out = check_decoded_basic_auth(auth, &decoded).await;
     zero_bytes(&mut decoded);
     out
 }
 
-async fn check_decoded_basic_auth(
-    users: &HashMap<String, String>,
-    auth_cache: &Arc<Mutex<AuthCache>>,
-    decoded: &[u8],
-) -> Result<String, AuthDenied> {
+async fn check_decoded_basic_auth(auth: &Authenticator, decoded: &[u8]) -> Result<String, AuthDenied> {
     let Ok(s) = std::str::from_utf8(decoded) else {
         return Err(AuthDenied::anonymous("invalid utf8 in Authorization"));
     };
     let Some((user, pass)) = s.split_once(':') else {
         return Err(AuthDenied::anonymous("invalid basic auth payload"));
     };
-    let Some(expected_hash) = users.get(user).cloned() else {
+    let Some(expected_hash) = auth.users.get(user).cloned() else {
         // Unknown user: burn an equivalent bcrypt verify so the reply time does not
         // reveal whether the username exists, then fail with the same message.
-        let _ = bcrypt_verify_blocking(pass, DUMMY_BCRYPT_HASH).await;
-        return Err(AuthDenied::anonymous("invalid credentials"));
+        return match bcrypt_verify_blocking(&auth.bcrypt_slots, pass, &auth.dummy_hash).await {
+            None => Err(AuthDenied::busy()),
+            Some(_) => Err(AuthDenied::anonymous("invalid credentials")),
+        };
     };
 
     // Cache lookup: if this (user, hash, password digest) succeeded before, accept
-    // immediately and skip bcrypt.
+    // immediately and skip bcrypt (and so needs no bcrypt slot).
     let digest = password_digest(pass);
-    if let Ok(mut c) = auth_cache.lock() {
+    if let Ok(mut c) = auth.cache.lock() {
         if c.is_cached_ok(user, &expected_hash, digest, Instant::now()) {
             return Ok(user.to_string());
         }
     }
 
     // Cache miss: verify once.
-    let ok = bcrypt_verify_blocking(pass, &expected_hash).await;
-    if !ok {
-        return Err(AuthDenied::for_user(user, "invalid credentials"));
+    match bcrypt_verify_blocking(&auth.bcrypt_slots, pass, &expected_hash).await {
+        None => return Err(AuthDenied::busy()),
+        Some(false) => return Err(AuthDenied::for_user(user, "invalid credentials")),
+        Some(true) => {}
     }
     // Successful verify: remember it (best-effort).
-    if let Ok(mut c) = auth_cache.lock() {
+    if let Ok(mut c) = auth.cache.lock() {
         c.put_ok(user.to_string(), expected_hash, digest, Instant::now());
     }
     Ok(user.to_string())
@@ -588,13 +941,22 @@ async fn check_decoded_basic_auth(
 // bcrypt is deliberately CPU-expensive and this daemon shares ONE tokio runtime with
 // all supervision work, so a burst of logins on the async workers would starve it.
 // Always verify on the blocking pool. Any error (bad hash, join failure) is a mismatch.
-async fn bcrypt_verify_blocking(pass: &str, hash: &str) -> bool {
+//
+// Returns None, without verifying, when all bcrypt slots are taken. The permit moves
+// into the blocking task so it is held until bcrypt actually finishes, even if the
+// client hangs up and this future is dropped first.
+async fn bcrypt_verify_blocking(slots: &Arc<tokio::sync::Semaphore>, pass: &str, hash: &str) -> Option<bool> {
+    let permit = Arc::clone(slots).try_acquire_owned().ok()?;
     let pass = pass.to_string();
     let hash = hash.to_string();
-    matches!(
-        tokio::task::spawn_blocking(move || bcrypt::verify(&pass, &hash)).await,
+    Some(matches!(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            bcrypt::verify(&pass, &hash)
+        })
+        .await,
         Ok(Ok(true))
-    )
+    ))
 }
 
 // ---------------- CSRF ----------------
@@ -1093,37 +1455,17 @@ async fn jsonrpc(
                 let st = st.daemon.lock().unwrap_or_else(|p| p.into_inner());
                 st.cfg.clone()
             };
-            let admin_cg = match admin_actions_cgroup_dir(&cfg) {
-                Ok(p) => p,
-                Err(e) => {
-                    let v = serde_json::json!({ "ok": false, "message": e.to_string(), "pids": [] });
-                    return (
-                        StatusCode::OK,
-                        Json(JsonRpcResponse::<serde_json::Value> {
-                            jsonrpc: "2.0",
-                            id: req.id,
-                            result: Some(v),
-                            error: None,
-                        }),
-                    );
+            // Grouped by action id: "<id>: <pid>" per running process.
+            let v = match crate::pm::daemon::admin_action_pids_by_id(&cfg) {
+                Ok(running) => {
+                    let pids: Vec<String> = running
+                        .into_iter()
+                        .flat_map(|(id, pids)| pids.into_iter().map(move |p| format!("{id}: {p}")))
+                        .collect();
+                    serde_json::json!({ "ok": true, "message": "", "pids": pids })
                 }
+                Err(e) => serde_json::json!({ "ok": false, "message": e.to_string(), "pids": [] }),
             };
-            let pids = match cgroup::list_pids(&admin_cg) {
-                Ok(v) => v,
-                Err(e) => {
-                    let v = serde_json::json!({ "ok": false, "message": e.to_string(), "pids": [] });
-                    return (
-                        StatusCode::OK,
-                        Json(JsonRpcResponse::<serde_json::Value> {
-                            jsonrpc: "2.0",
-                            id: req.id,
-                            result: Some(v),
-                            error: None,
-                        }),
-                    );
-                }
-            };
-            let v = serde_json::json!({ "ok": true, "message": "", "pids": pids });
             return (
                 StatusCode::OK,
                 Json(JsonRpcResponse::<serde_json::Value> {
@@ -1251,11 +1593,9 @@ fn service_cgroup_dir(cfg: &crate::pm::config::MasterConfig, app: &str) -> anyho
         "cgroup.name must not contain '..'"
     );
     let app = app.trim();
-    anyhow::ensure!(!app.is_empty(), "app name is empty");
-    anyhow::ensure!(
-        !app.split('/').any(|seg| seg == ".." || seg.is_empty()),
-        "app name must not contain '/' or '..'"
-    );
+    // Same rules as service definitions: rules out '/', '.', '..' and leading dots, while
+    // still allowing names such as `db..backup` that a config can legitimately define.
+    crate::pm::app::validate_application_name(app)?;
     let master = PathBuf::from(&cfg.cgroup_root).join(name.trim_start_matches('/'));
     Ok(master.join(format!("pm-{app}")))
 }
@@ -1280,6 +1620,9 @@ fn validate_systemd_unit(unit: &str) -> anyhow::Result<()> {
     let t = unit.trim();
     anyhow::ensure!(!t.is_empty(), "unit is empty");
     anyhow::ensure!(t.ends_with(".service"), "only .service units are supported (got {t:?})");
+    // A leading '-' would be parsed by root's systemctl as an option (`-H user@host`
+    // opens SSH with root's keys). Callers also pass "--"; this is the belt.
+    anyhow::ensure!(!t.starts_with('-'), "invalid unit name (leading '-'): {t:?}");
     anyhow::ensure!(
         t.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@' | ':' | '\\')),
@@ -1486,7 +1829,7 @@ async fn systemd_action(unit: &str, action: &str) -> anyhow::Result<String> {
     validate_systemd_unit(unit)?;
     let action = validate_systemd_action(action)?;
     let mut cmd = Command::new("systemctl");
-    cmd.arg("--no-pager").arg(action).arg(unit);
+    cmd.arg("--no-pager").arg(action).arg("--").arg(unit);
     let out = run_cmd_timeout(cmd, 10_000).await?;
     if out.status.success() {
         return Ok(format!("{action} {unit}: ok"));
@@ -1525,9 +1868,10 @@ async fn systemd_service_details(unit: &str) -> anyhow::Result<(PathBuf, cgroup:
     validate_systemd_unit(unit)?;
     let mut cmd = Command::new("systemctl");
     cmd.arg("show")
-        .arg(unit)
         .arg("--no-pager")
-        .arg("--property=ControlGroup");
+        .arg("--property=ControlGroup")
+        .arg("--")
+        .arg(unit);
     let out = run_cmd_timeout(cmd, 3000).await?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -1549,6 +1893,36 @@ async fn systemd_service_details(unit: &str) -> anyhow::Result<(PathBuf, cgroup:
     }
     let snap = cgroup::read_resource_snapshot(&dir)?;
     Ok((dir, snap))
+}
+
+/// Reads the `flags` param (comma-separated string or array), normalised to lowercase.
+///
+/// Flags end up in the daemon's state and event log, so anything outside the charset
+/// the daemon accepts is refused here too, with a clearer error than the round trip.
+fn parse_flags_param(v: Option<&serde_json::Value>) -> Result<Vec<String>, String> {
+    let raw: Vec<&str> = match v {
+        Some(serde_json::Value::String(s)) => s.split(',').collect(),
+        Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).collect(),
+        _ => vec![],
+    };
+    let flags: Vec<String> = raw
+        .into_iter()
+        .map(|x| x.trim().to_ascii_lowercase())
+        .filter(|x| !x.is_empty())
+        .collect();
+    if flags.is_empty() {
+        return Err("missing/empty param: flags".to_string());
+    }
+    if let Some(bad) = flags
+        .iter()
+        .find(|f| !f.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' | b':' | b'-')))
+    {
+        return Err(format!(
+            "invalid flag {:?}: only a-z, 0-9, '_', '.', ':' and '-' are allowed",
+            sanitize_event_field(bad)
+        ));
+    }
+    Ok(flags)
 }
 
 fn map_method_to_request(method: &str, params: &serde_json::Value) -> Result<Request, String> {
@@ -1610,47 +1984,13 @@ fn map_method_to_request(method: &str, params: &serde_json::Value) -> Result<Req
         }
         "flag" => {
             let name = get_s("name").ok_or_else(|| "missing param: name".to_string())?;
-            let flags_val = obj.get("flags").cloned().unwrap_or(serde_json::Value::Null);
-            let flags: Vec<String> = match flags_val {
-                serde_json::Value::String(s) => s
-                    .split(',')
-                    .map(|x| x.trim().to_ascii_lowercase())
-                    .filter(|x| !x.is_empty())
-                    .collect(),
-                serde_json::Value::Array(a) => a
-                    .iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|x| x.trim().to_ascii_lowercase())
-                    .filter(|x| !x.is_empty())
-                    .collect(),
-                _ => vec![],
-            };
-            if flags.is_empty() {
-                return Err("missing/empty param: flags".to_string());
-            }
+            let flags = parse_flags_param(obj.get("flags"))?;
             let ttl = get_s("ttl");
             Ok(Request::Flag { name, flags, ttl })
         }
         "unflag" => {
             let name = get_s("name").ok_or_else(|| "missing param: name".to_string())?;
-            let flags_val = obj.get("flags").cloned().unwrap_or(serde_json::Value::Null);
-            let flags: Vec<String> = match flags_val {
-                serde_json::Value::String(s) => s
-                    .split(',')
-                    .map(|x| x.trim().to_ascii_lowercase())
-                    .filter(|x| !x.is_empty())
-                    .collect(),
-                serde_json::Value::Array(a) => a
-                    .iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|x| x.trim().to_ascii_lowercase())
-                    .filter(|x| !x.is_empty())
-                    .collect(),
-                _ => vec![],
-            };
-            if flags.is_empty() {
-                return Err("missing/empty param: flags".to_string());
-            }
+            let flags = parse_flags_param(obj.get("flags"))?;
             Ok(Request::Unflag { name, flags })
         }
         _ => Err(format!("unknown method: {method}")),
@@ -2183,9 +2523,24 @@ async fn serve(
 
         axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config))
     };
-    axum_server::bind_rustls(addr, tls_config)
+    // Same shutdown trigger as the plain-HTTP path; stragglers get a bounded grace
+    // period so an open keep-alive connection cannot hold the daemon's exit hostage.
+    let handle = axum_server::Handle::new();
+    let watcher = {
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            while !shutting_down.load(Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            handle.graceful_shutdown(Some(Duration::from_secs(5)));
+        })
+    };
+    let served = axum_server::bind_rustls(addr, tls_config)
+        .handle(handle)
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-        .await?;
+        .await;
+    watcher.abort();
+    served?;
     Ok(())
 }
 
@@ -2197,15 +2552,56 @@ mod tests {
 
     // ---- timing-safe primitives ------------------------------------------------
 
+    // A real bcrypt hash (cost 12) of a throwaway password, for parsing tests.
+    const SAMPLE_BCRYPT_HASH: &str = "$2b$12$BZCGuMAbOe5rXqoieAs5aOxvCRLsq5VaFUSiKk/7xlEM305d63GN6";
+
     #[test]
     fn dummy_bcrypt_hash_is_a_real_verifiable_hash() {
-        // This matters more than it looks: if the constant were malformed,
-        // bcrypt::verify would return Err *immediately* instead of doing the work,
-        // which would silently restore the username-enumeration timing oracle it
-        // exists to close.
-        let r = bcrypt::verify("any password at all", DUMMY_BCRYPT_HASH);
-        assert!(r.is_ok(), "DUMMY_BCRYPT_HASH is not a parseable bcrypt hash");
-        assert!(!r.unwrap(), "DUMMY_BCRYPT_HASH must not match a guessable password");
+        // This matters more than it looks: if the dummy were malformed, bcrypt::verify
+        // would return Err *immediately* instead of doing the work, which would
+        // silently restore the username-enumeration timing oracle it exists to close.
+        let h = make_dummy_bcrypt_hash(4).expect("generates");
+        assert_eq!(bcrypt_cost(&h), Some(4), "dummy hash must be at the requested cost");
+        for guess in ["any password at all", "", "password", "admin"] {
+            let r = bcrypt::verify(guess, &h);
+            assert!(r.is_ok(), "dummy hash is not a parseable bcrypt hash");
+            assert!(!r.unwrap(), "dummy hash must not match a guessable password");
+        }
+        // Random per process, so it is not a constant anyone can look up.
+        assert_ne!(h, make_dummy_bcrypt_hash(4).unwrap());
+    }
+
+    fn users_with_costs(costs: &[&str]) -> HashMap<String, String> {
+        costs
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (format!("u{i}"), format!("$2b${c}$BZCGuMAbOe5rXqoieAs5aOxvCRLsq5VaFUSiKk/7xlEM305d63GN6")))
+            .collect()
+    }
+
+    #[test]
+    fn dummy_cost_follows_the_most_common_configured_cost() {
+        assert_eq!(dummy_bcrypt_cost(&users_with_costs(&["12"])), (12, None));
+        assert_eq!(dummy_bcrypt_cost(&users_with_costs(&["11", "11", "12"])).0, 11);
+        // A tie goes to the higher, more expensive cost.
+        assert_eq!(dummy_bcrypt_cost(&users_with_costs(&["10", "12"])).0, 12);
+        // Nothing parseable: fall back to the library default.
+        assert_eq!(dummy_bcrypt_cost(&users_with_costs(&[])).0, bcrypt::DEFAULT_COST);
+        assert_eq!(bcrypt_cost("$2y$05$abc"), Some(5));
+        assert_eq!(bcrypt_cost("{SHA}abc"), None);
+        assert_eq!(bcrypt_cost("$2b$99$abc"), None);
+    }
+
+    #[test]
+    fn mixed_or_low_bcrypt_costs_are_warned_about() {
+        let (_, w) = dummy_bcrypt_cost(&users_with_costs(&["10", "12"]));
+        assert!(w.expect("mixed costs warn").contains("mixed"));
+        let (cost, w) = dummy_bcrypt_cost(&users_with_costs(&["05"]));
+        assert_eq!(cost, 5);
+        assert!(w.expect("low cost warns").contains("cost < 10"));
+        let mut users = users_with_costs(&["12"]);
+        users.insert("md5".to_string(), "$apr1$xyz$abc".to_string());
+        assert!(dummy_bcrypt_cost(&users).1.expect("non-bcrypt warns").contains("not bcrypt"));
     }
 
     #[test]
@@ -2273,13 +2669,13 @@ mod tests {
             enabled: true,
             auth: crate::pm::config::WebConsoleAuthConfig {
                 basic: crate::pm::config::WebConsoleBasicAuthConfig {
-                    users: vec![format!("alice:{DUMMY_BCRYPT_HASH}")],
+                    users: vec![format!("alice:{SAMPLE_BCRYPT_HASH}")],
                 },
             },
             ..Default::default()
         };
         let users = parse_htpasswd_users(&cfg).expect("parses");
-        assert_eq!(users.get("alice").map(String::as_str), Some(DUMMY_BCRYPT_HASH));
+        assert_eq!(users.get("alice").map(String::as_str), Some(SAMPLE_BCRYPT_HASH));
     }
 
     #[test]
@@ -2294,6 +2690,26 @@ mod tests {
             ..Default::default()
         };
         assert!(parse_htpasswd_users(&cfg).is_err());
+    }
+
+    #[test]
+    fn htpasswd_rejects_bcrypt_costs_above_the_supported_maximum() {
+        let cfg_for = |cost: u32| WebConsoleConfig {
+            enabled: true,
+            auth: crate::pm::config::WebConsoleAuthConfig {
+                basic: crate::pm::config::WebConsoleBasicAuthConfig {
+                    users: vec![format!("alice:$2y${cost:02}$BZCGuMAbOe5rXqoieAs5aOxvCRLsq5VaFUSiKk/7xlEM305d63GN6")],
+                },
+            },
+            ..Default::default()
+        };
+        assert!(parse_htpasswd_users(&cfg_for(MAX_SUPPORTED_BCRYPT_COST)).is_ok());
+        for cost in [MAX_SUPPORTED_BCRYPT_COST + 1, 31] {
+            let err = parse_htpasswd_users(&cfg_for(cost)).expect_err("too costly").to_string();
+            assert!(err.contains("exceeds the supported maximum"), "{err}");
+        }
+        // The dummy never exceeds the cap even if handed such a user directly.
+        assert_eq!(dummy_bcrypt_cost(&users_with_costs(&["31"])).0, MAX_SUPPORTED_BCRYPT_COST);
     }
 
     // ---- cookies ---------------------------------------------------------------
@@ -2447,19 +2863,256 @@ mod tests {
 
     #[tokio::test]
     async fn a_challenge_is_not_recorded_as_a_failed_login() {
-        let users: HashMap<String, String> = HashMap::new();
-        let cache = Arc::new(Mutex::new(AuthCache::new()));
+        let auth = Authenticator::new(HashMap::new(), make_dummy_bcrypt_hash(4).unwrap(), 2);
 
         // No credentials: every first page load looks like this, and it is not an attempt.
-        let denied = check_basic_auth(&users, &cache, &HeaderMap::new()).await.unwrap_err();
+        let denied = check_basic_auth(&auth, &HeaderMap::new()).await.unwrap_err();
         assert!(!denied.attempted);
 
         // Credentials that were sent but are unusable are a real, loggable rejection.
         let mut h = HeaderMap::new();
         h.insert(header::AUTHORIZATION, HeaderValue::from_static("Basic !!!not-base64!!!"));
-        let denied = check_basic_auth(&users, &cache, &h).await.unwrap_err();
+        let denied = check_basic_auth(&auth, &h).await.unwrap_err();
         assert!(denied.attempted);
         assert_eq!(denied.known_user, None);
+    }
+
+    fn basic_header(user: &str, pass: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        let v = format!("Basic {}", BASE64.encode(format!("{user}:{pass}")));
+        h.insert(header::AUTHORIZATION, HeaderValue::from_str(&v).unwrap());
+        h
+    }
+
+    #[tokio::test]
+    async fn saturated_bcrypt_slots_answer_busy_but_cache_hits_still_pass() {
+        let hash = bcrypt::hash("s3cret", 4).unwrap();
+        let users = HashMap::from([("alice".to_string(), hash)]);
+        let auth = Authenticator::new(users, make_dummy_bcrypt_hash(4).unwrap(), 1);
+
+        // Log in once so the credential is cached.
+        assert_eq!(check_basic_auth(&auth, &basic_header("alice", "s3cret")).await.ok().as_deref(), Some("alice"));
+
+        // Take the only slot, as a concurrent verify would.
+        let held = Arc::clone(&auth.bcrypt_slots).try_acquire_owned().unwrap();
+        for (user, pass) in [("alice", "wrong"), ("mallory", "whatever")] {
+            let denied = check_basic_auth(&auth, &basic_header(user, pass)).await.unwrap_err();
+            assert!(denied.busy, "{user}: a cache miss must not queue behind a full pool");
+        }
+        // A cached success needs no slot.
+        assert_eq!(check_basic_auth(&auth, &basic_header("alice", "s3cret")).await.ok().as_deref(), Some("alice"));
+
+        drop(held);
+        let denied = check_basic_auth(&auth, &basic_header("alice", "wrong")).await.unwrap_err();
+        assert!(!denied.busy);
+        assert_eq!(denied.known_user.as_deref(), Some("alice"));
+        // The permit is returned once the verify is done.
+        assert_eq!(auth.bcrypt_slots.available_permits(), 1);
+    }
+
+    #[test]
+    fn bcrypt_permits_are_at_least_two() {
+        assert!(bcrypt_verify_permits() >= 2);
+    }
+
+    // ---- per-source login throttle ---------------------------------------------
+
+    fn key(s: &str) -> ThrottleKey {
+        ThrottleKey::from_ip(s.parse().unwrap())
+    }
+
+    #[test]
+    fn a_source_is_locked_out_after_repeated_failures() {
+        let mut t = AuthThrottle::new();
+        let k = key("192.0.2.1");
+        let t0 = Instant::now();
+        for i in 1..THROTTLE_MAX_FAILURES {
+            assert_eq!(t.record_failure(k, t0), None, "failure {i} must not lock yet");
+            assert_eq!(t.check(k, t0), None);
+        }
+        assert_eq!(t.record_failure(k, t0), Some(THROTTLE_BASE_LOCKOUT));
+        // Other sources are unaffected.
+        assert_eq!(t.check(key("192.0.2.2"), t0), None);
+        // Once the lockout runs out the source may try again...
+        let after = t0 + THROTTLE_BASE_LOCKOUT;
+        assert_eq!(t.check(k, after), None);
+        // ...but its next failure locks it again, for twice as long.
+        assert_eq!(t.record_failure(k, after), Some(THROTTLE_BASE_LOCKOUT * 2));
+    }
+
+    #[test]
+    fn lockouts_double_only_on_failures_after_expiry_and_are_capped() {
+        let mut t = AuthThrottle::new();
+        let k = key("192.0.2.1");
+        let mut now = Instant::now();
+        for _ in 0..THROTTLE_MAX_FAILURES {
+            t.record_failure(k, now);
+        }
+        let mut expect = THROTTLE_BASE_LOCKOUT;
+        for _ in 0..10 {
+            // Attempts while locked do not escalate...
+            assert_eq!(t.check(k, now), Some(expect));
+            assert_eq!(t.check(k, now), Some(expect));
+            // ...only a failure once the lockout has run out does.
+            now += expect;
+            assert_eq!(t.check(k, now), None);
+            expect = (expect * 2).min(THROTTLE_MAX_LOCKOUT);
+            assert_eq!(t.record_failure(k, now), Some(expect));
+        }
+        assert_eq!(expect, THROTTLE_MAX_LOCKOUT);
+        // Still locked just before the (capped) lockout ends.
+        assert!(t.check(k, now + THROTTLE_MAX_LOCKOUT - Duration::from_secs(1)).is_some());
+    }
+
+    #[test]
+    fn polling_during_a_lockout_does_not_extend_it() {
+        // An admin's console tab keeps polling (with credentials) while its address is
+        // locked; that must not hold the lockout open forever.
+        let mut t = AuthThrottle::new();
+        let k = key("192.0.2.1");
+        let t0 = Instant::now();
+        for _ in 0..THROTTLE_MAX_FAILURES {
+            t.record_failure(k, t0);
+        }
+        let failures = t.sources.get(&k).unwrap().failures;
+        for s in 0..THROTTLE_BASE_LOCKOUT.as_secs() {
+            let now = t0 + Duration::from_secs(s);
+            assert_eq!(t.check(k, now), Some(THROTTLE_BASE_LOCKOUT - Duration::from_secs(s)));
+        }
+        // Sub-second remainders round up rather than telling the client to retry now.
+        let almost = t0 + THROTTLE_BASE_LOCKOUT - Duration::from_millis(10);
+        assert_eq!(t.check(k, almost), Some(Duration::from_secs(1)));
+        assert_eq!(t.check(k, t0 + THROTTLE_BASE_LOCKOUT), None, "lockout ends on time");
+        let st = t.sources.get(&k).unwrap();
+        assert_eq!(st.failures, failures, "refused requests are not counted");
+        assert_eq!(st.backoff, THROTTLE_BASE_LOCKOUT);
+    }
+
+    #[test]
+    fn failures_only_reset_by_decay_not_by_success() {
+        // There is no success path into the throttle: a logged-in admin behind the same
+        // NAT/proxy must not keep wiping an attacker's count. Only quiet time resets it.
+        let mut t = AuthThrottle::new();
+        let k = key("192.0.2.1");
+        let t0 = Instant::now();
+        for i in 0..(THROTTLE_MAX_FAILURES - 1) {
+            t.record_failure(k, t0 + Duration::from_secs(u64::from(i)));
+        }
+        let last = t0 + Duration::from_secs(u64::from(THROTTLE_MAX_FAILURES - 2));
+        let just_before = last + THROTTLE_WINDOW - Duration::from_secs(1);
+        assert_eq!(t.record_failure(k, just_before), Some(THROTTLE_BASE_LOCKOUT));
+    }
+
+    #[test]
+    fn a_quiet_source_is_forgotten() {
+        let mut t = AuthThrottle::new();
+        let k = key("192.0.2.1");
+        let t0 = Instant::now();
+        for _ in 0..(THROTTLE_MAX_FAILURES - 1) {
+            t.record_failure(k, t0);
+        }
+        assert_eq!(t.record_failure(k, t0 + THROTTLE_WINDOW), None);
+        assert_eq!(t.sources.get(&k).unwrap().failures, 1);
+    }
+
+    #[test]
+    fn throttle_sources_are_bounded_and_keep_active_lockouts() {
+        let mut t = AuthThrottle::new();
+        let t0 = Instant::now();
+        let locked = key("198.51.100.7");
+        for _ in 0..THROTTLE_MAX_FAILURES {
+            t.record_failure(locked, t0);
+        }
+        for i in 0..(THROTTLE_MAX_SOURCES + 500) {
+            t.record_failure(key(&format!("10.{}.{}.{}", i / 65536, (i / 256) % 256, i % 256)), t0);
+        }
+        assert!(t.sources.len() <= THROTTLE_MAX_SOURCES);
+        assert!(t.check(locked, t0).is_some(), "a flood of new sources must not lift a lockout");
+    }
+
+    #[test]
+    fn eviction_still_makes_room_when_every_source_is_locked() {
+        let mut t = AuthThrottle::new();
+        let t0 = Instant::now();
+        let src = |i: usize| key(&format!("10.{}.{}.{}", i / 65536, (i / 256) % 256, i % 256));
+        for i in 0..THROTTLE_MAX_SOURCES {
+            for _ in 0..THROTTLE_MAX_FAILURES {
+                t.record_failure(src(i), t0 + Duration::from_millis(i as u64));
+            }
+        }
+        assert_eq!(t.sources.len(), THROTTLE_MAX_SOURCES);
+        assert!(t.sources.values().all(|st| st.is_locked(t0 + Duration::from_secs(5))));
+        // A new source still gets a record; the oldest locked one is the victim.
+        let now = t0 + Duration::from_secs(5);
+        assert_eq!(t.record_failure(key("192.0.2.99"), now), None);
+        assert_eq!(t.sources.len(), THROTTLE_MAX_SOURCES);
+        assert!(t.sources.contains_key(&key("192.0.2.99")));
+        assert!(!t.sources.contains_key(&src(0)), "oldest lockout is evicted first");
+        assert!(t.check(src(THROTTLE_MAX_SOURCES - 1), now).is_some());
+    }
+
+    #[test]
+    fn ipv6_sources_are_throttled_per_64() {
+        assert_eq!(key("2001:db8:1:2:aaaa::1"), key("2001:db8:1:2:bbbb::2"));
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        assert_eq!(key("::ffff:192.0.2.1"), key("192.0.2.1"));
+    }
+
+    // ---- misc hardening --------------------------------------------------------
+
+    #[tokio::test]
+    async fn responses_carry_anti_framing_and_nosniff_headers() {
+        let resp = security_headers((StatusCode::OK, "x").into_response()).await;
+        let h = resp.headers();
+        assert_eq!(h.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+        assert_eq!(h.get(header::CONTENT_SECURITY_POLICY).unwrap(), "frame-ancestors 'none'");
+        assert_eq!(h.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+        assert_eq!(h.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
+    }
+
+    #[test]
+    fn service_cgroup_dir_follows_the_service_name_rules() {
+        let cfg = crate::pm::config::MasterConfig::default();
+        for bad in ["a/b", "/a", "a/", "..", ".", ".hidden", "", "a b"] {
+            assert!(service_cgroup_dir(&cfg, bad).is_err(), "{bad:?} must be rejected");
+        }
+        for good in ["web-1.api", "db..backup", "a..b"] {
+            let dir = service_cgroup_dir(&cfg, good).expect("valid service name");
+            assert_eq!(dir.file_name().unwrap(), format!("pm-{good}").as_str());
+        }
+    }
+
+    #[tokio::test]
+    async fn security_headers_are_wired_on_routed_responses_including_401() {
+        use tower::ServiceExt;
+        // Same outer wiring as build_router; the inner router stands in for the
+        // authenticated routes, answering 401 as basic_auth_middleware does.
+        let inner = Router::new().route("/status", get(|| async { StatusCode::UNAUTHORIZED }));
+        let app = mount_console(inner);
+        for (path, status) in [
+            ("/processmaster/status", StatusCode::UNAUTHORIZED),
+            ("/", StatusCode::TEMPORARY_REDIRECT),
+            ("/no-such-route", StatusCode::NOT_FOUND),
+        ] {
+            let req = axum::http::Request::builder().uri(path).body(axum::body::Body::empty()).unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), status, "{path}");
+            let h = resp.headers();
+            assert_eq!(h.get(header::X_FRAME_OPTIONS).unwrap(), "DENY", "{path}");
+            assert_eq!(h.get(header::CONTENT_SECURITY_POLICY).unwrap(), "frame-ancestors 'none'");
+            assert_eq!(h.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+            assert_eq!(h.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
+        }
+    }
+
+    #[test]
+    fn flag_params_are_limited_to_the_daemon_charset() {
+        let ok = parse_flags_param(Some(&serde_json::json!("Maint, drain:v2"))).unwrap();
+        assert_eq!(ok, vec!["maint", "drain:v2"]);
+        for bad in [serde_json::json!("a b"), serde_json::json!(["ok", "x\ny"]), serde_json::json!("é")] {
+            assert!(parse_flags_param(Some(&bad)).is_err(), "{bad} must be rejected");
+        }
+        assert!(parse_flags_param(None).is_err());
     }
 
     #[test]
