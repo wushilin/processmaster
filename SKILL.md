@@ -42,6 +42,7 @@ pmctl start myapp
 ```
 
 Defaults: working_directory = that dir, start_command = `./run.sh`, run as root (or `global.default_service_user/group`), stop = SIGTERM, logs under `./logs/`. The generated `service.yml` in the app dir is yours to edit (edit → `pmctl update` → `pmctl restart myapp`). Notes:
+- `%app_dir%` (auto services only) expands to the app dir in working_directory, start/stop_command, environment values, logs paths and provisioning paths — quote it, since YAML can't start an unquoted value with `%`: `start_command: ["%app_dir%/bin/run"]`. working_directory may be omitted (= `%app_dir%`) or relative to it; no `..`. In config_directory definitions the token is an error and working_directory must be absolute.
 - Rename a directory to `<name>.disabled` to have it ignored entirely.
 - Same app name in both `config_directory` and `auto_service_directory` is a hard error.
 - After a processmaster upgrade, drop an empty `.regen_pm_config` file in the app dir + `pmctl update` to regenerate a fresh `service.yml` (the old one is kept as `service.yml.bak`).
@@ -60,7 +61,7 @@ Realistic long-running service:
 ```yaml
 application: myapp
 process:
-  working_directory: /opt/myapp
+  working_directory: /opt/myapp     # must be absolute here (no %app_dir%)
   start_command: ["./bin/myapp", "--config", "app.conf"]   # argv list, NOT a shell string
   stop_signal: SIGTERM              # OR stop_command: ["./stop.sh"] — exactly one, not both
   stop_grace_period_ms: 5000        # then escalates to cgroup.kill

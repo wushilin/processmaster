@@ -83,7 +83,7 @@ fn every_example_service_definition_loads() {
                 continue;
             }
             let raw = std::fs::read_to_string(&path).expect("read example");
-            let def = parse_app_definition_yaml(&raw, &path, None)
+            let def = parse_app_definition_yaml(&raw, &path, None, None)
                 .unwrap_or_else(|e| panic!("{} failed to load: {e:#}", path.display()));
             assert!(
                 !def.application.trim().is_empty(),

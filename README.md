@@ -293,6 +293,10 @@ If your job did not match, it is okay, they will fail to start, you can edit the
   - `service.yaml`, otherwise
   - no config file → processmaster uses built-in defaults (working_directory = that dir, start_command = `./run.sh`, logs under `./logs/`, etc).
 - **Collision rule**: if an app name exists in `config_directory` and `auto_service_directory`, that is a **hard error**.
+- **`%app_dir%`**: inside an auto-service `service.yml`, `%app_dir%` expands to that service's directory (`<auto_service_directory>/<app>`), so paths need not be hard-coded. It is expanded first, in `working_directory`, `start_command`, `stop_command`, `environment` values (including `@file://%app_dir%/...`), `logs.*` paths and `provisioning[].path`. The generated `service.yml` uses `working_directory: '%app_dir%'`.
+  - `working_directory` may be omitted (defaults to `%app_dir%`) or relative (resolved under `%app_dir%`); it must not contain `..`.
+  - YAML cannot start an unquoted value with `%`, so quote it: `start_command: ["%app_dir%/bin/run"]`, `working_directory: "%app_dir%/data"`.
+  - `%app_dir%` is **not** available in `config_directory` definitions: there `working_directory` must be absolute (or omitted, for `<auto_service_directory>/<application>`), and using the token is a load error.
 
 ### Regeneration flow (`.regen_pm_config`)
 Sometimes, after version upgrade, your older version became incompatible. you are too lazy to generate the new config, you can use
@@ -331,7 +335,7 @@ Example (long-running service):
 application: sleeper            # optional; if omitted, derived from the filename
 
 process:
-  working_directory: /tmp/processmaster/examples/sleeper   # required (unless auto-service and omitted there)
+  working_directory: /tmp/processmaster/examples/sleeper   # absolute; if omitted: <auto_service_directory>/<application>
   start_command: ["/bin/sleep", "1000000"]                 # required; argv list
 
   # Stop behavior: choose exactly one of process.stop_signal or process.stop_command.

@@ -595,6 +595,34 @@ struct AppConfigFile {
     provisioning: Vec<ProvisioningEntry>,
 }
 
+/// Placeholder for an auto service's directory (`<auto_service_directory>/<app>`).
+///
+/// Expanded before anything else in the definition is interpreted, so a relative
+/// `working_directory` and the paths resolved under it all see the expanded value.
+/// Only auto services have one; config_directory definitions use absolute paths.
+pub const APP_DIR_TOKEN: &str = "%app_dir%";
+
+fn expand_app_dir(s: &str, app_dir: Option<&Path>) -> anyhow::Result<String> {
+    if !s.contains(APP_DIR_TOKEN) {
+        return Ok(s.to_string());
+    }
+    let app_dir = app_dir.ok_or_else(|| {
+        anyhow::anyhow!("{APP_DIR_TOKEN} is only available in auto_service_directory definitions")
+    })?;
+    let dir = app_dir
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("{} is not valid UTF-8; cannot expand {APP_DIR_TOKEN}", app_dir.display()))?;
+    Ok(s.replace(APP_DIR_TOKEN, dir))
+}
+
+fn expand_app_dir_path(p: PathBuf, app_dir: Option<&Path>) -> anyhow::Result<PathBuf> {
+    // A non-UTF-8 path cannot contain the (ASCII) token.
+    match p.to_str() {
+        Some(s) if s.contains(APP_DIR_TOKEN) => Ok(PathBuf::from(expand_app_dir(s, app_dir)?)),
+        _ => Ok(p),
+    }
+}
+
 /// Longest accepted service name. Generous, but bounded so names stay usable as
 /// cgroup directory components and in fixed-width status output.
 pub const MAX_APPLICATION_NAME_LEN: usize = 64;
@@ -636,6 +664,7 @@ impl AppConfigFile {
         self,
         source_file: Option<PathBuf>,
         auto_service_directory: Option<&Path>,
+        app_dir: Option<&Path>,
     ) -> anyhow::Result<AppDefinition> {
         let application: String = match self.application {
             Some(a) if !a.trim().is_empty() => a.trim().to_string(),
@@ -765,22 +794,97 @@ impl AppConfigFile {
             io_weight: None,
             io_bandwidth: None,
         });
-        // Derive working directory if omitted: ${auto_service_directory}/${application}
+        // Auto services have an app_dir (%app_dir%): it anchors a relative
+        // working_directory and is the default when working_directory is omitted.
+        // config_directory definitions must spell working_directory absolutely, or omit
+        // it for ${auto_service_directory}/${application}.
+        if let Some(d) = app_dir {
+            anyhow::ensure!(d.is_absolute(), "service {application}: app dir {} is not absolute", d.display());
+        }
         let working_directory = match self.process.working_directory {
-            Some(wd) => wd,
-            None => {
-                let base = auto_service_directory.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "service {}: missing process.working_directory and global.auto_service_directory is not set",
-                        application
-                    )
-                })?;
-                base.join(&application)
+            Some(wd) => {
+                let wd = expand_app_dir_path(wd, app_dir)
+                    .map_err(|e| anyhow::anyhow!("service {application}: process.working_directory: {e}"))?;
+                // Log and provisioning paths are opened under it by the symlink-safe
+                // walker, which refuses '..'; say so here rather than at first start.
+                anyhow::ensure!(
+                    !wd.components().any(|c| matches!(c, std::path::Component::ParentDir)),
+                    "service {application}: process.working_directory {} must not contain '..'",
+                    wd.display()
+                );
+                match app_dir {
+                    Some(d) => d.join(wd), // join() keeps an absolute path as-is
+                    None => {
+                        anyhow::ensure!(
+                            wd.is_absolute(),
+                            "service {application}: process.working_directory {} must be absolute \
+                             (relative paths are only resolved for auto services)",
+                            wd.display()
+                        );
+                        wd
+                    }
+                }
             }
+            None => match app_dir {
+                Some(d) => d.to_path_buf(),
+                None => {
+                    let base = auto_service_directory.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "service {}: missing process.working_directory and global.auto_service_directory is not set",
+                            application
+                        )
+                    })?;
+                    base.join(&application)
+                }
+            },
         };
+        let expand_cmd = |argv: Option<Vec<String>>, field: &str| -> anyhow::Result<Option<Vec<String>>> {
+            argv.map(|v| v.iter().map(|a| expand_app_dir(a, app_dir)).collect::<anyhow::Result<Vec<_>>>())
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("service {application}: process.{field}: {e}"))
+        };
+        let expand_path = |p: Option<PathBuf>, field: &str| -> anyhow::Result<Option<PathBuf>> {
+            p.map(|p| expand_app_dir_path(p, app_dir))
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("service {application}: {field}: {e}"))
+        };
+        let start_command = expand_cmd(self.process.start_command, "start_command")?;
+        let stop_command = expand_cmd(self.process.stop_command, "stop_command")?;
+        let log_stdout = expand_path(logs.stdout, "logs.stdout")?;
+        let log_stderr = expand_path(logs.stderr, "logs.stderr")?;
+        let stop_command_stdout = expand_path(logs.stop_command_stdout, "logs.stop_command_stdout")?;
+        let stop_command_stderr = expand_path(logs.stop_command_stderr, "logs.stop_command_stderr")?;
+        let alt_log_file_hint = logs
+            .hints
+            .into_iter()
+            .map(|p| expand_app_dir_path(p, app_dir))
+            .collect::<anyhow::Result<Vec<_>>>()
+            .map_err(|e| anyhow::anyhow!("service {application}: logs.hints: {e}"))?;
+        // Values may be indirections (`@file://%app_dir%/secret`), resolved later.
+        let environment = self
+            .process
+            .environment
+            .into_iter()
+            .map(|v| {
+                Ok(EnvironmentVar {
+                    value: expand_app_dir(&v.value, app_dir)
+                        .map_err(|e| anyhow::anyhow!("service {application}: environment {}: {e}", v.name))?,
+                    name: v.name,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let provisioning = self
+            .provisioning
+            .into_iter()
+            .map(|mut p| {
+                p.path = expand_app_dir_path(p.path, app_dir)
+                    .map_err(|e| anyhow::anyhow!("service {application}: provisioning.path: {e}"))?;
+                Ok(p)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         // Default start command if omitted.
-        let start_command = self.process.start_command.unwrap_or_else(default_start_command);
+        let start_command = start_command.unwrap_or_else(default_start_command);
 
         // Default restart config for non-scheduled apps if omitted.
         let restart = if self.process.schedule.is_some() {
@@ -870,7 +974,7 @@ impl AppConfigFile {
         let restart = restart;
 
         // If neither stop_command nor stop_signal provided, default to SIGTERM.
-        let stop_signal = if self.process.stop_command.is_none() {
+        let stop_signal = if stop_command.is_none() {
             Some(self.process.stop_signal.unwrap_or_else(|| "SIGTERM".to_string()))
         } else {
             None
@@ -893,17 +997,17 @@ impl AppConfigFile {
         Ok(AppDefinition {
             application,
             working_directory,
-            log_stdout: logs.stdout,
-            log_stderr: logs.stderr,
-            stop_command_stdout: logs.stop_command_stdout,
-            stop_command_stderr: logs.stop_command_stderr,
-            alt_log_file_hint: logs.hints,
+            log_stdout,
+            log_stderr,
+            stop_command_stdout,
+            stop_command_stderr,
+            alt_log_file_hint,
             start_command,
-            environment: self.process.environment,
+            environment,
             inherit_environment: self.process.inherit_environment,
             restart,
             stop_signal,
-            stop_command: self.process.stop_command,
+            stop_command,
             stop_grace_period_ms: self
                 .process
                 .stop_grace_period_ms
@@ -926,21 +1030,33 @@ impl AppConfigFile {
             schedule_not_before_ms,
             schedule_not_after_ms,
             schedule_max_time_per_run_ms,
-            provisioning: self.provisioning,
+            provisioning,
             source_file,
             source_mtime_ms: None,
         })
     }
 }
 
+/// `app_dir` is `Some(<auto_service_directory>/<app>)` for an auto service and `None`
+/// for a config_directory definition; only the former may use `%app_dir%` or a relative
+/// working_directory.
 pub fn parse_app_definition_yaml(
     raw: &str,
     source_file: &Path,
     auto_service_directory: Option<&Path>,
+    app_dir: Option<&Path>,
 ) -> anyhow::Result<AppDefinition> {
-    let file: AppConfigFile = serde_yaml::from_str(raw)
-        .map_err(|e| anyhow::anyhow!("failed to parse app def {}: {e}", source_file.display()))?;
-    let mut def = file.into_definition(Some(source_file.to_path_buf()), auto_service_directory)?;
+    let file: AppConfigFile = serde_yaml::from_str(raw).map_err(|e| {
+        // '%' cannot start a plain YAML scalar, so an unquoted `%app_dir%/...` is a
+        // syntax error that says nothing about the token. Point at the fix.
+        let hint = if raw.contains(APP_DIR_TOKEN) {
+            format!(" (hint: a value starting with {APP_DIR_TOKEN} must be quoted, e.g. \"{APP_DIR_TOKEN}/run.sh\")")
+        } else {
+            String::new()
+        };
+        anyhow::anyhow!("failed to parse app def {}: {e}{hint}", source_file.display())
+    })?;
+    let mut def = file.into_definition(Some(source_file.to_path_buf()), auto_service_directory, app_dir)?;
     // Best-effort mtime capture for update/restart logic.
     def.source_mtime_ms = source_file
         .metadata()
@@ -957,7 +1073,6 @@ pub fn parse_app_definition_yaml(
 /// remembering to update generation logic in `daemon.rs`.
 pub(crate) fn render_auto_service_yaml(
     app: &str,
-    working_directory: &Path,
     default_service_user: &str,
     default_service_group: &str,
 ) -> anyhow::Result<String> {
@@ -1104,7 +1219,9 @@ pub(crate) fn render_auto_service_yaml(
     }
 
     let mut process = YamlProcess::default();
-    process.working_directory = working_directory.display().to_string();
+    // The generated file sits in the service directory; the token keeps it valid if
+    // the directory is moved or renamed.
+    process.working_directory = APP_DIR_TOKEN.to_string();
     process.user = Some(default_service_user.to_string());
     process.group = Some(default_service_group.to_string());
 
@@ -1237,6 +1354,91 @@ mod tests {
                 "{ok:?} should be a valid service name"
             );
         }
+    }
+
+    // ---- %app_dir% / working_directory -----------------------------------------
+
+    fn parse_auto(yaml: &str) -> anyhow::Result<AppDefinition> {
+        let dir = Path::new("/srv/apps/web");
+        parse_app_definition_yaml(yaml, &dir.join("service.yml"), Some(Path::new("/srv/apps")), Some(dir))
+    }
+
+    fn parse_confd(yaml: &str) -> anyhow::Result<AppDefinition> {
+        parse_app_definition_yaml(yaml, Path::new("/etc/pm/conf.d/web.yml"), Some(Path::new("/srv/apps")), None)
+    }
+
+    #[test]
+    fn app_dir_expands_everywhere_in_auto_services() {
+        let def = parse_auto(
+            r#"
+application: web
+logs:
+  stdout: "%app_dir%/out.log"
+  stderr: logs/err.log
+  hints: ["%app_dir%/logs/extra.log"]
+process:
+  working_directory: "%app_dir%/data"
+  start_command: ["%app_dir%/bin/run", "--root=%app_dir%"]
+  stop_command: ["%app_dir%/bin/stop"]
+  environment:
+    - name: SECRET
+      value: "@file://%app_dir%/secret"
+provisioning:
+  - path: "%app_dir%/bin/run"
+    mode: 0755
+"#,
+        )
+        .unwrap();
+        assert_eq!(def.working_directory, Path::new("/srv/apps/web/data"));
+        assert_eq!(def.start_command, ["/srv/apps/web/bin/run", "--root=/srv/apps/web"]);
+        assert_eq!(def.stop_command.unwrap(), ["/srv/apps/web/bin/stop"]);
+        assert_eq!(def.log_stdout.unwrap(), Path::new("/srv/apps/web/out.log"));
+        // Plain relative paths are untouched here and resolve under working_directory later.
+        assert_eq!(def.log_stderr.unwrap(), Path::new("logs/err.log"));
+        assert_eq!(def.alt_log_file_hint, [PathBuf::from("/srv/apps/web/logs/extra.log")]);
+        assert_eq!(def.environment[0].value, "@file:///srv/apps/web/secret");
+        assert_eq!(def.provisioning[0].path, Path::new("/srv/apps/web/bin/run"));
+    }
+
+    #[test]
+    fn auto_service_working_directory_defaults_to_and_resolves_under_app_dir() {
+        let def = parse_auto("application: web\nprocess: {}\n").unwrap();
+        assert_eq!(def.working_directory, Path::new("/srv/apps/web"));
+        let def = parse_auto("application: web\nprocess:\n  working_directory: data\n").unwrap();
+        assert_eq!(def.working_directory, Path::new("/srv/apps/web/data"));
+        let def = parse_auto("application: web\nprocess:\n  working_directory: /opt/web\n").unwrap();
+        assert_eq!(def.working_directory, Path::new("/opt/web"));
+    }
+
+    #[test]
+    fn working_directory_rejects_parent_components() {
+        let e = parse_auto("application: web\nprocess:\n  working_directory: \"%app_dir%/../other\"\n").unwrap_err();
+        assert!(format!("{e:#}").contains("'..'"), "{e:#}");
+    }
+
+    #[test]
+    fn config_directory_definitions_need_absolute_paths() {
+        let e = parse_confd("application: web\nprocess:\n  start_command: [\"%app_dir%/run\"]\n").unwrap_err();
+        assert!(format!("{e:#}").contains("only available"), "{e:#}");
+        let e = parse_confd("application: web\nprocess:\n  working_directory: data\n").unwrap_err();
+        assert!(format!("{e:#}").contains("must be absolute"), "{e:#}");
+        // Omitted: unchanged default of ${auto_service_directory}/${application}.
+        let def = parse_confd("application: web\nprocess: {}\n").unwrap();
+        assert_eq!(def.working_directory, Path::new("/srv/apps/web"));
+    }
+
+    #[test]
+    fn unquoted_app_dir_token_gets_a_quoting_hint() {
+        let e = parse_auto("application: web\nprocess:\n  working_directory: %app_dir%/data\n").unwrap_err();
+        assert!(format!("{e:#}").contains("must be quoted"), "{e:#}");
+    }
+
+    #[test]
+    fn generated_auto_service_yaml_uses_the_app_dir_token() {
+        let yaml = render_auto_service_yaml("web", "root", "root").unwrap();
+        assert!(yaml.contains(APP_DIR_TOKEN), "{yaml}");
+        let def = parse_auto(&yaml).unwrap();
+        assert_eq!(def.working_directory, Path::new("/srv/apps/web"));
     }
 
     // ---- parse_duration_str ----------------------------------------------------

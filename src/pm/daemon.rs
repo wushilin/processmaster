@@ -7966,7 +7966,7 @@ fn load_app_definitions_best_effort(
             }
         };
 
-        match parse_app_definition_yaml(&raw, path, auto_service_directory) {
+        match parse_app_definition_yaml(&raw, path, auto_service_directory, None) {
             Ok(def) => {
                 // Misconfig check: working directory must exist (otherwise skip/keep old).
                 if !def.working_directory.exists() || !def.working_directory.is_dir() {
@@ -8310,7 +8310,6 @@ fn merge_auto_services_best_effort(
             // Generate a fresh service.yml.
             let yaml_text = match crate::pm::app::render_auto_service_yaml(
                 app,
-                &path,
                 default_service_user,
                 default_service_group,
             ) {
@@ -8394,7 +8393,7 @@ fn merge_auto_services_best_effort(
                 }
                 _ => {
                     match crate::pm::safefs::read_trusted_file(sf, MAX_APP_CONFIG_BYTES) {
-                        Ok(raw) => match parse_app_definition_yaml(&raw, sf, Some(dir)) {
+                        Ok(raw) => match parse_app_definition_yaml(&raw, sf, Some(dir), Some(&path)) {
                             Ok(def) => {
                                 if def.application != app {
                                     // Best-effort: treat as malconfigured; keep previous if any.
@@ -8468,7 +8467,6 @@ fn merge_auto_services_best_effort(
 
             let yaml_text = match crate::pm::app::render_auto_service_yaml(
                 app,
-                &path,
                 default_service_user,
                 default_service_group,
             ) {
@@ -8525,7 +8523,7 @@ fn merge_auto_services_best_effort(
                 }
 
                 // Parse the generated YAML so runtime behavior matches the file.
-                match parse_app_definition_yaml(&yaml_text, &target, Some(dir)) {
+                match parse_app_definition_yaml(&yaml_text, &target, Some(dir), Some(&path)) {
                     Ok(def) => def,
                     Err(e) => {
                         warnings.push(format!(
@@ -9072,7 +9070,7 @@ mod tests {
             "application: provtest\nprocess:\n  working_directory: {}\n  start_command: [\"/bin/true\"]\nprovisioning:\n{entries_yaml}",
             workdir.display()
         );
-        crate::pm::app::parse_app_definition_yaml(&yaml, &workdir.join("provtest.yaml"), None)
+        crate::pm::app::parse_app_definition_yaml(&yaml, &workdir.join("provtest.yaml"), None, None)
             .expect("parse test def")
     }
 
