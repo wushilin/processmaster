@@ -12,7 +12,14 @@ fn cmd_stdout(cmd: &str, args: &[&str]) -> Option<String> {
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=build.rs");
+    // Any rerun-if-* line replaces cargo's default "rerun on any package change", so list
+    // every input. Watching only build.rs froze the embedded build time/host at whenever
+    // build.rs last changed, which also made different builds look "co-built" to pmctl.
+    for p in ["build.rs", "Cargo.toml", "Cargo.lock", "src", "templates"] {
+        println!("cargo:rerun-if-changed={p}");
+    }
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    println!("cargo:rerun-if-env-changed=HOSTNAME");
 
     // Prefer reproducible builds when SOURCE_DATE_EPOCH is set.
     let build_time = if let Ok(sde) = env::var("SOURCE_DATE_EPOCH") {

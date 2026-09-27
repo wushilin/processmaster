@@ -1,0 +1,149 @@
+# Build static musl binaries (processmaster + pmctl) for linux amd64 and aarch64.
+#
+# - Every push to master and every PR: run unit tests and the root-only supervisor
+#   scenarios (real daemon + cgroups), build both targets, keep the
+#   tarballs as workflow artifacts (downloadable from the run page for 14 days).
+# - Pushing a tag `v*` (e.g. `git tag v0.3 && git push origin v0.3`): same, then
+#   attach the tarballs + SHA256SUMS to the GitHub release for that tag, creating
+#   the release if it does not exist yet (existing release notes are kept).
+#
+# Cross-compilation uses cargo-zigbuild, the same toolchain as ./build_all.sh:
+# zig supplies the C cross toolchain that aws-lc-sys and ring need for musl.
+# Asset names match earlier releases: processmaster-<tag>-<x86_64|aarch64>-musl.tar.gz
+
+name: build
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  ZIG_VERSION: 0.14.1
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+
+  # Real daemon, real cgroups: tests/supervisor_scenarios.rs starts processmaster
+  # per test and drives services with different behaviours (crash loops, daemonizing,
+  # SIGTERM-immune, fan-out...). Needs root + cgroup v2, which GitHub's Ubuntu VMs
+  # have; only the test binary runs under sudo, never cargo.
+  supervisor-scenarios:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build scenario tests
+        id: bin
+        run: |
+          bin=$(cargo test --locked --test supervisor_scenarios --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "supervisor_scenarios" and .executable != null) | .executable')
+          echo "path=$bin" >> "$GITHUB_OUTPUT"
+      - name: Run as root
+        run: sudo "${{ steps.bin.outputs.path }}" --ignored --test-threads=4
+
+  build:
+    needs: [test, supervisor-scenarios]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build
+        env:
+          # Shown by `pmctl version` / `server-version` as the build host.
+          HOSTNAME: github-actions
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}
+
+      - name: Check binaries are static
+        run: |
+          for bin in processmaster pmctl; do
+            f="target/${{ matrix.target }}/release/$bin"
+            file "$f"
+            file "$f" | grep -Eq 'statically linked|static-pie linked' || { echo "::error::$bin is not static"; exit 1; }
+          done
+
+      - name: Smoke test (x86_64 runs natively)
+        if: startsWith(matrix.target, 'x86_64')
+        run: target/${{ matrix.target }}/release/pmctl version
+
+      - name: Package
+        id: pkg
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            label="$GITHUB_REF_NAME"
+          else
+            label="$(git rev-parse --short HEAD)"
+          fi
+          arch="${{ matrix.target }}"; arch="${arch%%-*}"
+          name="processmaster-${label}-${arch}-musl.tar.gz"
+          mkdir -p dist
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/$name" processmaster pmctl
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: dist/${{ steps.pkg.outputs.name }}
+          retention-days: 14
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz | tee SHA256SUMS
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --generate-notes --verify-tag
+          fi
