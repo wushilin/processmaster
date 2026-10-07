@@ -1062,6 +1062,23 @@ struct StatusTemplate<'a> {
     csrf_token: &'a str,
     admin_actions: Vec<AdminActionButton>,
     build_banner: String,
+    asset_ver: &'static str,
+}
+
+/// Content hash of the embedded app.css, appended to its URL as `?v=`. Static assets
+/// are cached for a day, so without this a browser keeps the old stylesheet after an
+/// upgrade while rendering the new markup.
+fn asset_ver() -> &'static str {
+    static VER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VER.get_or_init(|| {
+        // FNV-1a: stable across builds and platforms, unlike DefaultHasher.
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in APP_CSS {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        format!("{:016x}", h)
+    })
 }
 
 #[derive(Clone)]
@@ -1097,6 +1114,7 @@ async fn status_page(
         admin_actions,
         // Compact stamp: the navbar already carries the product name.
         build_banner: crate::pm::build_info::short_stamp(),
+        asset_ver: asset_ver(),
     };
     match t.render() {
         Ok(s) => Html(s).into_response(),

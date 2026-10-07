@@ -407,6 +407,11 @@ td.col-app {
 }
 
 .pm-badge-sys {
+  color: var(--pm-idle);
+  background: var(--pm-idle-soft);
+}
+
+.pm-badge-sys.is-bad {
   color: var(--pm-bad);
   background: var(--pm-bad-soft);
 }
@@ -424,41 +429,148 @@ td.col-app {
 
 /* --------------------------------------------------------- action buttons --- */
 
+/* Row actions are one segmented control: a single outline, hairline separators,
+   neutral glyphs. Colour appears only on hover, where it confirms intent, so a
+   table of healthy services doesn't read as a wall of warnings. */
+.pm-actions {
+  display: inline-flex;
+  white-space: nowrap;
+  border: 1px solid var(--pm-border-strong);
+  border-radius: var(--pm-radius-sm);
+  background: var(--pm-surface);
+  overflow: hidden;
+}
+
+.pm-actions > .pm-action-btn + .pm-action-btn {
+  border-left: 1px solid var(--pm-border) !important;
+}
+
 .pm-action-btn {
-  width: 32px;
-  height: 32px;
+  width: var(--pm-btn, 32px);
+  height: 30px;
   padding: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: var(--pm-radius-sm);
+  border: 0 !important;
+  border-radius: 0 !important;
   line-height: 1;
   color: var(--pm-text-muted);
-  border-color: var(--pm-border-strong) !important;
   background: transparent;
-  transition: color var(--pm-transition), background-color var(--pm-transition),
-    border-color var(--pm-transition);
+  transition: color var(--pm-transition), background-color var(--pm-transition);
 }
 
-.pm-action-btn .pm-icon { width: 17px; height: 17px; }
+.pm-action-btn .pm-icon { width: 15px; height: 15px; }
 .pm-action-btn.pm-kind-play .pm-icon,
-.pm-action-btn.pm-kind-stop .pm-icon { width: 20px; height: 20px; }
+.pm-action-btn.pm-kind-stop .pm-icon { width: 17px; height: 17px; }
 
 /* Meaning on hover: green to start, red to stop. Neutral until then, so a row of
    actions doesn't look like a warning. */
-.pm-action-btn:hover { background: var(--pm-surface-sunken); border-color: var(--pm-text-muted) !important; }
-.pm-action-btn.pm-kind-play:hover { color: var(--pm-ok); border-color: var(--pm-ok) !important; }
-.pm-action-btn.pm-kind-stop:hover { color: var(--pm-bad); border-color: var(--pm-bad) !important; }
-.pm-action-btn:active { transform: translateY(1px); }
+.pm-action-btn:hover { background: var(--pm-surface-sunken); color: var(--bs-emphasis-color); }
+.pm-action-btn.pm-kind-play:hover { color: var(--pm-ok); background: var(--pm-ok-soft); }
+.pm-action-btn.pm-kind-stop:hover { color: var(--pm-bad); background: var(--pm-bad-soft); }
+.pm-action-btn.pm-kind-restart:hover { color: var(--pm-accent); }
+.pm-action-btn.pm-kind-flags:hover { color: var(--pm-warn); background: var(--pm-warn-soft); }
+.pm-action-btn:focus-visible { outline-offset: -2px; }
+.pm-action-btn:active { background: var(--pm-border); }
 
-.pm-actions { white-space: nowrap; display: inline-flex; gap: 0.25rem; }
-
-td.col-actions { overflow-x: auto; overflow-y: hidden; }
-td.col-actions::-webkit-scrollbar { height: 5px; }
-td.col-actions::-webkit-scrollbar-thumb { background: var(--pm-border-strong); border-radius: 999px; }
-td.col-actions::-webkit-scrollbar-track { background: transparent; }
 
 .pm-icon { display: inline-block; vertical-align: -0.125em; }
+
+/* Several PIDs collapse into one quiet chip that opens the processes modal. */
+.pm-pids-btn {
+  padding: 0.1rem 0.45rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1.4;
+  white-space: nowrap;
+  color: var(--pm-accent);
+  background: color-mix(in srgb, var(--pm-accent) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--pm-accent) 30%, transparent);
+  border-radius: 999px;
+}
+.pm-pids-btn:hover {
+  color: var(--pm-accent);
+  background: color-mix(in srgb, var(--pm-accent) 18%, transparent);
+  border-color: var(--pm-accent);
+}
+.pm-pids-uptime {
+  color: inherit;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  font-size: inherit;
+}
+/* Processes popup: a borderless list. Rows are soft rounded strips with an
+   alternating fill; the age bar shows each process against the oldest one. */
+.pm-pids-dialog { max-width: min(640px, calc(100vw - 1rem)); }
+.pm-pids-head { display: flex; flex-direction: column; gap: 0.1rem; min-width: 0; }
+.pm-pids-eyebrow {
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--pm-text-muted);
+}
+.pm-pids-head .modal-title {
+  font-family: var(--pm-font-mono);
+  font-size: 1.0625rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#pidsModal .modal-header,
+#pidsModal .modal-footer { border-color: var(--pm-border); }
+#pidsModal .modal-body { padding: 0.5rem 0.75rem 0.75rem; }
+
+.pm-pids-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 0.875rem;
+  font-variant-numeric: tabular-nums;
+}
+.pm-pids-table > thead > tr > th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--pm-surface);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--pm-text-muted);
+  padding: 0.5rem 0.75rem;
+  border: 0;
+}
+.pm-pids-table > tbody > tr > td {
+  padding: 0.5rem 0.75rem;
+  border: 0;
+  white-space: nowrap;
+  line-height: 1.5rem; /* one line box for mixed sizes/faces keeps the row on one baseline */
+  vertical-align: middle;
+}
+.pm-pids-table > tbody > tr:nth-child(odd) > td { background: var(--pm-surface-sunken); }
+.pm-pids-table > tbody > tr > td:first-child { border-radius: var(--pm-radius-sm) 0 0 var(--pm-radius-sm); }
+.pm-pids-table > tbody > tr > td:last-child { border-radius: 0 var(--pm-radius-sm) var(--pm-radius-sm) 0; }
+.pm-pids-table > tbody > tr:hover > td { background: color-mix(in srgb, var(--pm-accent) 8%, var(--pm-surface)); }
+.pm-pids-rank { width: 2.5rem; color: var(--pm-text-muted); font-size: 0.75rem; }
+.pm-pids-started { color: var(--pm-text-muted); font-size: 0.8125rem; }
+.pm-pids-up { display: inline-flex; align-items: center; gap: 0.625rem; justify-content: flex-end; }
+.pm-pids-up > span:last-child { min-width: 5.5em; text-align: right; }
+.pm-pids-bar {
+  width: 64px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--pm-border);
+  overflow: hidden;
+}
+.pm-pids-bar > span { display: block; height: 100%; border-radius: inherit; background: var(--pm-accent); opacity: 0.75; }
+
+@media (max-width: 480px) {
+  .pm-pids-started, .pm-pids-table th:nth-child(3) { display: none; }
+  .pm-pids-bar { width: 40px; }
+}
 
 /* ------------------------------------------------------------------ logs --- */
 
@@ -533,17 +645,39 @@ td.col-actions::-webkit-scrollbar-track { background: transparent; }
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--pm-accent) 22%, transparent);
 }
 
-/* Fixed column widths, in characters, so filtering rows never reflows the table. */
-th.col-app, td.col-app { width: 21ch; max-width: 21ch; }
-th.col-status, td.col-status { width: 11ch; max-width: 11ch; }
-th.col-crashes_10m, td.col-crashes_10m { width: 15ch; max-width: 15ch; }
-th.col-crashes_10m { white-space: nowrap; }
-th.col-pid, td.col-pid { width: 8ch; max-width: 8ch; }
-th.col-uptime, td.col-uptime { width: 14ch; max-width: 14ch; }
-th.col-enabled, td.col-enabled { width: 8ch; max-width: 8ch; }
-th.col-last_run, td.col-last_run { width: 20ch; max-width: 20ch; }
-th.col-actions, td.col-actions { width: 20ch; max-width: 20ch; }
-th.col-schedule, td.col-schedule { width: 21ch; max-width: 21ch; }
+/* Fixed column widths so filtering rows never reflows the table. Every column has
+   a width (none is auto), so on wide screens the spare space is shared out in
+   proportion instead of all landing in one column.
+   Widths are in rem, not ch: with table-layout: fixed the (small-font) header row
+   decides column widths, so ch would resolve against the header's font, not the
+   data's. The container-query breakpoints below are the measured minimum table
+   widths for each column set — re-measure if these widths change. */
+.pm-status-table {
+  --pm-btn: 32px;
+  --pm-btn-gap: 1px;
+  --pm-cell-pad-x: 0.625rem;
+  --pm-action-count: 5;
+}
+#pane-systemd .pm-status-table { --pm-action-count: 4; }
+
+th.col-app, td.col-app { width: 13rem; }
+th.col-enabled { text-align: center; }
+th.col-status, td.col-status { width: 7rem; max-width: 7rem; }
+th.col-crashes_10m, td.col-crashes_10m { width: 5.5rem; max-width: 5.5rem; }
+th.col-pid, td.col-pid { width: 5rem; max-width: 5rem; }
+th.col-uptime, td.col-uptime { width: 6.5rem; max-width: 6.5rem; }
+th.col-enabled, td.col-enabled { width: 5rem; max-width: 5rem; }
+th.col-last_run, td.col-last_run { width: 9rem; max-width: 9rem; }
+th.col-schedule, td.col-schedule { width: 11rem; max-width: 11rem; }
+th.col-flags, td.col-flags { width: 10rem; max-width: 10rem; }
+/* Exactly as wide as its buttons — never a scrollbar. */
+th.col-actions, td.col-actions {
+  width: calc(var(--pm-action-count) * var(--pm-btn)
+    + (var(--pm-action-count) - 1) * var(--pm-btn-gap)
+    + var(--pm-cell-pad-x) + 1rem + 2px); /* last column: 1rem outer padding */
+}
+/* The only long header; let it wrap rather than widen the column. */
+.pm-status-table > thead > tr > th.col-crashes_10m { white-space: normal; line-height: 1.25; }
 td.col-schedule .btn { max-width: 100%; }
 td.col-schedule code {
   display: inline-block;
@@ -552,10 +686,223 @@ td.col-schedule code {
   text-overflow: ellipsis;
   vertical-align: bottom;
 }
-th.col-flags, td.col-flags { width: auto; }
+td.col-flags .pm-flag-badge {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 table.pm-status-table { table-layout: fixed; width: 100%; }
 table.pm-status-table th, table.pm-status-table td { vertical-align: middle; }
+
+/* ------------------------------------------------------- adaptive tables --- */
+
+/* The tables respond to the width they actually get (container queries), not
+   the viewport, so they adapt the same inside a modal, a split window or a phone.
+   As space shrinks, the least-scanned columns step out first; below that the
+   rows become stacked cards. Columns the operator hid stay hidden throughout. */
+.pm-table-wrap { container: pmtable / inline-size; }
+
+@container pmtable (min-width: 870px) and (max-width: 1266px) {
+  #pane-cron .col-last_run { display: none; }
+}
+@container pmtable (min-width: 870px) and (max-width: 1178px) {
+  #pane-services .col-last_run { display: none; }
+}
+@container pmtable (min-width: 870px) and (max-width: 1122px) {
+  #pane-cron .col-enabled { display: none; }
+}
+@container pmtable (min-width: 870px) and (max-width: 1042px) {
+  #pane-cron .col-pid { display: none; }
+}
+@container pmtable (min-width: 870px) and (max-width: 1034px) {
+  #pane-services .col-crashes_10m { display: none; }
+}
+@container pmtable (min-width: 870px) and (max-width: 962px) {
+  #pane-cron .col-uptime { display: none; }
+}
+@container pmtable (min-width: 870px) and (max-width: 946px) {
+  #pane-services .col-enabled { display: none; }
+}
+
+/* Card layout:  [app ............ status]
+                 [pid  uptime  schedule …]   (labelled)
+                 [flags chips            ]
+                 [ ▶  ■  ↻  ⚑  ≡         ]   (full-width touch targets) */
+@container pmtable (max-width: 869px) {
+  .pm-status-table,
+  .pm-status-table > tbody { display: block; width: 100%; }
+  .pm-status-table > thead { display: none; }
+
+  .pm-status-table > tbody > tr {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    column-gap: 1.25rem;
+    row-gap: 0.5rem;
+    padding: 0.875rem 1rem;
+    border-bottom: 1px solid var(--pm-border);
+  }
+  .pm-status-table > tbody > tr:last-child { border-bottom: 0; }
+  /* Line break after the app/status header line. */
+  .pm-status-table > tbody > tr::after {
+    content: "";
+    order: 2;
+    flex-basis: 100%;
+    height: 0;
+    margin-top: -0.5rem;
+  }
+
+  .pm-status-table > tbody > tr > td {
+    display: block;
+    width: auto;
+    max-width: none;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    text-align: left;
+    background: transparent;
+    box-shadow: none;
+  }
+  .pm-status-table > tbody > tr > td[colspan] { flex-basis: 100%; }
+  .pm-status-table > tbody > tr.pm-row-bad { box-shadow: inset 3px 0 0 var(--pm-bad); }
+  .pm-status-table > tbody > tr.pm-row-warn { box-shadow: inset 3px 0 0 var(--pm-warn); }
+
+  .pm-status-table td.col-app { order: 0; flex: 1 1 0; font-size: 1rem; }
+  .pm-status-table td.col-status { order: 1; flex: none; max-width: none; }
+
+  .pm-status-table td[data-label] { order: 3; flex: none; max-width: 100%; }
+  .pm-status-table td[data-label]::before {
+    content: attr(data-label);
+    display: block;
+    font-size: 0.625rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--pm-text-muted);
+    margin-bottom: 0.1rem;
+  }
+  .pm-status-table td.col-schedule .btn { padding: 0.1rem 0.4rem; }
+  .pm-status-table td.col-enabled { text-align: left !important; } /* beats .text-center */
+
+  .pm-status-table td.col-flags { order: 4; flex-basis: 100%; max-width: none; }
+  .pm-status-table td.col-flags:has(> .text-muted) { display: none; }
+
+  .pm-status-table td.col-actions { order: 5; flex-basis: 100%; width: auto; }
+  .pm-status-table .pm-actions { display: flex; width: 100%; }
+  .pm-status-table .pm-action-btn { flex: 1 1 0; width: auto; height: 38px; }
+}
+
+/* ------------------------------------------------------------ refinements --- */
+
+/* Identifiers (service names, PIDs) are data, not links or errors: neutral ink in
+   the mono face, never Bootstrap's pink <code>. */
+.pm-status-table code,
+.pm-pids-table code {
+  color: inherit;
+  font-size: 0.8125rem;
+  background: none;
+  padding: 0;
+}
+
+td.col-app .btn-link {
+  color: var(--bs-emphasis-color);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: left;
+}
+td.col-app .btn-link code { font-size: 0.875rem; font-weight: 600; }
+td.col-app .btn-link:hover code {
+  color: var(--pm-accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+td.col-pid, td.col-uptime, td.col-crashes_10m, td.col-last_run { font-size: 0.8125rem; }
+td.col-pid code { color: var(--pm-text-muted); }
+td.col-last_run small { font-size: inherit; }
+
+/* No zebra stripes: hairlines and a hover tint are enough and read calmer. */
+.pm-status-table { --bs-table-striped-bg: transparent; --bs-table-hover-bg: var(--pm-surface-sunken); }
+
+/* Rows that need attention carry a stripe on the leading edge, so trouble is
+   visible while scanning even before the status pill is read. */
+@container pmtable (min-width: 870px) {
+  .pm-status-table > tbody > tr.pm-row-bad > td:first-child { box-shadow: inset 3px 0 0 var(--pm-bad); }
+  .pm-status-table > tbody > tr.pm-row-warn > td:first-child { box-shadow: inset 3px 0 0 var(--pm-warn); }
+}
+
+/* Enabled: a small On/Off chip. "Off" is hollow so it stands apart in greyscale. */
+.pm-enabled {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+.pm-enabled::before {
+  content: "";
+  width: 0.55em;
+  height: 0.55em;
+  border-radius: 50%;
+  flex: none;
+}
+.pm-enabled.is-on { color: var(--bs-emphasis-color); }
+.pm-enabled.is-on::before { background: var(--pm-ok); }
+.pm-enabled.is-off { color: var(--pm-text-muted); }
+.pm-enabled.is-off::before { border: 1.5px solid var(--pm-text-muted); }
+
+/* Page header: title with a live roll-up of the fleet beside it. */
+.pm-page-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.875rem;
+  min-width: 0;
+}
+.pm-page-title { font-size: 1.25rem; }
+.pm-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.875rem;
+  font-size: 0.8125rem;
+  color: var(--pm-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.pm-sum { display: inline-flex; align-items: center; gap: 0.4em; }
+.pm-sum::before { content: ""; width: 0.5em; height: 0.5em; border-radius: 50%; background: currentColor; }
+.pm-sum-run { color: var(--pm-ok); }
+.pm-sum-bad { color: var(--pm-bad); font-weight: 600; }
+.pm-sum-warn { color: var(--pm-warn); font-weight: 600; }
+
+/* Bulk verbs as one segmented group; only Stop all hints red, and only on hover. */
+.pm-bulk > .btn { --bs-btn-bg: var(--pm-surface); }
+.pm-bulk > .pm-bulk-start:hover { color: var(--pm-ok); }
+.pm-bulk > .pm-bulk-stop { color: var(--pm-bad); }
+.pm-bulk > .pm-bulk-stop:hover { --bs-btn-hover-bg: var(--pm-bad-soft); color: var(--pm-bad); border-color: var(--pm-bad); }
+.pm-btn-icon { display: inline-flex; align-items: center; justify-content: center; width: 34px; padding-inline: 0 !important; }
+
+/* Primary action: solid accent, but sized and weighted like its neighbours. */
+.pm-toolbar .btn-primary {
+  --bs-btn-bg: var(--pm-accent);
+  --bs-btn-border-color: var(--pm-accent);
+  --bs-btn-hover-bg: color-mix(in srgb, var(--pm-accent) 88%, #000);
+  --bs-btn-hover-border-color: color-mix(in srgb, var(--pm-accent) 88%, #000);
+}
+[data-bs-theme="dark"] .pm-toolbar .btn-primary { --bs-btn-color: #0b1120; --bs-btn-hover-color: #0b1120; }
+
+/* The table card: tabs sit on the card edge, table bleeds to the card edges. */
+.card > .card-body { padding: 0.5rem 0 0; }
+.card > .card-body > .nav-tabs { padding-inline: 1rem; margin-bottom: 0 !important; }
+@container pmtable (min-width: 870px) {
+  .pm-status-table > thead > tr > th:first-child,
+  .pm-status-table > tbody > tr > td:first-child { padding-left: 1rem; }
+  .pm-status-table > thead > tr > th:last-child,
+  .pm-status-table > tbody > tr > td:last-child { padding-right: 1rem; }
+}
 
 /* ANSI (SGR) colours for rendered logs. Tuned for the dark log pane in both themes. */
 .ansi-bold { font-weight: 600; }

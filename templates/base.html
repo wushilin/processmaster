@@ -13,7 +13,7 @@
     <!-- Served from the daemon, not a CDN: this console has to work on hosts with no
          egress, and a root-privileged UI should not depend on a third-party origin. -->
     <link href="static/bootstrap.css" rel="stylesheet">
-    <link href="static/app.css" rel="stylesheet">
+    <link href="static/app.css?v={{ asset_ver }}" rel="stylesheet">
     <script>
       // Resolve the theme before first paint so a dark-mode operator never gets a
       // white flash. Stored choice wins; otherwise follow the OS.

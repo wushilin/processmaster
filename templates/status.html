@@ -4,7 +4,10 @@
 <div class="row g-3">
   <div class="col-12">
     <div class="d-flex align-items-center justify-content-between flex-wrap gap-2">
-      <h1 class="pm-page-title">Status</h1>
+      <div class="pm-page-head">
+        <h1 class="pm-page-title">Status</h1>
+        <div id="pm-summary" class="pm-summary" aria-live="polite"></div>
+      </div>
       <!-- Hierarchy, not a rainbow: one filled primary action, quiet outlines for
            everything routine, and the bulk/destructive verbs fenced off on the right
            so "Stop all" is never adjacent to "Refresh". -->
@@ -26,10 +29,14 @@
 
         <span class="pm-toolbar-sep" aria-hidden="true"></span>
 
-        <button id="btn-start-all" class="btn btn-outline-success">Start all</button>
-        <button id="btn-restart-all" class="btn pm-btn-quiet">Restart all</button>
-        <button id="btn-stop-all" class="btn btn-outline-danger">Stop all</button>
-        <button id="btn-cols" class="btn pm-btn-quiet" title="Choose columns" aria-label="Choose columns">⚙</button>
+        <div class="btn-group pm-bulk" role="group" aria-label="All services">
+          <button id="btn-start-all" class="btn pm-btn-quiet pm-bulk-start">Start all</button>
+          <button id="btn-restart-all" class="btn pm-btn-quiet">Restart all</button>
+          <button id="btn-stop-all" class="btn pm-btn-quiet pm-bulk-stop">Stop all</button>
+        </div>
+        <button id="btn-cols" class="btn pm-btn-quiet pm-btn-icon" title="Choose columns" aria-label="Choose columns">
+          <svg class="pm-icon" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M0 2a1 1 0 0 1 1-1h14a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H1a1 1 0 0 1-1-1zm1 0v12h4V2zm5 0v12h4V2zm5 0v12h4V2z"/></svg>
+        </button>
       </div>
     </div>
   </div>
@@ -60,11 +67,11 @@
           </li>
         </ul>
 
-        <div class="table-responsive">
+        <div class="table-responsive pm-table-wrap">
 
           <div class="tab-content" id="svcTabsContent">
             <div class="tab-pane fade show active" id="pane-services" role="tabpanel">
-              <table class="table table-sm table-striped table-hover align-middle mb-0 pm-status-table">
+              <table class="table table-sm table-hover align-middle mb-0 pm-status-table">
             <thead>
               <tr>
                 <th role="button" class="user-select-none col-app" data-sort="app">
@@ -109,7 +116,7 @@
             </div>
 
             <div class="tab-pane fade" id="pane-cron" role="tabpanel">
-              <table class="table table-sm table-striped table-hover align-middle mb-0 pm-status-table">
+              <table class="table table-sm table-hover align-middle mb-0 pm-status-table">
                 <thead>
                   <tr>
                     <th class="col-app">Application</th>
@@ -130,7 +137,7 @@
             </div>
 
             <div class="tab-pane fade" id="pane-systemd" role="tabpanel">
-              <table class="table table-sm table-striped table-hover align-middle mb-0 pm-status-table">
+              <table class="table table-sm table-hover align-middle mb-0 pm-status-table">
                 <thead>
                   <tr>
                     <th class="col-app">Application</th>
@@ -347,6 +354,30 @@
   </div>
 </div>
 
+<!-- Processes modal (rows with more than one PID) -->
+<div class="modal fade" id="pidsModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-scrollable pm-pids-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <div class="pm-pids-head">
+          <div class="pm-pids-eyebrow">Processes</div>
+          <h5 class="modal-title" id="pidsApp"></h5>
+        </div>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <table class="pm-pids-table">
+          <thead><tr><th>#</th><th>PID</th><th>Started</th><th class="text-end">Uptime</th></tr></thead>
+          <tbody id="pidsBody"></tbody>
+        </table>
+      </div>
+      <div class="modal-footer justify-content-start">
+        <small class="text-muted" id="pidsFoot"></small>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Add user flag modal -->
 <div class="modal fade" id="flagModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog">
@@ -483,6 +514,26 @@
     return `${hours}h${mins}m${secs}s`;
   }
 
+  // PID + Uptime cells. One process renders inline as before; several collapse into
+  // a "N PIDs" button (plus the oldest uptime, i.e. how long the service has had a
+  // process up) that opens the processes modal. `attrs` identifies the row for the
+  // click handler, e.g. `data-app="x"` or `data-kind="systemd" data-unit="x"`.
+  function pidCells(pids, ups, attrs) {
+    if (!pids.length) {
+      const dash = `<span class="text-muted">-</span>`;
+      return [dash, dash];
+    }
+    if (pids.length === 1) {
+      return [`<code>${esc(pids[0].toString())}</code>`, esc(fmtUptimeMs(ups[0] ?? -1))];
+    }
+    const known = ups.filter(u => u !== null && u !== undefined && u >= 0);
+    const oldest = known.length ? Math.max(...known) : -1;
+    const n = pids.length;
+    const pidHtml = `<button type="button" class="btn btn-sm pm-pids-btn" data-action="pids" ${attrs} title="Show all ${n} processes">${n} PIDs</button>`;
+    const upHtml = `<button type="button" class="btn btn-link btn-sm p-0 pm-pids-uptime" data-action="pids" ${attrs} title="Oldest of ${n} processes — click for all">${esc(fmtUptimeMs(oldest))}</button>`;
+    return [pidHtml, upHtml];
+  }
+
   function fmtLastRun(ms) {
     if (!ms) return "-";
     const d = new Date(ms);
@@ -545,14 +596,7 @@
 
   function iconButton(kind, title, action, app) {
     const base = "btn btn-sm pm-action-btn btn-outline-secondary";
-    const tone = {
-      play: "text-success",
-      stop: "text-danger",
-      restart: "text-primary",
-      flags: "text-warning",
-      logs: "text-secondary",
-    }[kind] || "text-secondary";
-    const cls = `${base} ${tone} pm-kind-${kind}`;
+    const cls = `${base} pm-kind-${kind}`;
 
     const svg = {
       // Simple glyph icons (inline SVG) — cleaner inside buttons than circle icons.
@@ -575,18 +619,8 @@
 
   function enabledIconFor(s) {
     return s.enabled
-      ? `<span class="pm-enabled" title="enabled" aria-label="enabled">
-           <svg class="pm-icon" xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 16 16" fill="#198754" aria-hidden="true">
-             <path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0z"/>
-             <path d="M12.03 5.47a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06 0L3.97 8.03a.75.75 0 1 1 1.06-1.06l2.22 2.22 3.72-3.72a.75.75 0 0 1 1.06 0z" fill="#fff"/>
-           </svg>
-         </span>`
-      : `<span class="pm-enabled" title="disabled" aria-label="disabled">
-           <svg class="pm-icon" xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 16 16" fill="#dc3545" aria-hidden="true">
-             <path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0z"/>
-             <path d="M5.354 5.354a.75.75 0 0 1 1.06 0L8 6.94l1.586-1.586a.75.75 0 0 1 1.06 1.06L9.06 8l1.586 1.586a.75.75 0 0 1-1.06 1.06L8 9.06l-1.586 1.586a.75.75 0 0 1-1.06-1.06L6.94 8 5.354 6.414a.75.75 0 0 1 0-1.06z" fill="#fff"/>
-           </svg>
-         </span>`;
+      ? `<span class="pm-enabled is-on" title="Enabled: starts with processmaster">On</span>`
+      : `<span class="pm-enabled is-off" title="Disabled: will not be started">Off</span>`;
   }
 
   function flagsCellFor(s) {
@@ -600,7 +634,7 @@
     // Compact mode: render all flags as tiny chips in a single horizontal strip.
     // System flags are red; user flags are orange.
     const sysBadges = sysFlags
-      .map(f => `<span class="pm-badge-sys pm-flag-badge">${esc(f)}</span>`)
+      .map(f => `<span class="pm-badge-sys pm-flag-badge${/fail|crash|backoff/i.test(f) ? " is-bad" : ""}">${esc(f)}</span>`)
       .join("");
     const userBadges = userFlags
       .map(f => `<span class="pm-badge-user pm-flag-badge">${esc(f)}</span>`)
@@ -610,6 +644,11 @@
 
   // Status pills carry a leading dot as well as a hue, so state stays legible in
   // greyscale, on a washed-out projector, and to colour-blind operators.
+  function rowClassFor(badge) {
+    if (badge.includes("pm-state-bad")) return "pm-row-bad";
+    if (badge.includes("pm-state-warn")) return "pm-row-warn";
+    return "";
+  }
   function badgeForState(s) {
     const phase = (s.phase || (s.running ? "RUNNING" : "STOPPED")).toUpperCase();
     if (phase.includes("RUN")) return 'pm-state pm-state-run';
@@ -647,8 +686,7 @@
       const app = s.application;
       const pids = (s.pids || []);
       const ups = (s.pid_uptimes_ms || []);
-      const pidLines = pids.length ? pids.map((pid) => `<div><code>${esc(pid.toString())}</code></div>`).join("") : `<div class="text-muted">-</div>`;
-      const upLines = pids.length ? pids.map((_, i) => `<div>${esc(fmtUptimeMs(ups[i] ?? -1))}</div>`).join("") : `<div class="text-muted">-</div>`;
+      const [pidLines, upLines] = pidCells(pids, ups, `data-app="${esc(app)}"`);
       const appBtn = `<button type="button" class="btn btn-link btn-sm p-0 text-decoration-none" data-action="details" data-app="${esc(app)}" title="Show service details"><code>${esc(app)}</code></button>`;
       const actions = [
         iconButton("play", "Start", "start", app),
@@ -658,15 +696,15 @@
         iconButton("logs", "Logs", "logs", app),
       ].join("");
       const actionsGroup = `<div class="btn-group btn-group-sm pm-actions" role="group" aria-label="Actions">${actions}</div>`;
-      return `<tr>
+      return `<tr class="${rowClassFor(badgeForState(s))}">
         <td class="pm-truncate col-app" title="${esc(app)}">${appBtn}</td>
         <td class="col-status"><span class="${badgeForState(s)}">${esc(phase)}</span></td>
-        <td class="col-crashes_10m">${esc(crashes)}</td>
-        <td class="text-nowrap col-pid">${pidLines}</td>
-        <td class="text-nowrap col-uptime">${upLines}</td>
+        <td class="col-crashes_10m" data-label="Crashes (10m)">${esc(crashes)}</td>
+        <td class="text-nowrap col-pid" data-label="PID">${pidLines}</td>
+        <td class="text-nowrap col-uptime" data-label="Uptime">${upLines}</td>
         <td class="col-flags">${flagsCellFor(s)}</td>
-        <td class="text-center col-enabled">${enabledIconFor(s)}</td>
-        <td class="pm-truncate col-last_run" title="${esc(last_run_full)}"><small class="text-muted">${esc(last_run)}</small></td>
+        <td class="text-center col-enabled" data-label="Enabled">${enabledIconFor(s)}</td>
+        <td class="pm-truncate col-last_run" data-label="Last run" title="${esc(last_run_full)}"><small class="text-muted">${esc(last_run)}</small></td>
         <td class="text-end col-actions">${actionsGroup}</td>
       </tr>`;
     }
@@ -679,8 +717,7 @@
       const expr = s.schedule || "-";
       const pids = (s.pids || []);
       const ups = (s.pid_uptimes_ms || []);
-      const pidLines = pids.length ? pids.map((pid) => `<div><code>${esc(pid.toString())}</code></div>`).join("") : `<div class="text-muted">-</div>`;
-      const upLines = pids.length ? pids.map((_, i) => `<div>${esc(fmtUptimeMs(ups[i] ?? -1))}</div>`).join("") : `<div class="text-muted">-</div>`;
+      const [pidLines, upLines] = pidCells(pids, ups, `data-app="${esc(app)}"`);
       const appBtn = `<button type="button" class="btn btn-link btn-sm p-0 text-decoration-none" data-action="details" data-app="${esc(app)}" title="Show service details"><code>${esc(app)}</code></button>`;
       const scheduleBtn = `<button type="button" class="btn btn-sm btn-outline-info" data-action="schedule" data-app="${esc(app)}"><code>${esc(expr)}</code></button>`;
       const actions = [
@@ -691,15 +728,15 @@
         iconButton("logs", "Logs", "logs", app),
       ].join("");
       const actionsGroup = `<div class="btn-group btn-group-sm pm-actions" role="group" aria-label="Actions">${actions}</div>`;
-      return `<tr>
+      return `<tr class="${rowClassFor(badgeForState(s))}">
         <td class="pm-truncate col-app" title="${esc(app)}">${appBtn}</td>
-        <td class="pm-truncate col-schedule">${scheduleBtn}</td>
+        <td class="pm-truncate col-schedule" data-label="Schedule">${scheduleBtn}</td>
         <td class="col-status"><span class="${badgeForState(s)}">${esc(phase)}</span></td>
-        <td class="text-nowrap col-pid">${pidLines}</td>
-        <td class="text-nowrap col-uptime">${upLines}</td>
+        <td class="text-nowrap col-pid" data-label="PID">${pidLines}</td>
+        <td class="text-nowrap col-uptime" data-label="Uptime">${upLines}</td>
         <td class="col-flags">${flagsCellFor(s)}</td>
-        <td class="text-center col-enabled">${enabledIconFor(s)}</td>
-        <td class="pm-truncate col-last_run" title="${esc(last_run_full)}"><small class="text-muted">${esc(last_run)}</small></td>
+        <td class="text-center col-enabled" data-label="Enabled">${enabledIconFor(s)}</td>
+        <td class="pm-truncate col-last_run" data-label="Last run" title="${esc(last_run_full)}"><small class="text-muted">${esc(last_run)}</small></td>
         <td class="text-end col-actions">${actionsGroup}</td>
       </tr>`;
     }
@@ -719,9 +756,30 @@
     applyHiddenColsAll();
   }
 
+  // One-line roll-up beside the title, so trouble is visible before reading rows.
+  function renderSummary() {
+    const el = document.getElementById("pm-summary");
+    if (!el) return;
+    let run = 0, bad = 0, warn = 0;
+    for (const s of lastStatuses) {
+      const b = badgeForState(s);
+      if (b.includes("pm-state-run")) run++;
+      else if (b.includes("pm-state-bad")) bad++;
+      else if (b.includes("pm-state-warn")) warn++;
+    }
+    const n = lastStatuses.length;
+    const parts = [`<span>${n} app${n === 1 ? "" : "s"}</span>`,
+      `<span class="pm-sum pm-sum-run">${run} running</span>`];
+    if (bad) parts.push(`<span class="pm-sum pm-sum-bad">${bad} failed</span>`);
+    if (warn) parts.push(`<span class="pm-sum pm-sum-warn">${warn} backing off</span>`);
+    el.innerHTML = parts.join("");
+  }
+
   function renderStatus(resp) {
     lastStatuses = (resp.statuses || []);
     applyFilterSortAndRender();
+    renderSummary();
+    if (pidsTarget && pidsTarget.kind === "pm") renderPidsModal();
   }
 
   // -------- status refresh (auto every 2s) --------
@@ -825,6 +883,7 @@
       if (!resp.ok) throw new Error(resp.message || "systemd_list failed");
       lastSystemd = resp.services || [];
       renderSystemdTable();
+      if (pidsTarget && pidsTarget.kind === "systemd") renderPidsModal();
     } catch (e) {
       showAlert("danger", e.toString());
     } finally {
@@ -852,8 +911,7 @@
       const phase = s.phase || "STOPPED";
       const pids = (s.pids || []);
       const ups = (s.pid_uptimes_ms || []);
-      const pidLines = pids.length ? pids.map((pid) => `<div><code>${esc(pid.toString())}</code></div>`).join("") : `<div class="text-muted">-</div>`;
-      const upLines = pids.length ? pids.map((_, i) => `<div>${esc(fmtUptimeMs(ups[i] ?? -1))}</div>`).join("") : `<div class="text-muted">-</div>`;
+      const [pidLines, upLines] = pidCells(pids, ups, `data-kind="systemd" data-unit="${esc(unit)}"`);
       const appBtn = `<button type="button" class="btn btn-link btn-sm p-0 text-decoration-none" data-kind="systemd" data-action="details" data-unit="${esc(unit)}" title="Show systemd service details"><code>${esc(unit)}</code></button>`;
       const actions = [
         iconButtonExtra("play", "Start", "start", unit, `data-kind="systemd" data-unit="${esc(unit)}"`),
@@ -869,12 +927,12 @@
         ph.includes("EXIT") ? "pm-state pm-state-warn" :
         ph.includes("FAIL") ? "pm-state pm-state-bad" :
         "pm-state pm-state-idle";
-      return `<tr>
+      return `<tr class="${rowClassFor(badge)}">
         <td class="pm-truncate col-app" title="${esc(unit)}">${appBtn}</td>
         <td class="col-status"><span class="${badge}">${esc(phase)}</span></td>
-        <td class="text-nowrap col-pid">${pidLines}</td>
-        <td class="text-nowrap col-uptime">${upLines}</td>
-        <td class="text-center col-enabled">${enabledIconFor({ enabled })}</td>
+        <td class="text-nowrap col-pid" data-label="PID">${pidLines}</td>
+        <td class="text-nowrap col-uptime" data-label="Uptime">${upLines}</td>
+        <td class="text-center col-enabled" data-label="Enabled">${enabledIconFor({ enabled })}</td>
         <td class="text-end col-actions">${actionsGroup}</td>
       </tr>`;
     }
@@ -1875,6 +1933,51 @@
     scheduleModal.show();
   }
 
+  // -------- processes modal --------
+  // Re-rendered from the latest poll while open, so it tracks processes coming and going.
+  const pidsModalEl = document.getElementById("pidsModal");
+  const pidsModal = new bootstrap.Modal(pidsModalEl);
+  let pidsTarget = null; // { kind: "pm" | "systemd", id }
+  function renderPidsModal() {
+    if (!pidsTarget) return;
+    const { kind, id } = pidsTarget;
+    const entry = (kind === "systemd")
+      ? (lastSystemd || []).find(s => s.unit === id)
+      : (lastStatuses || []).find(s => s.application === id);
+    const pids = (entry && entry.pids) || [];
+    const ups = (entry && entry.pid_uptimes_ms) || [];
+    document.getElementById("pidsApp").textContent = id;
+    // Oldest first; processes with unknown uptime go last.
+    const rows = pids.map((pid, i) => ({ pid, up: (ups[i] ?? -1) }))
+      .sort((a, b) => b.up - a.up);
+    const oldest = rows.length ? Math.max(rows[0].up, 1) : 1;
+    const now = Date.now();
+    document.getElementById("pidsBody").innerHTML = rows.length
+      ? rows.map((r, i) => {
+          const known = r.up >= 0;
+          // Round to whole seconds so the start time doesn't flicker between polls.
+          const started = known ? fmtLastRunShort(Math.round((now - r.up) / 1000) * 1000) : "-";
+          const pct = known ? Math.max(2, Math.round(100 * r.up / oldest)) : 0;
+          return `<tr>
+          <td class="pm-pids-rank">${i + 1}</td>
+          <td><code>${esc(r.pid.toString())}</code></td>
+          <td class="pm-pids-started">${esc(started)}</td>
+          <td class="text-end"><span class="pm-pids-up">
+            <span class="pm-pids-bar" aria-hidden="true"><span style="width:${pct}%"></span></span>
+            <span>${esc(fmtUptimeMs(r.up))}</span>
+          </span></td>
+        </tr>`; }).join("")
+      : `<tr><td colspan="4" class="text-muted">No running processes.</td></tr>`;
+    document.getElementById("pidsFoot").textContent =
+      `${pids.length} process${pids.length === 1 ? "" : "es"} · updates live`;
+  }
+  function openPidsFor(kind, id) {
+    pidsTarget = { kind, id };
+    renderPidsModal();
+    pidsModal.show();
+  }
+  pidsModalEl.addEventListener("hidden.bs.modal", () => { pidsTarget = null; });
+
   // -------- column visibility (per-user cookie, no expiry) --------
   const colsModalEl = document.getElementById("colsModal");
   const colsModal = new bootstrap.Modal(colsModalEl);
@@ -2041,6 +2144,7 @@
     if (action === "logs") { openLogsFor("pm", app); return; }
     if (action === "flags") { openFlagsFor(app); return; }
     if (action === "schedule") { openScheduleFor(app); return; }
+    if (action === "pids") { openPidsFor("pm", app); return; }
     if (action === "start") { askConfirm("start", app); return; }
     if (action === "stop") { askConfirm("stop", app); return; }
     if (action === "restart") { askConfirm("restart", app); return; }
@@ -2058,6 +2162,7 @@
     if (!action || !unit) return;
     if (action === "details") { openServiceDetailsFor("systemd", unit); return; }
     if (action === "logs") { openLogsFor("systemd", unit); return; }
+    if (action === "pids") { openPidsFor("systemd", unit); return; }
     if (action === "start" || action === "stop" || action === "restart") {
       if (!confirm(`${action} ${unit}?`)) return;
       rpc("systemd_action", { unit, action })
