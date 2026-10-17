@@ -188,17 +188,13 @@ fn default_log_compression_enabled() -> bool {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum LogRotationMode {
     Time,
+    #[default]
     Size,
 }
 
-impl Default for LogRotationMode {
-    fn default() -> Self {
-        // Prefer size-based rotation by default to keep disk usage bounded.
-        LogRotationMode::Size
-    }
-}
 
 fn default_rotation_size() -> String {
     // Accepts base10 suffixes; "10m" => 10 MB.
@@ -420,13 +416,12 @@ where
     // Provisioning runs as root against files the service user can usually replace,
     // and it is re-applied automatically whenever a target changes. A setuid/setgid
     // bit would therefore be stamped onto whatever binary the service swaps in.
-    if let Some(m) = mode {
-        if m & 0o6000 != 0 {
+    if let Some(m) = mode
+        && m & 0o6000 != 0 {
             return Err(D::Error::custom(format!(
                 "mode 0o{m:o} sets setuid/setgid; provisioning refuses those bits"
             )));
         }
-    }
     Ok(mode)
 }
 
@@ -913,23 +908,21 @@ impl AppConfigFile {
                             rp.policy
                         )
                     })?;
-                    if matches!(parsed, RestartPolicyParsed::Never) {
-                        if rp.restart_backoff_ms.is_some() || rp.tolerance.is_some() {
+                    if matches!(parsed, RestartPolicyParsed::Never)
+                        && (rp.restart_backoff_ms.is_some() || rp.tolerance.is_some()) {
                             anyhow::bail!(
                                 "service {}: restart_policy.policy=never must not set restart_backoff_ms or tolerance",
                                 application
                             );
                         }
-                    }
-                    if let Some(t) = rp.tolerance.as_ref() {
-                        if t.max_restarts > 500 {
+                    if let Some(t) = rp.tolerance.as_ref()
+                        && t.max_restarts > 500 {
                             anyhow::bail!(
                                 "service {}: restart_policy.tolerance.max_restarts={} exceeds limit 500",
                                 application,
                                 t.max_restarts
                             );
                         }
-                    }
                     if let Some(b) = rp.restart_backoff_ms {
                         anyhow::ensure!(
                             b <= MAX_DURATION_MS,
@@ -979,8 +972,6 @@ impl AppConfigFile {
                 (default_log_rotation(), default_rotation_max_age_ms(), Some(bytes), Some(backups))
             }
         };
-
-        let restart = restart;
 
         // If neither stop_command nor stop_signal provided, default to SIGTERM.
         let stop_signal = if stop_command.is_none() {
@@ -1231,12 +1222,14 @@ pub(crate) fn render_auto_service_yaml(
         }
     }
 
-    let mut process = YamlProcess::default();
-    // The generated file sits in the service directory; the token keeps it valid if
-    // the directory is moved or renamed.
-    process.working_directory = APP_DIR_TOKEN.to_string();
-    process.user = Some(default_service_user.to_string());
-    process.group = Some(default_service_group.to_string());
+    let process = YamlProcess {
+        // The generated file sits in the service directory; the token keeps it valid if
+        // the directory is moved or renamed.
+        working_directory: APP_DIR_TOKEN.to_string(),
+        user: Some(default_service_user.to_string()),
+        group: Some(default_service_group.to_string()),
+        ..Default::default()
+    };
 
     let out = YamlFile {
         application: app.to_string(),

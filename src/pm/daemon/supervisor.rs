@@ -214,7 +214,7 @@ pub(super) fn refresh_supervisors(state: &Arc<Mutex<DaemonState>>) -> anyhow::Re
             st.supervisors.get(&name).map(|h| h.tx.clone())
         };
         if let Some(tx) = tx_opt {
-            if tx.send(SupervisorCmd::Update { def: def.clone() }).is_ok() {
+            if tx.send(SupervisorCmd::Update { def: Box::new(def.clone()) }).is_ok() {
                 continue;
             }
             // Its task is gone (see spawn_supervisor_thread): replace it, or the
@@ -223,8 +223,8 @@ pub(super) fn refresh_supervisors(state: &Arc<Mutex<DaemonState>>) -> anyhow::Re
         }
         // Enable controllers for children of this app cgroup so nested cgroup trees work
         // (e.g. nested processmaster, or apps that create their own sub-cgroups).
-        if cfg.cgroup_subtree_control_allow {
-            if let Err(e) = enable_all_subtree_controllers(&cg_dir) {
+        if cfg.cgroup_subtree_control_allow
+            && let Err(e) = enable_all_subtree_controllers(&cg_dir) {
                 pm_event_state(
                     state,
                     "cgroup",
@@ -235,7 +235,6 @@ pub(super) fn refresh_supervisors(state: &Arc<Mutex<DaemonState>>) -> anyhow::Re
                     ),
                 );
             }
-        }
 
         let (run_info, events) = {
             let st = state.lock().unwrap_or_else(|p| p.into_inner());
@@ -292,7 +291,7 @@ pub(super) enum SupervisorCmd {
         resp: oneshot::Sender<anyhow::Result<()>>,
     },
     Update {
-        def: AppDefinition,
+        def: Box<AppDefinition>,
     },
     WaiterExited {
         epoch: u64,
@@ -398,7 +397,7 @@ impl Supervisor {
             let Some(cmd) = cmd else { break };
 
             match cmd {
-                SupervisorCmd::Update { def } => self.def = def,
+                SupervisorCmd::Update { def } => self.def = *def,
                 SupervisorCmd::ReloadStart { force, resp } => {
                     let _ = resp.send(self.reload_start(force).await);
                 }

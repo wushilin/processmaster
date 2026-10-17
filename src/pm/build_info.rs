@@ -14,8 +14,8 @@ pub fn build_time_pretty() -> String {
 
 pub fn format_build_time_pretty(raw: &str) -> String {
     let raw = raw.trim();
-    if let Some(epoch) = raw.strip_prefix("epoch:") {
-        if let Ok(secs) = epoch.trim().parse::<i64>() {
+    if let Some(epoch) = raw.strip_prefix("epoch:")
+        && let Ok(secs) = epoch.trim().parse::<i64>() {
             // Render in UTC, stable across environments.
             if let Some(dt) = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0) {
                 return dt.format("%Y-%m-%d %H:%M:%S").to_string();
@@ -26,7 +26,6 @@ pub fn format_build_time_pretty(raw: &str) -> String {
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string();
         }
-    }
 
     // Common case: RFC3339 "YYYY-MM-DDTHH:MM:SSZ" -> "YYYY-MM-DD HH:MM:SS" (UTC)
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {

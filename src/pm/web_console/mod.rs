@@ -651,8 +651,8 @@ async fn basic_auth_middleware(
     let key = peer_ip(&req).map(ThrottleKey::from_ip);
     // Only requests carrying credentials are throttled: the bare browser challenge is
     // not a guess, and counting it would lock people out on page loads.
-    if req.headers().contains_key(header::AUTHORIZATION) {
-        if let Some(key) = key {
+    if req.headers().contains_key(header::AUTHORIZATION)
+        && let Some(key) = key {
             let locked = st
                 .auth_throttle
                 .lock()
@@ -663,7 +663,6 @@ async fn basic_auth_middleware(
                 return too_many_attempts(wait);
             }
         }
-    }
 
     let headers = req.headers().clone();
     match check_basic_auth(&st.auth, &headers).await {
@@ -926,11 +925,10 @@ async fn check_decoded_basic_auth(auth: &Authenticator, decoded: &[u8]) -> Resul
     // Cache lookup: if this (user, hash, password digest) succeeded before, accept
     // immediately and skip bcrypt (and so needs no bcrypt slot).
     let digest = password_digest(pass);
-    if let Ok(mut c) = auth.cache.lock() {
-        if c.is_cached_ok(user, &expected_hash, digest, Instant::now()) {
+    if let Ok(mut c) = auth.cache.lock()
+        && c.is_cached_ok(user, &expected_hash, digest, Instant::now()) {
             return Ok(user.to_string());
         }
-    }
 
     // Cache miss: verify once.
     match bcrypt_verify_blocking(&auth.bcrypt_slots, pass, &expected_hash).await {
@@ -1037,11 +1035,10 @@ fn cookie_get(headers: &HeaderMap, name: &str) -> Option<String> {
     let v = headers.get(header::COOKIE)?.to_str().ok()?;
     for part in v.split(';') {
         let t = part.trim();
-        if let Some((k, val)) = t.split_once('=') {
-            if k.trim() == name {
+        if let Some((k, val)) = t.split_once('=')
+            && k.trim() == name {
                 return Some(val.trim().to_string());
             }
-        }
     }
     None
 }
@@ -1538,11 +1535,10 @@ async fn serve(
 
             async fn write_file(path: &str, contents: &str) -> anyhow::Result<()> {
                 let p = Path::new(path);
-                if let Some(parent) = p.parent() {
-                    if !parent.as_os_str().is_empty() {
+                if let Some(parent) = p.parent()
+                    && !parent.as_os_str().is_empty() {
                         tokio::fs::create_dir_all(parent).await?;
                     }
-                }
                 tokio::fs::write(p, contents.as_bytes()).await?;
                 Ok(())
             }
@@ -1552,11 +1548,10 @@ async fn serve(
             // silently failing here would leave the key readable by every local user.
             async fn write_private_file(path: &str, contents: &str) -> anyhow::Result<()> {
                 let p = Path::new(path);
-                if let Some(parent) = p.parent() {
-                    if !parent.as_os_str().is_empty() {
+                if let Some(parent) = p.parent()
+                    && !parent.as_os_str().is_empty() {
                         tokio::fs::create_dir_all(parent).await?;
                     }
-                }
                 let mut opts = std::fs::OpenOptions::new();
                 opts.write(true).create_new(true);
                 #[cfg(unix)]
@@ -2398,10 +2393,4 @@ mod tests {
         assert!(cert_not_after_and_issuer(&der[1..]).is_none());
     }
 
-    #[test]
-    fn autogen_certificates_are_not_long_lived() {
-        // 397 days is the browser-accepted maximum; the 20-year original meant a leaked
-        // key stayed useful for the life of the machine.
-        assert!(AUTOGEN_CERT_VALID_DAYS <= 397);
-    }
 }

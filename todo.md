@@ -11,12 +11,9 @@ Pending items from the 2026-10-17 code review.
   (tested default), `run.sh` (documented launcher) and `conf.d/` (demo services) stay.
 - `issues.md` removed; it remains in git history.
 
-## Optional
-
-- [ ] Clippy reports ~60 style-only warnings (mostly collapsible `if`s), nearly all
-      older than this review.
-
 ## Done
+
+- [x] `cargo clippy --all-targets` is clean.
 
 - [x] Console `systemd_list` timeout raised from 3s to 10s (a slow first listing failed).
 - [x] Event-driven cgroup waiter: async watch on `cgroup.events` (`populated`), no

@@ -1,3 +1,9 @@
+//! Minimal cgroup-v2 helpers: process launching, cgroup membership, resource limits
+//! and kill/wait primitives.
+//!
+//! This module owns the privilege drop for every supervised process (see
+//! `build_command`), so changes here are security-sensitive.
+
 #![allow(dead_code)]
 
 use crate::pm::config::MasterConfig;
@@ -20,12 +26,6 @@ use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs as tokio_fs;
 use tokio::task;
-
-/// Minimal cgroup-v2 helpers: process launching, cgroup membership, resource limits
-/// and kill/wait primitives.
-///
-/// This module owns the privilege drop for every supervised process (see
-/// `build_command`), so changes here are security-sensitive.
 
 /// Write `content` to a cgroup control file.
 ///
@@ -480,6 +480,7 @@ impl Drop for OwnedPidFd {
 }
 
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub(crate) struct Resources {
     /// cgroup v2 `cpu.max` payload, e.g. `"max 100000"` or `"20000 100000"`.
     pub(crate) cpu_max: Option<String>,
@@ -497,19 +498,6 @@ pub(crate) struct Resources {
     pub(crate) io_max: Vec<String>,
 }
 
-impl Default for Resources {
-    fn default() -> Self {
-        Self {
-            cpu_max: None,
-            memory_max: None,
-            swap_max: None,
-            pids_max: None,
-            cpu_weight: None,
-            io_weight: None,
-            io_max: Vec::new(),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct LaunchParams {
@@ -1049,7 +1037,7 @@ pub(crate) fn read_resource_snapshot(cgroup_dir: &Path) -> anyhow::Result<Cgroup
     let cpu_max = read_trimmed_opt(&cgroup_dir.join("cpu.max"))?;
     let cpu_stat = read_to_string_opt(&cgroup_dir.join("cpu.stat"))?
         .map(|s| parse_kv_u64_lines(&s))
-        .or_else(|| None);
+        .or(None);
 
     let cpu_pressure = parse_pressure_opt(read_to_string_opt(&cgroup_dir.join("cpu.pressure"))?);
     let memory_pressure =

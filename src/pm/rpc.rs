@@ -358,8 +358,7 @@ impl Response {
             let _ = height; // (for readability: height is the number of ASCII rows this service occupies)
 
             let up0 = s
-                .pid_uptimes_ms
-                .get(0)
+                .pid_uptimes_ms.first()
                 .copied()
                 .map(fmt_uptime_ms)
                 .unwrap_or_else(|| "-".to_string());

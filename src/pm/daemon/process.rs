@@ -35,11 +35,10 @@ pub(super) fn kill_orphan_pids_in_cgroup_procs_file(
             continue;
         }
         if let Ok(pid) = t.parse::<i32>() {
-            if let Some(ex) = exclude_pid {
-                if pid == ex as i32 {
+            if let Some(ex) = exclude_pid
+                && pid == ex as i32 {
                     continue;
                 }
-            }
             // Skip obviously invalid entries.
             if pid > 1 {
                 pids.push(pid);
@@ -72,7 +71,7 @@ pub(super) fn kill_orphan_pids_in_cgroup_procs_file(
     // exited during the grace window can have been recycled by the kernel, and this
     // runs as root: the stale entry would send SIGKILL to an unrelated process.
     let still_present: std::collections::HashSet<i32> =
-        read_pids_from_cgroup_procs(&cgroup_procs).into_iter().collect();
+        read_pids_from_cgroup_procs(cgroup_procs).into_iter().collect();
     for pid in &filtered {
         if still_present.contains(pid) {
             let _ = kill(Pid::from_raw(*pid), Signal::SIGKILL);
@@ -761,21 +760,19 @@ pub(super) fn enforce_app_user_group_rules(def: &AppDefinition) -> anyhow::Resul
         .map(|g| g.name().to_string_lossy().to_string())
         .unwrap_or_else(|| egid.as_raw().to_string());
 
-    if let Some(u) = def.user.as_deref() {
-        if u != cur_user {
+    if let Some(u) = def.user.as_deref()
+        && u != cur_user {
             anyhow::bail!(
                 "service {} requests user={u}, but pm is running as non-root {cur_user}:{cur_group}",
                 def.application
             );
         }
-    }
-    if let Some(g) = def.group.as_deref() {
-        if g != cur_group {
+    if let Some(g) = def.group.as_deref()
+        && g != cur_group {
             anyhow::bail!(
                 "service {} requests group={g}, but pm is running as non-root {cur_user}:{cur_group}",
                 def.application
             );
         }
-    }
     Ok(())
 }

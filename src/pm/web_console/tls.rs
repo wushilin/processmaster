@@ -6,6 +6,8 @@ use super::*;
 /// 397 days: the maximum a public CA (and therefore every browser) will accept for a
 /// server certificate. A long-lived auto-generated key is a credential nobody rotates.
 pub(super) const AUTOGEN_CERT_VALID_DAYS: i64 = 397;
+// The 20-year original meant a leaked key stayed useful for the life of the machine.
+const _: () = assert!(AUTOGEN_CERT_VALID_DAYS <= 397);
 
 /// CN of the CA processmaster generates for itself. Doubles as the marker that tells an
 /// expired certificate of ours apart from an operator's own.

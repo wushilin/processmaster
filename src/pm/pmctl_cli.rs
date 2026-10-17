@@ -412,7 +412,7 @@ pub fn run() -> anyhow::Result<()> {
                 }
             }
 
-            fn fetch(sock: &std::path::PathBuf, name: &str) -> anyhow::Result<rpc::PerfMetricsSnapshot> {
+            fn fetch(sock: &std::path::Path, name: &str) -> anyhow::Result<rpc::PerfMetricsSnapshot> {
                 let resp = rpc::client_call(sock, rpc::Request::PerfMetrics { name: name.to_string() })?;
                 if !resp.ok {
                     if !resp.message.trim().is_empty() {
@@ -523,12 +523,11 @@ pub fn run() -> anyhow::Result<()> {
                 if let Some(du) = d_usage {
                     let one_core_pct = (du as f64) / (dt_us as f64) * 100.0;
                     print!("  - usage: {:.1}% of 1 core", one_core_pct);
-                    if let Some(ec) = effective_cores {
-                        if ec > 0.0 {
+                    if let Some(ec) = effective_cores
+                        && ec > 0.0 {
                             let quota_pct = (du as f64) / ((dt_us as f64) * ec) * 100.0;
                             print!("  ({:.1}% of quota ~{}m)", quota_pct, (ec * 1000.0).round() as i64);
                         }
-                    }
                     println!();
                 } else {
                     println!("  - usage: - (missing/non-monotonic cpu.stat usage_usec)");
@@ -618,9 +617,7 @@ pub fn run() -> anyhow::Result<()> {
                     for k in a.keys() { devs.insert(k.clone()); }
                     for k in b.keys() { devs.insert(k.clone()); }
                     let cap = 20usize;
-                    let mut shown = 0usize;
-                    for dev in devs.iter() {
-                        if shown >= cap { break; }
+                    for dev in devs.iter().take(cap) {
                         let va = a.get(dev).cloned().unwrap_or_default();
                         let vb = b.get(dev).cloned().unwrap_or_default();
                         let drb = delta(va.get("rbytes").copied(), vb.get("rbytes").copied());
@@ -634,7 +631,6 @@ pub fn run() -> anyhow::Result<()> {
                             fmt_bytes_per_s(dwb, dt_us),
                             fmt_iops(dwi, dt_us),
                         );
-                        shown += 1;
                     }
                     if devs.len() > cap {
                         println!("  … (+{} more devices)", devs.len() - cap);
@@ -838,13 +834,12 @@ fn sanitize_for_terminal(s: &str) -> Cow<'_, str> {
     let mut out = String::with_capacity(s.len() + 16);
     let mut rest = s;
     while let Some(c) = rest.chars().next() {
-        if c == '\x1b' {
-            if let Some(len) = sgr_len(rest) {
+        if c == '\x1b'
+            && let Some(len) = sgr_len(rest) {
                 out.push_str(&rest[..len]);
                 rest = &rest[len..];
                 continue;
             }
-        }
         if c == '\r' && rest[1..].starts_with('\n') {
             rest = &rest[1..];
             continue;

@@ -210,15 +210,12 @@ pub(super) async fn do_update_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::
     // NOTE: this intentionally only considers services with a known YAML `source_file` and mtime.
     let mut modified_apps: Vec<String> = vec![];
     for (name, new_def) in &new_defs {
-        if let Some(old_def) = old_defs.get(name) {
-            if new_def.source_file.is_some() && old_def.source_file.is_some() {
-                if let (Some(nm), Some(om)) = (new_def.source_mtime_ms, old_def.source_mtime_ms) {
-                    if nm > om {
+        if let Some(old_def) = old_defs.get(name)
+            && new_def.source_file.is_some() && old_def.source_file.is_some()
+                && let (Some(nm), Some(om)) = (new_def.source_mtime_ms, old_def.source_mtime_ms)
+                    && nm > om {
                         modified_apps.push(name.clone());
                     }
-                }
-            }
-        }
     }
     modified_apps.sort();
     modified_apps.dedup();
@@ -250,11 +247,10 @@ pub(super) async fn do_update_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::
                     to_stop.push(name.clone());
                 }
             }
-            Some(def) if !def.enabled => {
-                if cgroup_running_async(&cfg, name).await.unwrap_or(false) {
+            Some(def) if !def.enabled
+                && cgroup_running_async(&cfg, name).await.unwrap_or(false) => {
                     to_stop.push(name.clone());
                 }
-            }
             _ => {}
         }
     }
@@ -769,11 +765,10 @@ pub(super) async fn do_stop_all_async(state: &Arc<Mutex<DaemonState>>) -> anyhow
     {
         let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
         for (name, r) in &results {
-            if r.is_err() {
-                if let Some(entry) = ri.get_mut(name) {
+            if r.is_err()
+                && let Some(entry) = ri.get_mut(name) {
                     sysflag_clear(&mut entry.system_flags, SYSFLAG_USER_STOP);
                 }
-            }
         }
     }
     Ok(bulk_summary_response("stop_all", &format!(" skipped_not_running={skipped}"), results))
@@ -814,11 +809,10 @@ pub(super) fn do_flag(state: &Arc<Mutex<DaemonState>>, name: &str, flags: &[Stri
     // Prune expired flags before returning (fail-safe even if maintenance thread hasn't run yet).
     let mut expired: Vec<String> = vec![];
     for (k, v) in e.user_flags.iter() {
-        if let Some(deadline) = v {
-            if now_ms >= *deadline {
+        if let Some(deadline) = v
+            && now_ms >= *deadline {
                 expired.push(k.clone());
             }
-        }
     }
     for k in &expired {
         e.user_flags.remove(k);
@@ -903,11 +897,10 @@ pub(super) fn do_unflag(state: &Arc<Mutex<DaemonState>>, name: &str, flags: &[St
     // Prune expired flags before returning (fail-safe even if maintenance thread hasn't run yet).
     let mut expired: Vec<String> = vec![];
     for (k, v) in e.user_flags.iter() {
-        if let Some(deadline) = v {
-            if now_ms >= *deadline {
+        if let Some(deadline) = v
+            && now_ms >= *deadline {
                 expired.push(k.clone());
             }
-        }
     }
     for k in &expired {
         e.user_flags.remove(k);
@@ -938,11 +931,10 @@ pub(super) fn do_status(state: &Arc<Mutex<DaemonState>>, name: Option<&str>) -> 
     let (cfg, defs, run_info) = {
         let st = state.lock().unwrap_or_else(|p| p.into_inner());
         let want_one = name.filter(|n| *n != "all");
-        if let Some(one) = want_one {
-            if !st.defs.contains_key(one) {
+        if let Some(one) = want_one
+            && !st.defs.contains_key(one) {
                 anyhow::bail!("unknown service: {one}");
             }
-        }
         let defs: Vec<(String, AppDefinition)> = st
             .defs
             .iter()
@@ -978,10 +970,11 @@ pub(super) fn do_status(state: &Arc<Mutex<DaemonState>>, name: Option<&str>) -> 
             .system_flags
             .keys()
             .copied()
-            .filter(|k| match (is_running_now, k.scope()) {
-                (true, FlagScope::Running | FlagScope::Both) => true,
-                (false, FlagScope::Stopped | FlagScope::Both) => true,
-                _ => false,
+            .filter(|k| {
+                matches!(
+                    (is_running_now, k.scope()),
+                    (true, FlagScope::Running | FlagScope::Both) | (false, FlagScope::Stopped | FlagScope::Both)
+                )
             })
             .map(|k| k.to_string())
             .collect();

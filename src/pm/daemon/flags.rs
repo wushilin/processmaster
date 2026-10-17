@@ -341,7 +341,7 @@ pub(super) fn load_flag_rules(cfg: &MasterConfig) -> FlagRulesCompiled {
         let mut compiled: FlagRulesCompiled = HashMap::new();
         for (k, v) in parsed {
             let Some(flag) = SystemFlag::parse(&k) else {
-                pm_event("flags", None, &format!("ignore_rule reason=unknown_flag flag={k}"));
+                pm_event("flags", None, format!("ignore_rule reason=unknown_flag flag={k}"));
                 continue;
             };
             let mut clears: Vec<SystemFlag> = vec![];
@@ -357,7 +357,7 @@ pub(super) fn load_flag_rules(cfg: &MasterConfig) -> FlagRulesCompiled {
                     pm_event(
                         "flags",
                         None,
-                        &format!(
+                        format!(
                             "ignore_rule_field reason=unknown_flag parent={} field=clears value={c}",
                             flag.as_str()
                         ),
@@ -372,7 +372,7 @@ pub(super) fn load_flag_rules(cfg: &MasterConfig) -> FlagRulesCompiled {
                     pm_event(
                         "flags",
                         None,
-                        &format!(
+                        format!(
                             "ignore_rule_field reason=unknown_flag parent={} field=also_sets value={a}",
                             flag.as_str()
                         ),
@@ -395,7 +395,7 @@ pub(super) fn load_flag_rules(cfg: &MasterConfig) -> FlagRulesCompiled {
     let embedded_parsed: Option<FlagRulesFile> = match serde_json::from_str(EMBEDDED_FLAG_RULES_JSON) {
         Ok(v) => Some(v),
         Err(e) => {
-            pm_event("flags", None, &format!("decision=use_builtin_defaults reason=embedded_json_parse_error err={e}"));
+            pm_event("flags", None, format!("decision=use_builtin_defaults reason=embedded_json_parse_error err={e}"));
             None
         }
     };
@@ -409,13 +409,13 @@ pub(super) fn load_flag_rules(cfg: &MasterConfig) -> FlagRulesCompiled {
         Ok(text) => match serde_json::from_str::<FlagRulesFile>(&text) {
             Ok(parsed) => {
                 base = compile_from_parsed(parsed);
-                pm_event("flags", None, &format!("loaded source=disk file={} rules={}", path.display(), base.len()));
+                pm_event("flags", None, format!("loaded source=disk file={} rules={}", path.display(), base.len()));
             }
             Err(e) => {
                 pm_event(
                     "flags",
                     None,
-                    &format!(
+                    format!(
                         "decision=keep_embedded reason=json_parse_error file={} err={e}",
                         path.display()
                     ),
@@ -423,13 +423,13 @@ pub(super) fn load_flag_rules(cfg: &MasterConfig) -> FlagRulesCompiled {
             }
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            pm_event("flags", None, &format!("loaded source=embedded rules={}", base.len()));
+            pm_event("flags", None, format!("loaded source=embedded rules={}", base.len()));
         }
         Err(e) => {
             pm_event(
                 "flags",
                 None,
-                &format!("decision=keep_embedded reason=read_error file={} err={e}", path.display()),
+                format!("decision=keep_embedded reason=read_error file={} err={e}", path.display()),
             );
         }
     }

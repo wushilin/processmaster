@@ -405,7 +405,7 @@ mod tests {
         fs::create_dir(&user).unwrap();
         fs::set_permissions(&user, fs::Permissions::from_mode(0o777)).unwrap();
         // x -> u/l -> /usr (trusted); u is world-writable, so l can be re-pointed.
-        std::os::unix::fs::symlink(&user.join("l"), d.join("x")).unwrap();
+        std::os::unix::fs::symlink(user.join("l"), d.join("x")).unwrap();
         std::os::unix::fs::symlink("/usr", user.join("l")).unwrap();
         assert!(!is_root_controlled_dir(&d.join("x")));
         // And the no-follow walk refuses the user's link instead of creating through it.

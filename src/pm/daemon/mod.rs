@@ -214,8 +214,8 @@ pub async fn run_daemon_async(cfg: MasterConfig) -> anyhow::Result<()> {
     // directory anyone can write is a problem regardless of the socket's own mode: a
     // local user could unlink and replace it. Warn rather than refuse, since operators
     // may deliberately use /tmp.
-    if let Some(parent) = sock.parent() {
-        if let Ok(md) = std::fs::metadata(parent) {
+    if let Some(parent) = sock.parent()
+        && let Ok(md) = std::fs::metadata(parent) {
             let mode = std::os::unix::fs::MetadataExt::mode(&md);
             let world_writable = mode & 0o002 != 0;
             let sticky = mode & 0o1000 != 0;
@@ -230,7 +230,6 @@ pub async fn run_daemon_async(cfg: MasterConfig) -> anyhow::Result<()> {
                 );
             }
         }
-    }
 
     let shutting_down = Arc::new(AtomicBool::new(false));
 
@@ -423,8 +422,7 @@ fn validate_web_console_config(cfg: &MasterConfig) -> anyhow::Result<()> {
             "web",
             None,
             "WARNING default bootstrap web console credentials are in use \
-             (loopback-only); replace them via `pmctl password generate`"
-                .to_string(),
+             (loopback-only); replace them via `pmctl password generate`",
         );
     }
 

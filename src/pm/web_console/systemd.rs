@@ -128,7 +128,7 @@ pub(super) async fn systemd_list_services() -> anyhow::Result<Vec<SystemdService
         }
 
         let active_state = active.unwrap_or_else(|| "unknown".to_string());
-        let sub_state = sub.unwrap_or_else(|| "".to_string());
+        let sub_state = sub.unwrap_or_default();
         let mpid = main_pid.unwrap_or(0);
         let unit_file_state = ufs.unwrap_or_else(|| "unknown".to_string());
         let fragment_path = frag.unwrap_or_default();

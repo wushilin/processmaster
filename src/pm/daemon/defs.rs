@@ -74,13 +74,17 @@ pub(super) fn preflight_validate_and_load_defs(cfg: &MasterConfig) -> anyhow::Re
     Ok(defs)
 }
 
+/// Loaded definitions, load warnings, and the services whose new definition was
+/// rejected (they keep their previous one).
+pub(super) type LoadedDefs = (HashMap<String, AppDefinition>, Vec<String>, Vec<String>);
+
 pub(super) fn load_app_definitions_best_effort(
     dir: &Path,
     old_defs: &HashMap<String, AppDefinition>,
     auto_service_directory: Option<&Path>,
     default_service_user: &str,
     default_service_group: &str,
-) -> anyhow::Result<(HashMap<String, AppDefinition>, Vec<String>, Vec<String>)> {
+) -> anyhow::Result<LoadedDefs> {
     if !dir.exists() {
         return Ok((
             old_defs.clone(),
@@ -127,8 +131,8 @@ pub(super) fn load_app_definitions_best_effort(
 
     for path in &files {
         // Enforce per-file size limit (best-effort: keep previous if possible).
-        if let Ok(m) = fs::metadata(path) {
-            if m.is_file() && m.len() > MAX_APP_CONFIG_BYTES {
+        if let Ok(m) = fs::metadata(path)
+            && m.is_file() && m.len() > MAX_APP_CONFIG_BYTES {
                 if let Some((app, old)) = old_defs
                     .iter()
                     .find(|(_, d)| d.source_file.as_deref() == Some(path.as_path()))
@@ -152,7 +156,6 @@ pub(super) fn load_app_definitions_best_effort(
                 }
                 continue;
             }
-        }
         // Definitions are executed as root (they choose `user:`, commands, paths), so
         // only a root-owned, single-link, non-group/other-writable file is loaded.
         let raw = match crate::pm::safefs::read_trusted_file(path, MAX_APP_CONFIG_BYTES) {
@@ -208,8 +211,8 @@ pub(super) fn load_app_definitions_best_effort(
                 // (marker missing), provisioning must succeed for the app to be loadable.
                 // If provisioning fails, we drop the app from this load (do NOT keep last-known-good),
                 // so a subsequent reload will retry provisioning.
-                if !def.provisioning.is_empty() {
-                    if let Err(e) = maybe_provision_workdir(&def) {
+                if !def.provisioning.is_empty()
+                    && let Err(e) = maybe_provision_workdir(&def) {
                         pm_event(
                             "provision",
                             Some(&def.application),
@@ -225,7 +228,6 @@ pub(super) fn load_app_definitions_best_effort(
                         ));
                         continue;
                     }
-                }
 
                 let app = def.application.clone();
                 seen_sources.entry(app.clone()).or_default().push(path.to_path_buf());
@@ -566,17 +568,15 @@ pub(super) fn merge_auto_services_best_effort(
             svc_file = Some(svc_yml.clone());
 
             // Remove marker only if generation + write succeeded.
-            if regen_ok {
-                if let Err(e) = std::fs::remove_file(&regen_marker) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
+            if regen_ok
+                && let Err(e) = std::fs::remove_file(&regen_marker)
+                    && e.kind() != std::io::ErrorKind::NotFound {
                         warnings.push(format!(
                             "auto_service_regen_marker_remove_failed app={} file={} err={e}",
                             app,
                             regen_marker.display()
                         ));
                     }
-                }
-            }
         }
 
         let def = if let Some(sf) = svc_file.as_ref() {
@@ -755,8 +755,8 @@ pub(super) fn merge_auto_services_best_effort(
         // Provisioning gate (auto services too): if provisioning is defined and marker is missing,
         // provisioning must succeed for the app to be loadable. If it fails, do NOT keep any old def;
         // the next reload will retry.
-        if !def.provisioning.is_empty() {
-            if let Err(e) = maybe_provision_workdir(&def) {
+        if !def.provisioning.is_empty()
+            && let Err(e) = maybe_provision_workdir(&def) {
                 let file_s = def
                     .source_file
                     .as_ref()
@@ -773,7 +773,6 @@ pub(super) fn merge_auto_services_best_effort(
                 ));
                 continue;
             }
-        }
 
         defs.insert(app.to_string(), def);
     }

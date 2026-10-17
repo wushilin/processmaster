@@ -21,8 +21,8 @@ pub(super) fn restore_app_state_best_effort(state: Arc<Mutex<DaemonState>>) {
         let st = state.lock().unwrap_or_else(|p| p.into_inner());
         (st.appstate_path.clone(), Arc::clone(&st.run_info), Arc::clone(&st.events))
     };
-    if let Ok(m) = fs::metadata(&path) {
-        if m.is_file() && m.len() > MAX_APPSTATE_BYTES {
+    if let Ok(m) = fs::metadata(&path)
+        && m.is_file() && m.len() > MAX_APPSTATE_BYTES {
             push_event(
                 &events,
                 "appstate",
@@ -36,7 +36,6 @@ pub(super) fn restore_app_state_best_effort(state: Arc<Mutex<DaemonState>>) {
             );
             return;
         }
-    }
     let text = match fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) => {

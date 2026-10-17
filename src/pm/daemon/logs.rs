@@ -94,11 +94,10 @@ pub(super) async fn prune_numbered_backups_async(base_path: &Path, keep: usize) 
         if let Some(s) = suffix.strip_suffix(".gz") {
             suffix = s;
         }
-        if suffix.chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(n) = suffix.parse::<u64>() {
+        if suffix.chars().all(|c| c.is_ascii_digit())
+            && let Ok(n) = suffix.parse::<u64>() {
                 nums.push((n, p));
             }
-        }
     }
     // delete any backups with N > keep
     for (n, p) in nums {
@@ -314,9 +313,9 @@ pub(super) fn handle_logs_follow(
     for p in &selected {
         let header = format!("==> {} <==\n", p.display());
         stream.write_all(header.as_bytes())?;
-        if n > 0 {
-            if let Ok(s) = tail_lines(p, n) {
-                if !s.is_empty() {
+        if n > 0
+            && let Ok(s) = tail_lines(p, n)
+                && !s.is_empty() {
                     // Keep the "tail" output plain (no per-line prefix), but still wrap long lines.
                     for line in s.split_terminator('\n') {
                         let b = line.as_bytes();
@@ -336,8 +335,6 @@ pub(super) fn handle_logs_follow(
                         }
                     }
                 }
-            }
-        }
         stream.write_all(b"\n")?;
     }
     stream.flush()?;
@@ -391,7 +388,7 @@ pub(super) fn handle_logs_follow(
             while remaining > 0 {
                 let take = remaining.min(LOGSFOLLOW_READ_CHUNK_BYTES);
                 let mut buf = vec![0u8; take];
-                if let Err(_) = std::io::Read::read_exact(&mut f, &mut buf) {
+                if std::io::Read::read_exact(&mut f, &mut buf).is_err() {
                     break;
                 }
                 st.offset += take as u64;

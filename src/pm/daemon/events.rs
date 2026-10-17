@@ -180,7 +180,7 @@ pub(super) fn start_daemon_log_file(cfg: &MasterConfig) {
                 s.push('\n');
             }
             if f.write_all(s.as_bytes()).await.is_ok() {
-                bytes_written = bytes_written.saturating_add(s.as_bytes().len() as u64);
+                bytes_written = bytes_written.saturating_add(s.len() as u64);
             }
 
             // Rotate after write too (covers single large writes).

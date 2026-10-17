@@ -73,18 +73,16 @@ pub(super) fn start_scheduler_thread(state: Arc<Mutex<DaemonState>>) {
 
                 // Optional schedule window checks.
                 let now_ms = now.timestamp_millis();
-                if let Some(nb) = def.schedule_not_before_ms {
-                    if now_ms < nb {
+                if let Some(nb) = def.schedule_not_before_ms
+                    && now_ms < nb {
                         pm_event_state(&state, "schedule", Some(&name), format!("skip not_before now_ms={} not_before_ms={} schedule={expr:?}", now_ms, nb));
                         continue;
                     }
-                }
-                if let Some(na) = def.schedule_not_after_ms {
-                    if now_ms > na {
+                if let Some(na) = def.schedule_not_after_ms
+                    && now_ms > na {
                         pm_event_state(&state, "schedule", Some(&name), format!("skip not_after now_ms={} not_after_ms={} schedule={expr:?}", now_ms, na));
                         continue;
                     }
-                }
 
                 // Avoid double-firing if we ever loop twice within the same minute.
                 if last_fired.get(&name).copied() == Some(minute_key) {

@@ -157,6 +157,7 @@ pub struct WebConsoleConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(Default)]
 pub struct WebConsoleTlsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -272,18 +273,6 @@ impl Default for WebConsoleConfig {
     }
 }
 
-impl Default for WebConsoleTlsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            ca_pem: None,
-            server_cert_pem: None,
-            server_key_pem: None,
-            client_host: None,
-            mtls: false,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -716,11 +705,10 @@ pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
             cfg.web_console.tls.mtls = tls.mtls;
         }
 
-        if let Some(auth) = wc.auth {
-            if let Some(basic) = auth.basic {
+        if let Some(auth) = wc.auth
+            && let Some(basic) = auth.basic {
                 cfg.web_console.auth.basic.users = basic.users;
             }
-        }
     }
 
     if let Some(actions) = file_cfg.admin_actions {
@@ -783,11 +771,10 @@ pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
     if cfg.config_directory.is_relative() {
         cfg.config_directory = base.join(&cfg.config_directory);
     }
-    if let Some(p) = cfg.auto_service_directory.clone() {
-        if p.is_relative() {
+    if let Some(p) = cfg.auto_service_directory.clone()
+        && p.is_relative() {
             cfg.auto_service_directory = Some(base.join(p));
         }
-    }
 
     // Resolve relative web_console TLS paths against the config file directory.
     if let Some(p) = cfg.web_console.tls.ca_pem.clone() {
