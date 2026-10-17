@@ -643,6 +643,15 @@ fn check_trusted_chain(path: &Path, trusted_uids: &[u32]) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// `cgroup.name` becomes a path under `cgroup.root`, so it must stay there. A leading '/'
+/// is allowed for convenience and ignored (see `cgroup::master_dir`).
+pub(crate) fn validate_cgroup_name(name: &str) -> anyhow::Result<()> {
+    let name = name.trim();
+    anyhow::ensure!(!name.trim_start_matches('/').is_empty(), "cgroup.name is empty");
+    anyhow::ensure!(!name.split('/').any(|seg| seg == ".."), "cgroup.name must not contain '..'");
+    Ok(())
+}
+
 pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
     let raw = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("failed to read config {}: {e}", config_path.display()))?;
@@ -654,6 +663,7 @@ pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
 
     if let Some(cg) = file_cfg.cgroup {
         cfg.cgroup_root = cg.root;
+        validate_cgroup_name(&cg.name)?;
         cfg.cgroup_name = cg.name;
         cfg.cgroup_memory_max = cg.memory_max;
         cfg.cgroup_memory_swap_max = cg.memory_swap_max;
@@ -807,6 +817,16 @@ pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cgroup_name_must_stay_under_the_cgroup_root() {
+        for bad in ["", "  ", "/", "..", "a/../b", "/../x"] {
+            assert!(validate_cgroup_name(bad).is_err(), "{bad:?} must be rejected");
+        }
+        for good in ["processmaster", "/processmaster", "a/b", "a..b"] {
+            assert!(validate_cgroup_name(good).is_ok(), "{good:?} must be accepted");
+        }
+    }
 
     // ---- admin action trust ------------------------------------------------------
     //

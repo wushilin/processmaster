@@ -34,11 +34,12 @@ struct Service {
     policy: &'static str,
     max_restarts: usize,
     stop_grace_period_ms: u64,
+    max_pids: Option<u64>,
 }
 
 impl Service {
     fn new(script: &'static str) -> Self {
-        Service { script, policy: "always", max_restarts: 50, stop_grace_period_ms: 2_000 }
+        Service { script, policy: "always", max_restarts: 50, stop_grace_period_ms: 2_000, max_pids: None }
     }
     fn policy(mut self, p: &'static str) -> Self {
         self.policy = p;
@@ -50,6 +51,10 @@ impl Service {
     }
     fn grace_ms(mut self, ms: u64) -> Self {
         self.stop_grace_period_ms = ms;
+        self
+    }
+    fn max_pids(mut self, n: u64) -> Self {
+        self.max_pids = Some(n);
         self
     }
 }
@@ -99,13 +104,14 @@ impl Harness {
         } else {
             String::new()
         };
+        let resources = svc.max_pids.map(|n| format!("resources:\n  max_pids: {n}\n")).unwrap_or_default();
         write_trusted(
             &dir.join("conf.d").join(format!("{APP}.yaml")),
             &format!(
                 "application: {APP}\n\
                  process:\n  working_directory: {}\n  start_command: [\"/bin/sh\", \"-c\", {script}]\n  \
                  stop_grace_period_ms: {}\n\
-                 restart_policy:\n  policy: {}\n{tolerance}",
+                 restart_policy:\n  policy: {}\n{tolerance}{resources}",
                 work.display(),
                 svc.stop_grace_period_ms,
                 svc.policy,
@@ -354,6 +360,24 @@ fn fan_out_children_are_all_tracked_and_all_killed() {
     h.stop();
     h.wait_for("every child to die", Duration::from_secs(15), || kids.iter().all(|&p| !pid_alive(p)));
     h.wait_for("an empty cgroup", Duration::from_secs(5), || h.status().pids.is_empty());
+}
+
+/// `max_pids` holds a fork bomb to its own cgroup: forks past the cap fail inside the
+/// service, the daemon is unaffected, and the service still stops cleanly.
+#[test]
+#[ignore = "needs root + cgroup v2"]
+fn max_pids_contains_a_fork_bomb() {
+    // The shell may give up once fork starts failing; the sleepers it did start remain.
+    let h = Harness::start(Service::new("for i in $(seq 1 64); do sleep 300 & done; wait").max_pids(16));
+    let limit = std::fs::read_to_string(h.cgroup.join(format!("pm-{APP}")).join("pids.max")).unwrap();
+    assert_eq!(limit.trim(), "16");
+    h.wait_for("the service to reach its cap", Duration::from_secs(10), || h.status().pids.len() >= 12);
+    std::thread::sleep(Duration::from_millis(500));
+    let pids = h.status().pids.len();
+    assert!(pids <= 16, "expected the cap to hold, got {pids} pids");
+
+    h.stop();
+    h.wait_for("an empty cgroup", Duration::from_secs(10), || h.status().pids.is_empty());
 }
 
 /// Output on both streams is captured by the log pumps and served by `logs`.

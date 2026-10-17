@@ -276,6 +276,11 @@ pub struct AppDefinition {
     #[serde(default)]
     pub max_swap: Option<String>,
 
+    /// Optional: cgroup v2 pids.max, the most processes and threads the service may have
+    /// at once. Contains a fork bomb to its own cgroup.
+    #[serde(default)]
+    pub max_pids: Option<u64>,
+
     /// Optional: cgroup v2 io.weight (1..=10000). Proportional I/O share under contention.
     #[serde(default)]
     pub io_weight: Option<u16>,
@@ -558,6 +563,9 @@ pub(crate) struct ResourcesSection {
     max_memory: Option<String>,
     #[serde(default)]
     max_swap: Option<String>,
+    /// Optional: cgroup v2 pids.max (see `AppDefinition.max_pids`).
+    #[serde(default)]
+    max_pids: Option<u64>,
     /// Optional: cgroup v2 io.weight (1..=10000).
     #[serde(default)]
     io_weight: Option<u16>,
@@ -791,6 +799,7 @@ impl AppConfigFile {
             max_cpu: default_max_str(),
             max_memory: default_max_str(),
             max_swap: default_max_str(),
+            max_pids: None,
             io_weight: None,
             io_bandwidth: None,
         });
@@ -988,6 +997,9 @@ impl AppConfigFile {
                 parse_cpu_millicores(t).map_err(|e| anyhow::anyhow!("service {application}: resources.max_cpu: {e}"))?;
             }
         }
+        if let Some(n) = resources.max_pids {
+            anyhow::ensure!(n >= 1, "service {application}: resources.max_pids must be at least 1");
+        }
         if let Some(g) = self.process.stop_grace_period_ms {
             anyhow::ensure!(
                 g <= MAX_DURATION_MS,
@@ -1015,6 +1027,7 @@ impl AppConfigFile {
             max_cpu: resources.max_cpu,
             max_memory: resources.max_memory,
             max_swap: resources.max_swap,
+            max_pids: resources.max_pids,
             io_weight: resources.io_weight,
             io_bandwidth: resources.io_bandwidth,
             user: self.process.user,

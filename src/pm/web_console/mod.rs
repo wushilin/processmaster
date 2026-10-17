@@ -26,6 +26,11 @@ use std::time::{Duration, Instant};
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::process::Command;
 
+mod systemd;
+mod tls;
+use systemd::*;
+use tls::*;
+
 #[derive(Clone)]
 struct WebState {
     daemon: Arc<Mutex<DaemonState>>,
@@ -355,20 +360,20 @@ async fn security_headers(mut resp: AxumResponse) -> AxumResponse {
 
 // ---------------- Embedded static assets (icons) ----------------
 
-const ICON_FAVICON_ICO: &[u8] = include_bytes!("../../templates/icons/favicon.ico");
-const ICON_ANDROID_192: &[u8] = include_bytes!("../../templates/icons/android-chrome-192x192.png");
-const ICON_ANDROID_512: &[u8] = include_bytes!("../../templates/icons/android-chrome-512x512.png");
-const ICON_FAVICON_16: &[u8] = include_bytes!("../../templates/icons/favicon-16x16.png");
-const ICON_FAVICON_32: &[u8] = include_bytes!("../../templates/icons/favicon-32x32.png");
-const ICON_APPLE_TOUCH: &[u8] = include_bytes!("../../templates/icons/apple-touch-icon.png");
+const ICON_FAVICON_ICO: &[u8] = include_bytes!("../../../templates/icons/favicon.ico");
+const ICON_ANDROID_192: &[u8] = include_bytes!("../../../templates/icons/android-chrome-192x192.png");
+const ICON_ANDROID_512: &[u8] = include_bytes!("../../../templates/icons/android-chrome-512x512.png");
+const ICON_FAVICON_16: &[u8] = include_bytes!("../../../templates/icons/favicon-16x16.png");
+const ICON_FAVICON_32: &[u8] = include_bytes!("../../../templates/icons/favicon-32x32.png");
+const ICON_APPLE_TOUCH: &[u8] = include_bytes!("../../../templates/icons/apple-touch-icon.png");
 
 // CSS/JS are embedded rather than loaded from a CDN. processmaster supervises
 // servers, and those are routinely air-gapped or egress-filtered — pulling Bootstrap
 // over the network meant the console rendered as unstyled HTML exactly where it is
 // needed most. Embedding also removes a third-party origin from a root-privileged UI.
-const VENDOR_BOOTSTRAP_CSS: &[u8] = include_bytes!("../../templates/vendor/bootstrap.min.css");
-const VENDOR_BOOTSTRAP_JS: &[u8] = include_bytes!("../../templates/vendor/bootstrap.bundle.min.js");
-const APP_CSS: &[u8] = include_bytes!("../../templates/app.css");
+const VENDOR_BOOTSTRAP_CSS: &[u8] = include_bytes!("../../../templates/vendor/bootstrap.min.css");
+const VENDOR_BOOTSTRAP_JS: &[u8] = include_bytes!("../../../templates/vendor/bootstrap.bundle.min.js");
+const APP_CSS: &[u8] = include_bytes!("../../../templates/app.css");
 
 fn bytes_response(content_type: &'static str, bytes: &'static [u8]) -> AxumResponse {
     (
@@ -969,20 +974,6 @@ const CSRF_HEADER: &str = "x-csrf-token";
 #[derive(Clone)]
 struct CsrfToken(String);
 
-// Constant-time comparison, so a wrong token cannot be recovered byte-by-byte via
-// timing. Length mismatch is not secret (the token length is fixed), so it fails fast.
-fn ct_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 async fn csrf_middleware(
     State(st): State<WebState>,
     mut req: axum::http::Request<axum::body::Body>,
@@ -1003,7 +994,7 @@ async fn csrf_middleware(
     if !safe_method {
         let hdr = headers.get(CSRF_HEADER).and_then(|v| v.to_str().ok()).map(|s| s.trim());
         let ok = match (cookie_token.as_deref(), hdr) {
-            (Some(c), Some(h)) => !c.is_empty() && ct_eq(c, h),
+            (Some(c), Some(h)) => !c.is_empty() && crate::pm::consttime::ct_eq(c, h),
             _ => false,
         };
         if !ok {
@@ -1499,21 +1490,7 @@ async fn jsonrpc(
                 let st = st.daemon.lock().unwrap_or_else(|p| p.into_inner());
                 st.cfg.clone()
             };
-            let admin_cg = match admin_actions_cgroup_dir(&cfg) {
-                Ok(p) => p,
-                Err(e) => {
-                    let v = serde_json::json!({ "ok": false, "message": e.to_string() });
-                    return (
-                        StatusCode::OK,
-                        Json(JsonRpcResponse::<serde_json::Value> {
-                            jsonrpc: "2.0",
-                            id: req.id,
-                            result: Some(v),
-                            error: None,
-                        }),
-                    );
-                }
-            };
+            let admin_cg = cgroup::admin_actions_dir(&cfg);
             let before = cgroup::list_pids(&admin_cg).unwrap_or_default();
             if let Err(e) = cgroup::kill_all_pids(&admin_cg) {
                 let v = serde_json::json!({ "ok": false, "message": e.to_string() });
@@ -1592,326 +1569,14 @@ async fn jsonrpc(
     }
 }
 
-fn admin_actions_cgroup_dir(cfg: &crate::pm::config::MasterConfig) -> anyhow::Result<PathBuf> {
-    let name = cfg.cgroup_name.trim();
-    anyhow::ensure!(!name.is_empty(), "cgroup.name is empty");
-    anyhow::ensure!(
-        !name.split('/').any(|seg| seg == ".."),
-        "cgroup.name must not contain '..'"
-    );
-    let master = PathBuf::from(&cfg.cgroup_root).join(name.trim_start_matches('/'));
-    Ok(master.join("admin_actions"))
-}
-
 fn service_cgroup_dir(cfg: &crate::pm::config::MasterConfig, app: &str) -> anyhow::Result<PathBuf> {
-    let name = cfg.cgroup_name.trim();
-    anyhow::ensure!(!name.is_empty(), "cgroup.name is empty");
-    anyhow::ensure!(
-        !name.split('/').any(|seg| seg == ".."),
-        "cgroup.name must not contain '..'"
-    );
     let app = app.trim();
     // Same rules as service definitions: rules out '/', '.', '..' and leading dots, while
     // still allowing names such as `db..backup` that a config can legitimately define.
     crate::pm::app::validate_application_name(app)?;
-    let master = PathBuf::from(&cfg.cgroup_root).join(name.trim_start_matches('/'));
-    Ok(master.join(format!("pm-{app}")))
+    Ok(cgroup::app_dir(cfg, app))
 }
 
-// ---------------- systemd helpers (web console) ----------------
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct SystemdServiceStatus {
-    unit: String,
-    phase: String, // RUNNING/STOPPED
-    enabled: bool,
-    unit_file_state: String,
-    fragment_path: String,
-    exec_start_path: String,
-    main_pid: i32,
-    cgroup_dir: String,
-    pids: Vec<u32>,
-    pid_uptimes_ms: Vec<i64>,
-}
-
-fn validate_systemd_unit(unit: &str) -> anyhow::Result<()> {
-    let t = unit.trim();
-    anyhow::ensure!(!t.is_empty(), "unit is empty");
-    anyhow::ensure!(t.ends_with(".service"), "only .service units are supported (got {t:?})");
-    // A leading '-' would be parsed by root's systemctl as an option (`-H user@host`
-    // opens SSH with root's keys). Callers also pass "--"; this is the belt.
-    anyhow::ensure!(!t.starts_with('-'), "invalid unit name (leading '-'): {t:?}");
-    anyhow::ensure!(
-        t.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@' | ':' | '\\')),
-        "invalid unit name (unsupported characters): {t:?}"
-    );
-    Ok(())
-}
-
-fn validate_systemd_action(action: &str) -> anyhow::Result<&'static str> {
-    match action {
-        "start" => Ok("start"),
-        "stop" => Ok("stop"),
-        "restart" => Ok("restart"),
-        _ => anyhow::bail!("unsupported action: {action:?} (allowed: start|stop|restart)"),
-    }
-}
-
-async fn run_cmd_timeout(mut cmd: Command, ms: u64) -> anyhow::Result<std::process::Output> {
-    let fut = cmd.output();
-    let out = tokio::time::timeout(std::time::Duration::from_millis(ms), fut)
-        .await
-        .map_err(|_| anyhow::anyhow!("command timed out after {ms}ms"))??;
-    Ok(out)
-}
-
-fn sysfs_cgroup_dir_from_control_group(control_group: &str) -> Option<PathBuf> {
-    let cg = control_group.trim();
-    if cg.is_empty() {
-        return None;
-    }
-    // systemctl show ControlGroup is typically like "/system.slice/sshd.service"
-    let rel = cg.trim_start_matches('/');
-    if rel.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from("/sys/fs/cgroup").join(rel))
-}
-
-fn clock_ticks_per_second() -> Option<f64> {
-    let v = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if v <= 0 { None } else { Some(v as f64) }
-}
-
-fn read_system_uptime_seconds() -> Option<f64> {
-    let s = std::fs::read_to_string("/proc/uptime").ok()?;
-    let first = s.split_whitespace().next()?;
-    first.parse::<f64>().ok()
-}
-
-fn compute_pid_uptimes_ms_u32(pids: &[u32], sys_uptime_s: Option<f64>, hz: Option<f64>) -> Vec<i64> {
-    let mut out = Vec::with_capacity(pids.len());
-    for &pid in pids {
-        let ms = pid_uptime_ms_u32(pid, sys_uptime_s, hz);
-        out.push(ms.unwrap_or(-1));
-    }
-    out
-}
-
-fn pid_uptime_ms_u32(pid: u32, sys_uptime_s: Option<f64>, hz: Option<f64>) -> Option<i64> {
-    let sys_uptime_s = sys_uptime_s?;
-    let hz = hz?;
-    let start_ticks = read_pid_starttime_ticks_u32(pid)?;
-    let started_s = (start_ticks as f64) / hz;
-    let up_s = (sys_uptime_s - started_s).max(0.0);
-    Some((up_s * 1000.0).round() as i64)
-}
-
-fn read_pid_starttime_ticks_u32(pid: u32) -> Option<u64> {
-    let path = format!("/proc/{pid}/stat");
-    let stat = std::fs::read_to_string(path).ok()?;
-    let rparen = stat.rfind(')')?;
-    let after = stat.get(rparen + 2..)?; // skip ") "
-    let fields: Vec<&str> = after.split_whitespace().collect();
-    // fields[0] is original field 3 (state). starttime is original field 22 => index 22-3 = 19
-    let start = *fields.get(19)?;
-    start.parse::<u64>().ok()
-}
-
-async fn systemd_list_services() -> anyhow::Result<Vec<SystemdServiceStatus>> {
-    // Bulk query for all service units. This is dramatically faster than per-unit `systemctl show`.
-    let mut cmd = Command::new("systemctl");
-    cmd.arg("show")
-        .arg("--type=service")
-        .arg("--all")
-        .arg("--no-pager")
-        .arg("--property=Id,ActiveState,SubState,MainPID,ControlGroup,UnitFileState,FragmentPath,ExecStart");
-    let out = run_cmd_timeout(cmd, 3000).await?;
-
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        anyhow::bail!("systemctl show failed: {}", if err.is_empty() { out.status.to_string() } else { err });
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let sys_uptime_s = read_system_uptime_seconds();
-    let hz = clock_ticks_per_second();
-
-    let mut services = vec![];
-    for block in text.split("\n\n") {
-        let mut id: Option<String> = None;
-        let mut active: Option<String> = None;
-        let mut sub: Option<String> = None;
-        let mut main_pid: Option<i32> = None;
-        let mut cg: Option<String> = None;
-        let mut ufs: Option<String> = None;
-        let mut frag: Option<String> = None;
-        let mut exec_start: Option<String> = None;
-
-        for line in block.lines() {
-            let (k, v) = match line.split_once('=') {
-                Some(kv) => kv,
-                None => continue,
-            };
-            let v = v.trim().to_string();
-            match k.trim() {
-                "Id" => id = Some(v),
-                "ActiveState" => active = Some(v),
-                "SubState" => sub = Some(v),
-                "MainPID" => {
-                    let p = v.parse::<i32>().unwrap_or(0);
-                    main_pid = Some(p);
-                }
-                "ControlGroup" => cg = Some(v),
-                "UnitFileState" => ufs = Some(v),
-                "FragmentPath" => frag = Some(v),
-                "ExecStart" => exec_start = Some(v),
-                _ => {}
-            }
-        }
-
-        let Some(unit) = id else { continue };
-        if !unit.ends_with(".service") {
-            continue;
-        }
-        // Avoid odd corner cases: only list units we can later act on.
-        if validate_systemd_unit(&unit).is_err() {
-            continue;
-        }
-
-        let active_state = active.unwrap_or_else(|| "unknown".to_string());
-        let sub_state = sub.unwrap_or_else(|| "".to_string());
-        let mpid = main_pid.unwrap_or(0);
-        let unit_file_state = ufs.unwrap_or_else(|| "unknown".to_string());
-        let fragment_path = frag.unwrap_or_default();
-        let exec_start_path = exec_start
-            .as_deref()
-            .and_then(parse_systemd_execstart_path)
-            .unwrap_or_default();
-        let enabled = unit_file_state.starts_with("enabled");
-        let phase = if active_state == "active" && sub_state == "exited" {
-            "EXITED"
-        } else if active_state == "active" {
-            "RUNNING"
-        } else if active_state == "failed" {
-            "FAILED"
-        } else {
-            "STOPPED"
-        }
-        .to_string();
-
-        let cgroup_dir = cg.clone().unwrap_or_default();
-        let sysfs_dir = cg.as_deref().and_then(sysfs_cgroup_dir_from_control_group);
-        let pids = match sysfs_dir.as_deref() {
-            Some(dir) if std::fs::metadata(dir).is_ok() => cgroup::list_pids(dir).unwrap_or_default(),
-            _ => vec![],
-        };
-        let pid_uptimes_ms = compute_pid_uptimes_ms_u32(&pids, sys_uptime_s, hz);
-
-        services.push(SystemdServiceStatus {
-            unit,
-            phase,
-            enabled,
-            unit_file_state,
-            fragment_path,
-            exec_start_path,
-            main_pid: mpid,
-            cgroup_dir,
-            pids,
-            pid_uptimes_ms,
-        });
-    }
-
-    services.sort_by(|a, b| a.unit.cmp(&b.unit));
-    Ok(services)
-}
-
-fn parse_systemd_execstart_path(raw: &str) -> Option<String> {
-    // `systemctl show -p ExecStart` commonly yields strings like:
-    //   ExecStart={ path=/usr/sbin/sshd ; argv[]=/usr/sbin/sshd -D ... ; ... }
-    // There may be multiple `{...}{...}` entries; we just take the first `path=...`.
-    let t = raw.trim();
-    if t.is_empty() {
-        return None;
-    }
-    let idx = t.find("path=")?;
-    let rest = &t[idx + "path=".len()..];
-    let end = rest
-        .find(|c: char| c.is_whitespace() || c == ';' || c == '}' || c == ',' )
-        .unwrap_or(rest.len());
-    let p = rest[..end].trim().trim_matches('"').to_string();
-    if p.is_empty() { None } else { Some(p) }
-}
-
-async fn systemd_action(unit: &str, action: &str) -> anyhow::Result<String> {
-    validate_systemd_unit(unit)?;
-    let action = validate_systemd_action(action)?;
-    let mut cmd = Command::new("systemctl");
-    cmd.arg("--no-pager").arg(action).arg("--").arg(unit);
-    let out = run_cmd_timeout(cmd, 10_000).await?;
-    if out.status.success() {
-        return Ok(format!("{action} {unit}: ok"));
-    }
-    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    anyhow::bail!(
-        "systemctl {} {} failed: {}",
-        action,
-        unit,
-        if err.is_empty() { out.status.to_string() } else { err }
-    );
-}
-
-async fn systemd_logs(unit: &str, n: usize) -> anyhow::Result<String> {
-    validate_systemd_unit(unit)?;
-    let n = n.clamp(1, 5000);
-    let mut cmd = Command::new("journalctl");
-    cmd.arg("-u")
-        .arg(unit)
-        .arg("-n")
-        .arg(n.to_string())
-        .arg("--no-pager")
-        .arg("--output=short-iso");
-    let out = run_cmd_timeout(cmd, 5000).await?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        anyhow::bail!(
-            "journalctl -u {unit} failed: {}",
-            if err.is_empty() { out.status.to_string() } else { err }
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
-}
-
-async fn systemd_service_details(unit: &str) -> anyhow::Result<(PathBuf, cgroup::CgroupResourceSnapshot)> {
-    validate_systemd_unit(unit)?;
-    let mut cmd = Command::new("systemctl");
-    cmd.arg("show")
-        .arg("--no-pager")
-        .arg("--property=ControlGroup")
-        .arg("--")
-        .arg(unit);
-    let out = run_cmd_timeout(cmd, 3000).await?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        anyhow::bail!(
-            "systemctl show {unit} failed: {}",
-            if err.is_empty() { out.status.to_string() } else { err }
-        );
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let cg = text
-        .lines()
-        .find_map(|line| line.strip_prefix("ControlGroup="))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    let dir = sysfs_cgroup_dir_from_control_group(&cg)
-        .ok_or_else(|| anyhow::anyhow!("systemd unit has no ControlGroup: {unit}"))?;
-    if let Err(e) = std::fs::metadata(&dir) {
-        anyhow::bail!("cgroup dir not found for {unit}: {}: {e}", dir.display());
-    }
-    let snap = cgroup::read_resource_snapshot(&dir)?;
-    Ok((dir, snap))
-}
 
 /// Reads the `flags` param (comma-separated string or array), normalised to lowercase.
 ///
@@ -2015,219 +1680,6 @@ fn map_method_to_request(method: &str, params: &serde_json::Value) -> Result<Req
     }
 }
 
-// ---------------- auto-generated TLS material ----------------
-
-/// 397 days: the maximum a public CA (and therefore every browser) will accept for a
-/// server certificate. A long-lived auto-generated key is a credential nobody rotates.
-const AUTOGEN_CERT_VALID_DAYS: i64 = 397;
-
-/// CN of the CA processmaster generates for itself. Doubles as the marker that tells an
-/// expired certificate of ours apart from an operator's own.
-const AUTOGEN_CA_COMMON_NAME: &str = "processmaster-ca";
-
-/// The host's name, if it is usable as a certificate DNS SAN.
-///
-/// Read from /proc rather than gethostname(2): this daemon is Linux/cgroup-v2 only, so
-/// /proc is always mounted, and it keeps an unsafe call out of the TLS path. Anything
-/// that is not a plain DNS label is rejected rather than fed to rcgen.
-fn system_hostname() -> Option<String> {
-    let raw = std::fs::read_to_string("/proc/sys/kernel/hostname").ok()?;
-    let t = raw.trim().to_ascii_lowercase();
-    if t.is_empty() || t.len() > 253 {
-        return None;
-    }
-    if !t
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
-    {
-        return None;
-    }
-    Some(t)
-}
-
-/// Subject CN for the generated leaf. `CN=test` said nothing about which machine was
-/// being talked to, which matters when several hosts each generate their own.
-fn autogen_cert_common_name(hostname: Option<&str>) -> String {
-    hostname
-        .map(|h| h.to_string())
-        .unwrap_or_else(|| "processmaster".to_string())
-}
-
-/// SANs for the generated leaf, normalized (DNS lowercased, both sets deduped/sorted).
-///
-/// Modern clients ignore the CN entirely and match on SANs alone, so anything an
-/// operator might type into the address bar has to be listed here: loopback, the host's
-/// own name, the configured `client_host`, and the address the console actually binds.
-/// A wildcard bind (0.0.0.0 / ::) names no particular interface and is skipped -- there
-/// is nothing to put in the certificate.
-fn autogen_cert_sans(
-    client_host: Option<&str>,
-    bind_ip: IpAddr,
-    hostname: Option<&str>,
-) -> (Vec<String>, Vec<IpAddr>) {
-    let mut dns_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut ip_set: std::collections::BTreeSet<IpAddr> = std::collections::BTreeSet::new();
-
-    dns_set.insert("localhost".to_string());
-    ip_set.insert(IpAddr::from([127, 0, 0, 1]));
-    ip_set.insert(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
-
-    if let Some(h) = hostname {
-        let t = h.trim().to_ascii_lowercase();
-        if !t.is_empty() {
-            dns_set.insert(t);
-        }
-    }
-
-    if !bind_ip.is_unspecified() {
-        ip_set.insert(bind_ip);
-    }
-
-    // Optional extra host SAN for operator-provided hostname/IP (e.g. public domain).
-    if let Some(raw) = client_host {
-        let t = raw.trim().to_ascii_lowercase();
-        if !t.is_empty() {
-            if let Ok(ip) = t.parse::<IpAddr>() {
-                ip_set.insert(ip);
-            } else {
-                dns_set.insert(t);
-            }
-        }
-    }
-
-    (dns_set.into_iter().collect(), ip_set.into_iter().collect())
-}
-
-enum CertStatus {
-    Valid { not_after: OffsetDateTime },
-    /// Expired, and issued by the CA processmaster generates: safe to renew in place.
-    ExpiredAutogen { not_after: OffsetDateTime },
-    /// Expired, but somebody else's: we hold no key that can re-sign it.
-    ExpiredForeign { not_after: OffsetDateTime },
-    /// Could not be established. Never treat this as "valid" silently.
-    Unknown { reason: String },
-}
-
-async fn server_cert_status(cert_path: &str, now: OffsetDateTime) -> CertStatus {
-    let bytes = match tokio::fs::read(cert_path).await {
-        Ok(b) => b,
-        Err(e) => return CertStatus::Unknown { reason: format!("cannot read: {e}") },
-    };
-    let mut reader: &[u8] = &bytes;
-    let chain: Vec<CertificateDer<'static>> = match rustls_pemfile::certs(&mut reader).collect() {
-        Ok(v) => v,
-        Err(e) => return CertStatus::Unknown { reason: format!("cannot parse PEM: {e}") },
-    };
-    // The leaf comes first by rustls convention; that is the one clients validate.
-    let Some(leaf) = chain.first() else {
-        return CertStatus::Unknown { reason: "no certificates in file".to_string() };
-    };
-    let Some((not_after, issuer)) = cert_not_after_and_issuer(leaf.as_ref()) else {
-        return CertStatus::Unknown { reason: "unrecognised certificate structure".to_string() };
-    };
-    if not_after > now {
-        return CertStatus::Valid { not_after };
-    }
-    if issuer
-        .windows(AUTOGEN_CA_COMMON_NAME.len())
-        .any(|w| w == AUTOGEN_CA_COMMON_NAME.as_bytes())
-    {
-        CertStatus::ExpiredAutogen { not_after }
-    } else {
-        CertStatus::ExpiredForeign { not_after }
-    }
-}
-
-/// Recovers `notAfter` and the raw issuer name from a DER certificate.
-///
-/// Hand-rolled because neither of our TLS crates can answer this: rustls only checks
-/// validity when acting as a *client*, and rcgen only writes certificates. This walks
-/// exactly as far into the structure as it must and returns `None` the moment anything
-/// is unexpected -- callers must treat that as "unknown", never as "valid".
-///
-///   Certificate ::= SEQUENCE { tbsCertificate, ... }
-///   TBSCertificate ::= SEQUENCE { [0] version OPTIONAL, serialNumber, signature,
-///                                 issuer, validity, ... }
-///   Validity ::= SEQUENCE { notBefore Time, notAfter Time }
-fn cert_not_after_and_issuer(der: &[u8]) -> Option<(OffsetDateTime, &[u8])> {
-    const SEQUENCE: u8 = 0x30;
-    const CONTEXT_0: u8 = 0xa0;
-
-    let (tag, cert_body, _) = der_take(der)?;
-    if tag != SEQUENCE {
-        return None;
-    }
-    let (tag, tbs, _) = der_take(cert_body)?;
-    if tag != SEQUENCE {
-        return None;
-    }
-    // version is [0] EXPLICIT and optional (absent means v1).
-    let (tag, _, after_version) = der_take(tbs)?;
-    let rest = if tag == CONTEXT_0 { after_version } else { tbs };
-    let (_, _, rest) = der_take(rest)?; // serialNumber
-    let (_, _, rest) = der_take(rest)?; // signature AlgorithmIdentifier
-    let (_, issuer, rest) = der_take(rest)?; // issuer Name
-    let (tag, validity, _) = der_take(rest)?;
-    if tag != SEQUENCE {
-        return None;
-    }
-    let (_, _, after_not_before) = der_take(validity)?;
-    let (tag, not_after, _) = der_take(after_not_before)?;
-    Some((parse_asn1_time(tag, not_after)?, issuer))
-}
-
-/// Splits one DER TLV off the front, returning (tag, contents, remainder).
-fn der_take(buf: &[u8]) -> Option<(u8, &[u8], &[u8])> {
-    let (&tag, rest) = buf.split_first()?;
-    let (&len0, rest) = rest.split_first()?;
-    let (len, rest) = if len0 < 0x80 {
-        (len0 as usize, rest)
-    } else {
-        // Long form: the low 7 bits give the number of length bytes that follow.
-        let n = (len0 & 0x7f) as usize;
-        if n == 0 || n > 4 || rest.len() < n {
-            return None;
-        }
-        let mut v = 0usize;
-        for &b in &rest[..n] {
-            v = (v << 8) | b as usize;
-        }
-        (v, &rest[n..])
-    };
-    if rest.len() < len {
-        return None;
-    }
-    Some((tag, &rest[..len], &rest[len..]))
-}
-
-fn parse_asn1_time(tag: u8, body: &[u8]) -> Option<OffsetDateTime> {
-    const UTC_TIME: u8 = 0x17;
-    const GENERALIZED_TIME: u8 = 0x18;
-
-    let s = std::str::from_utf8(body).ok()?.trim_end_matches('Z');
-    // Only the UTC forms are accepted: an offset form ("...+0200") is legal ASN.1 but
-    // forbidden in certificates, and guessing at one would misdate the expiry.
-    let (year, rest) = match tag {
-        UTC_TIME => {
-            let yy: i32 = s.get(0..2)?.parse().ok()?;
-            // RFC 5280: two-digit years 00..=49 are 20xx, 50..=99 are 19xx.
-            (if yy < 50 { 2000 + yy } else { 1900 + yy }, s.get(2..)?)
-        }
-        GENERALIZED_TIME => (s.get(0..4)?.parse().ok()?, s.get(4..)?),
-        _ => return None,
-    };
-    if rest.len() < 10 {
-        return None;
-    }
-    let num = |a: usize, b: usize| -> Option<u8> { rest.get(a..b)?.parse().ok() };
-    let month = time::Month::try_from(num(0, 2)?).ok()?;
-    let date = time::Date::from_calendar_date(year, month, num(2, 4)?).ok()?;
-    Some(
-        date.with_hms(num(4, 6)?, num(6, 8)?, num(8, 10)?)
-            .ok()?
-            .assume_utc(),
-    )
-}
 
 async fn serve(
     cfg: WebConsoleConfig,
@@ -2562,8 +2014,6 @@ async fn serve(
     Ok(())
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2620,19 +2070,6 @@ mod tests {
         let mut users = users_with_costs(&["12"]);
         users.insert("md5".to_string(), "$apr1$xyz$abc".to_string());
         assert!(dummy_bcrypt_cost(&users).1.expect("non-bcrypt warns").contains("not bcrypt"));
-    }
-
-    #[test]
-    fn ct_eq_matches_ordinary_equality() {
-        assert!(ct_eq("", ""));
-        assert!(ct_eq("abc", "abc"));
-        assert!(ct_eq(&"x".repeat(64), &"x".repeat(64)));
-        assert!(!ct_eq("abc", "abd"));
-        assert!(!ct_eq("abc", "ab"));
-        assert!(!ct_eq("", "a"));
-        // Differences in the final byte must be caught just as reliably as the first.
-        assert!(!ct_eq("aaaaaaaaZ", "aaaaaaaaY"));
-        assert!(!ct_eq("Zaaaaaaaa", "Yaaaaaaaa"));
     }
 
     // ---- systemd argument allow-lists ------------------------------------------

@@ -151,7 +151,7 @@ pub struct StatusEntry {
     pub schedule_max_time_per_run_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Response {
     pub ok: bool,
     #[serde(default)]
@@ -234,6 +234,11 @@ pub struct AdminActionInfo {
 }
 
 impl Response {
+    /// A plain reply: just the outcome and a human-readable message.
+    pub fn message(ok: bool, message: impl Into<String>) -> Self {
+        Response { ok, message: message.into(), ..Default::default() }
+    }
+
     pub fn render_text(&self) -> String {
         if !self.message.is_empty() && self.statuses.is_empty() {
             return self.message.clone();

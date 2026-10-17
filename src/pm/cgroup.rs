@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use crate::pm::config::MasterConfig;
 use anyhow::Context as _;
 use nix::errno::Errno;
 use nix::sys::signal::{kill as kill_pid, Signal};
@@ -32,6 +33,25 @@ use tokio::task;
 /// a string, so callers can still recover the errno with
 /// `downcast_ref::<io::Error>()` — several fail-safe branches depend on distinguishing
 /// `NotFound` (cgroup already gone) from a real failure.
+/// `<cgroup_root>/<cgroup_name>`: the parent of every cgroup processmaster manages.
+/// `cgroup_name` is checked by `config::validate_cgroup_name` when the config is loaded.
+/// The leading '/' is stripped because `join` with an absolute path would *replace* the
+/// root, putting app cgroups on the root filesystem.
+pub(crate) fn master_dir(cfg: &MasterConfig) -> PathBuf {
+    PathBuf::from(&cfg.cgroup_root).join(cfg.cgroup_name.trim().trim_start_matches('/'))
+}
+
+/// A service's cgroup. Prefixed so app names cannot collide with reserved or system cgroup
+/// names (e.g. "failure"); the caller is responsible for `app` being a valid service name.
+pub(crate) fn app_dir(cfg: &MasterConfig, app: &str) -> PathBuf {
+    master_dir(cfg).join(format!("pm-{app}"))
+}
+
+/// Parent of the per-action cgroups that admin actions run in.
+pub(crate) fn admin_actions_dir(cfg: &MasterConfig) -> PathBuf {
+    master_dir(cfg).join("admin_actions")
+}
+
 fn write_file(path: &Path, content: &str) -> anyhow::Result<()> {
     let mut f = fs::OpenOptions::new()
         .write(true)
@@ -406,6 +426,8 @@ pub(crate) struct Resources {
     pub(crate) memory_max: Option<String>,
     /// cgroup v2 `memory.swap.max` payload, e.g. `"max"` or `"0"`.
     pub(crate) swap_max: Option<String>,
+    /// cgroup v2 `pids.max`; `None` means unlimited.
+    pub(crate) pids_max: Option<u64>,
     /// cgroup v2 `cpu.weight` (1..=10000).
     pub(crate) cpu_weight: Option<u16>,
     /// cgroup v2 `io.weight` default weight (1..=10000). Written as `default <n>`.
@@ -420,6 +442,7 @@ impl Default for Resources {
             cpu_max: None,
             memory_max: None,
             swap_max: None,
+            pids_max: None,
             cpu_weight: None,
             io_weight: None,
             io_max: Vec::new(),
@@ -480,6 +503,17 @@ fn apply_resources(cgroup_dir: &Path, res: &Resources) -> anyhow::Result<()> {
     if let Some(v) = &res.swap_max {
         write_file(&cgroup_dir.join("memory.swap.max"), &format!("{v}\n"))
             .with_context(|| format!("set memory.swap.max for {}", cgroup_dir.display()))?;
+    }
+    let pids_max = cgroup_dir.join("pids.max");
+    match res.pids_max {
+        Some(v) => write_file(&pids_max, &format!("{v}\n"))
+            .with_context(|| format!("set pids.max for {}", cgroup_dir.display()))?,
+        // The cgroup outlives a definition change: lift a limit that was removed. Best
+        // effort, since the pids controller may not be delegated where none is wanted.
+        None if pids_max.exists() => {
+            let _ = write_file(&pids_max, "max\n");
+        }
+        None => {}
     }
     if let Some(v) = res.cpu_weight {
         write_file(&cgroup_dir.join("cpu.weight"), &format!("{v}\n"))

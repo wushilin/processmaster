@@ -1,5 +1,5 @@
-use crate::pm::{cli, rpc};
-use clap::Parser;
+use crate::pm::rpc;
+use clap::{Parser, Subcommand, ValueEnum};
 use std::borrow::Cow;
 use std::io::{BufRead, IsTerminal};
 use std::path::PathBuf;
@@ -13,7 +13,143 @@ pub struct PmctlArgs {
     pub sock: Option<PathBuf>,
 
     #[command(subcommand)]
-    pub cmd: Option<cli::Cmd>,
+    pub cmd: Option<Cmd>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Cmd {
+    /// Reload app definitions and reconcile state (stop removed/disabled services)
+    Update,
+    /// Start a service, or all
+    Start {
+        name: String,
+        /// Start even if the service is disabled (does not edit YAML)
+        #[arg(long = "force")]
+        force: bool,
+    },
+    /// Stop a service, or all
+    Stop { name: String },
+    /// Restart a service, or all
+    Restart {
+        name: String,
+        /// Start even if the service is disabled (does not edit YAML)
+        #[arg(long = "force")]
+        force: bool,
+    },
+    /// Set user flags on an app (comma-separated list)
+    Flag {
+        name: String,
+        flags: String,
+        /// Optional TTL for these flags, e.g. 5d4h3s or 10m or 1500ms. Units: ms/s/m/h/d.
+        /// Must be specified from larger to smaller units; no repeats (3h1m ok, 1m3h invalid).
+        #[arg(short = 't', long = "ttl")]
+        ttl: Option<String>,
+    },
+    /// Remove user flags from an app (comma-separated list)
+    Unflag { name: String, flags: String },
+    /// Enable a service (writes enabled: true into its YAML)
+    Enable { name: String },
+    /// Disable a service (writes enabled: false into its YAML)
+    Disable { name: String },
+    /// Show recent logs for an app (stdout/stderr + hinted log files)
+    Logs {
+        /// App name (required unless using -f to follow across all apps)
+        name: Option<String>,
+        /// Number of lines to show per file
+        #[arg(short = 'n', default_value_t = 50)]
+        n: usize,
+        /// Follow logs continuously. Optional value filters by filename only (basename, not path).
+        /// Examples: `-f` (all logs), `-f stdout.log`, `-f syslog`
+        #[arg(short = 'f', num_args = 0..=1, default_missing_value = "")]
+        f: Option<String>,
+    },
+    /// Show status for a service, or all (default)
+    Status {
+        name: Option<String>,
+        /// Output format: text (default) or json
+        #[arg(long = "format", default_value = "text")]
+        format: OutputFormat,
+    },
+    /// Show recent daemon events ("what happened")
+    Events {
+        /// Optional app name filter
+        name: Option<String>,
+        /// Number of events to show
+        #[arg(short = 'n', default_value_t = 200)]
+        n: usize,
+        /// Output format: text (default) or json
+        #[arg(long = "format", default_value = "text")]
+        format: OutputFormat,
+    },
+    /// Print local build info
+    Version,
+    /// Print server build info (requires daemon socket)
+    ServerVersion,
+    /// Show per-app performance/resource metrics from cgroup (memory/swap/cpu + pressure/throttling)
+    PerfMetrics {
+        name: String,
+        /// Sampling interval used to compute CPU utilization from cumulative cpu.stat counters.
+        /// If you pass `--once`, no utilization is computed and this is ignored.
+        #[arg(long = "interval-ms", default_value_t = 1000)]
+        interval_ms: u64,
+        /// Only print a single snapshot (no sleep; no utilization %).
+        #[arg(long = "once")]
+        once: bool,
+    },
+
+    /// List configured admin actions (name + label)
+    AdminList,
+    /// Kill all running admin actions via cgroup.kill (no mercy)
+    AdminKill,
+    /// Run an admin action by its id (the admin_actions map key)
+    AdminRun { id: String },
+    /// Show PIDs currently running in the admin_actions cgroup
+    AdminPs,
+
+    /// Utilities for generating/verifying htpasswd-style bcrypt entries (local; no daemon needed)
+    Password {
+        #[command(subcommand)]
+        cmd: PasswordCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PasswordCmd {
+    /// Generate an htpasswd-style entry: `user:$2b$...`
+    Generate {
+        /// Username to embed before the hash (left side of `user:hash`)
+        #[arg(long = "user")]
+        user: String,
+
+        /// Password to hash.
+        ///
+        /// If you pass `--password` with no value, pmctl reads the password from stdin.
+        #[arg(long = "password", num_args = 0..=1, default_missing_value = "-")]
+        password: String,
+    },
+
+    /// Verify a username+password against a `user:$2x$...` entry (exit 0 on success, 1 on failure).
+    Verify {
+        /// The full htpasswd-style entry (username + bcrypt hash), e.g. `hello:$2b$10$...`
+        #[arg(long = "secure")]
+        secure: String,
+
+        /// Username to verify
+        #[arg(long = "user")]
+        user: String,
+
+        /// Password to verify.
+        ///
+        /// If you pass `--password` with no value, pmctl reads the password from stdin.
+        #[arg(long = "password", num_args = 0..=1, default_missing_value = "-")]
+        password: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum OutputFormat {
+    Text,
+    Json,
 }
 
 fn resolve_sock(args: &PmctlArgs) -> anyhow::Result<PathBuf> {
@@ -54,25 +190,16 @@ impl fmt::Display for MissingSockHelp {
     }
 }
 
-/// Constant-time string comparison, so a mismatch cannot be narrowed byte-by-byte
-/// by timing. Length is not treated as secret.
-fn ct_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
 
 pub fn run() -> anyhow::Result<()> {
     let args = PmctlArgs::parse();
-    if matches!(&args.cmd, Some(cli::Cmd::Version)) {
+    if matches!(&args.cmd, Some(Cmd::Version)) {
         println!("{}", crate::pm::build_info::banner());
         return Ok(());
     }
 
     // Local-only utilities (no daemon socket required).
-    if let Some(cli::Cmd::Password { cmd }) = &args.cmd {
+    if let Some(Cmd::Password { cmd }) = &args.cmd {
         /// Resolve a password argument.
         ///
         /// `-` reads one line from stdin, with terminal echo disabled when stdin is a
@@ -127,7 +254,7 @@ pub fn run() -> anyhow::Result<()> {
         }
 
         match cmd {
-            cli::PasswordCmd::Generate { user, password } => {
+            PasswordCmd::Generate { user, password } => {
                 let user = user.trim();
                 anyhow::ensure!(!user.is_empty(), "user must not be empty");
                 anyhow::ensure!(!user.contains(':'), "user must not contain ':'");
@@ -136,7 +263,7 @@ pub fn run() -> anyhow::Result<()> {
                 println!("{user}:{hash}");
                 return Ok(());
             }
-            cli::PasswordCmd::Verify {
+            PasswordCmd::Verify {
                 secure,
                 user,
                 password,
@@ -163,7 +290,7 @@ pub fn run() -> anyhow::Result<()> {
                 // different amounts of time, which enumerates valid usernames for
                 // anyone who can invoke or time this command.
                 let hash_ok = bcrypt::verify(pass, &normalized_hash).unwrap_or(false);
-                let user_ok = ct_eq(user_t, secure_user);
+                let user_ok = crate::pm::consttime::ct_eq(user_t, secure_user);
                 if user_ok && hash_ok {
                     println!("OK");
                     return Ok(());
@@ -176,21 +303,21 @@ pub fn run() -> anyhow::Result<()> {
 
     let sock = resolve_sock(&args)?;
 
-    let cmd = args.cmd.unwrap_or(cli::Cmd::Status {
+    let cmd = args.cmd.unwrap_or(Cmd::Status {
         name: None,
-        format: cli::OutputFormat::Text,
+        format: OutputFormat::Text,
     });
 
     match cmd {
-        cli::Cmd::ServerVersion => {
+        Cmd::ServerVersion => {
             let resp = rpc::client_call(&sock, rpc::Request::ServerVersion)?;
             if !resp.message.trim().is_empty() {
                 println!("{}", resp.message.trim_end());
             }
             Ok(())
         }
-        cli::Cmd::Password { .. } => unreachable!("handled before sock resolution"),
-        cli::Cmd::PerfMetrics {
+        Cmd::Password { .. } => unreachable!("handled before sock resolution"),
+        Cmd::PerfMetrics {
             name,
             interval_ms,
             once,
@@ -519,7 +646,7 @@ pub fn run() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        cli::Cmd::Update => {
+        Cmd::Update => {
             let resp = rpc::client_call(&sock, rpc::Request::Update)?;
             if !resp.message.trim().is_empty() {
                 println!("{}", resp.message.trim_end());
@@ -529,28 +656,28 @@ pub fn run() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        cli::Cmd::Start { name, force } => {
+        Cmd::Start { name, force } => {
             let resp = rpc::client_call(&sock, rpc::Request::Start { name, force })?;
             if !resp.message.trim().is_empty() {
                 println!("{}", resp.message.trim_end());
             }
             Ok(())
         }
-        cli::Cmd::Stop { name } => {
+        Cmd::Stop { name } => {
             let resp = rpc::client_call(&sock, rpc::Request::Stop { name })?;
             if !resp.message.trim().is_empty() {
                 println!("{}", resp.message.trim_end());
             }
             Ok(())
         }
-        cli::Cmd::Restart { name, force } => {
+        Cmd::Restart { name, force } => {
             let resp = rpc::client_call(&sock, rpc::Request::Restart { name, force })?;
             if !resp.message.trim().is_empty() {
                 println!("{}", resp.message.trim_end());
             }
             Ok(())
         }
-        cli::Cmd::Flag { name, flags, ttl } => {
+        Cmd::Flag { name, flags, ttl } => {
             let flags: Vec<String> = flags
                 .split(',')
                 .map(|s| s.trim().to_ascii_lowercase())
@@ -563,7 +690,7 @@ pub fn run() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        cli::Cmd::Unflag { name, flags } => {
+        Cmd::Unflag { name, flags } => {
             let flags: Vec<String> = flags
                 .split(',')
                 .map(|s| s.trim().to_ascii_lowercase())
@@ -576,21 +703,21 @@ pub fn run() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        cli::Cmd::Enable { name } => {
+        Cmd::Enable { name } => {
             let resp = rpc::client_call(&sock, rpc::Request::Enable { name })?;
             if !resp.message.trim().is_empty() {
                 println!("{}", resp.message.trim_end());
             }
             Ok(())
         }
-        cli::Cmd::Disable { name } => {
+        Cmd::Disable { name } => {
             let resp = rpc::client_call(&sock, rpc::Request::Disable { name })?;
             if !resp.message.trim().is_empty() {
                 println!("{}", resp.message.trim_end());
             }
             Ok(())
         }
-        cli::Cmd::Logs { name, n, f } => {
+        Cmd::Logs { name, n, f } => {
             if f.is_some() {
                 let filename = f.and_then(|s| {
                     let t = s.trim().to_string();
@@ -615,18 +742,18 @@ pub fn run() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        cli::Cmd::Status { name, format } => {
+        Cmd::Status { name, format } => {
             let resp = rpc::client_call(&sock, rpc::Request::Status { name })?;
             match format {
-                cli::OutputFormat::Text => println!("{}", resp.render_text()),
-                cli::OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
+                OutputFormat::Text => println!("{}", resp.render_text()),
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
             }
             Ok(())
         }
-        cli::Cmd::Events { name, n, format } => {
+        Cmd::Events { name, n, format } => {
             let resp = rpc::client_call(&sock, rpc::Request::Events { name, n })?;
             match format {
-                cli::OutputFormat::Text => {
+                OutputFormat::Text => {
                     let tty = std::io::stdout().is_terminal();
                     for e in resp.events {
                         let line = if let Some(app) = e.app {
@@ -638,13 +765,13 @@ pub fn run() -> anyhow::Result<()> {
                     }
                     Ok(())
                 }
-                cli::OutputFormat::Json => {
+                OutputFormat::Json => {
                     println!("{}", serde_json::to_string_pretty(&resp)?);
                     Ok(())
                 }
             }
         }
-        cli::Cmd::AdminList => {
+        Cmd::AdminList => {
             let resp = rpc::client_call(&sock, rpc::Request::AdminList)?;
             if resp.admin_actions.is_empty() {
                 println!("(no admin actions configured)");
@@ -655,28 +782,28 @@ pub fn run() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        cli::Cmd::AdminKill => {
+        Cmd::AdminKill => {
             let resp = rpc::client_call(&sock, rpc::Request::AdminKill)?;
             if !resp.message.trim().is_empty() {
                 println!("{}", resp.message.trim_end());
             }
             Ok(())
         }
-        cli::Cmd::AdminRun { id } => {
+        Cmd::AdminRun { id } => {
             let resp = rpc::client_call(&sock, rpc::Request::AdminAction { name: id })?;
             if !resp.message.trim().is_empty() {
                 println!("{}", resp.message.trim_end());
             }
             Ok(())
         }
-        cli::Cmd::AdminPs => {
+        Cmd::AdminPs => {
             let resp = rpc::client_call(&sock, rpc::Request::AdminPs)?;
             if !resp.message.trim().is_empty() {
                 println!("{}", resp.message.trim_end());
             }
             Ok(())
         }
-        cli::Cmd::Version => unreachable!("handled before sock resolution"),
+        Cmd::Version => unreachable!("handled before sock resolution"),
     }
 }
 
@@ -777,17 +904,6 @@ fn sgr_len(s: &str) -> Option<usize> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn ct_eq_matches_ordinary_equality() {
-        assert!(ct_eq("", ""));
-        assert!(ct_eq("admin", "admin"));
-        assert!(!ct_eq("admin", "admln"));
-        assert!(!ct_eq("admin", "admi"));
-        assert!(!ct_eq("", "a"));
-        // A difference in the last byte must be caught as reliably as the first.
-        assert!(!ct_eq("aaaaaaaaZ", "aaaaaaaaY"));
-        assert!(!ct_eq("Zaaaaaaaa", "Yaaaaaaaa"));
-    }
 
     #[test]
     fn terminal_output_keeps_colour_and_whitespace() {
