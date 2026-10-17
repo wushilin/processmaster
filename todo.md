@@ -1,41 +1,33 @@
 # TODO
 
-Pending items from the 2026-10-17 code review (its fixes landed in the commit that
-added this file).
+Pending items from the 2026-10-17 code review.
 
-## Decisions needed
+## Decided
 
-- [ ] **Default for `resources.max_pids`.** Added as opt-in (unset = unlimited) so no
-      existing service changes. Decide whether services should get a default cap.
-- [ ] **Repo hygiene.** Personal/test files are tracked: `.sync` (OSS upload targets),
-      `conf.d/` (test scripts, `failure1.YmL`), root `config.yaml` and `run.sh`. Move to
-      `examples/`, gitignore, or keep.
-- [ ] **`issues.md`.** A dated audit that reads as current. Mark items done, or move it
-      to `docs/`.
+- `resources.max_pids` stays opt-in: `pids.max` counts threads, so a global default
+  could break thread-heavy services, and a cap on the master cgroup would also starve
+  the daemon, which lives inside it. Set it per service, sized from `pids.peak`.
+- Repo hygiene: `.sync` is untracked (kept locally, gitignored). Root `config.yaml`
+  (tested default), `run.sh` (documented launcher) and `conf.d/` (demo services) stay.
+- `issues.md` removed; it remains in git history.
 
-## Task management
+## Optional
 
-- [ ] **Event-driven cgroup waiter.** Each running service holds a blocking OS thread in
-      `cgroup::wait_all_cancellable`, which rescans the whole cgroup tree after every pid
-      exit (CPU grows with a service's fork churn), and a cancelled waiter lingers up to
-      5s (`CANCEL_POLL_MS`). Waiting on `cgroup.events` (`populated 0`) via poll/epoll
-      would need one thread for all services. See A8 in `issues.md`.
-- [ ] **Lock-poisoning policy.** `DaemonState` is locked with `map_err(..)?` in some
-      places (any panic under the lock then fails those RPCs forever) and
-      `unwrap_or_else(|p| p.into_inner())` in others. Pick one; recovering is the better
-      fit for a supervisor.
-- [ ] **Stop latency.** The grace loop in `stop_common` (`daemon/process.rs`) polls once
-      a second, so every stop takes at least ~1s. Poll faster (e.g. 50–100ms) or wait on
-      the cgroup.
-- [ ] **Cron process-waiter spawn failure.** If `spawn_process_waiter` fails (thread
-      creation), `Supervisor::attach_process_waiter` still marks the waiter running, so
-      that run's exit is never observed. Fall back to the cgroup waiter.
+- [ ] Clippy reports ~60 style-only warnings (mostly collapsible `if`s), nearly all
+      older than this review.
 
-## Follow-ups from the refactor
+## Done
 
-- [ ] `web_console/mod.rs` is still ~2.7k lines, mostly the `jsonrpc` handler (~400
-      lines) and tests. Split the console-only RPC methods out.
-- [ ] `start_enabled_services_async` (boot) spawns every service at once; it could
-      reuse `fan_out` like the other bulk operations.
-- [ ] The log pump's mid-stream write-error path shares code with the tested
-      open-failure path but has no direct test (hard to simulate ENOSPC without root).
+- [x] Console `systemd_list` timeout raised from 3s to 10s (a slow first listing failed).
+- [x] Event-driven cgroup waiter: async watch on `cgroup.events` (`populated`), no
+      thread per service; the pidfd thread waiter remains as a fallback.
+- [x] Lock poisoning: every lock recovers (`unwrap_or_else(|p| p.into_inner())`),
+      including the schedulers (used to stop firing) and the console's login throttle
+      (used to stop throttling).
+- [x] Stop latency: grace loop polls every 50ms (stop/restart ~90ms instead of ≥1s).
+- [x] Cron process-waiter spawn failure falls back to the cgroup waiter.
+- [x] Console-only RPC methods moved to `web_console/console_rpc.rs`.
+- [x] Boot autostart bounded through `fan_out` (32 at a time).
+- [x] Tests: `fan_out` panic, `max_pids` reset, and a root scenario that fills a
+      tmpfs log directory (the service must survive; fails against the old pump).
+- [x] Log pump logs only failure/recovery transitions, under the configured path.

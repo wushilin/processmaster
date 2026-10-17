@@ -9,3 +9,6 @@ appstate.json
 ca.pem
 server.pem
 server.key
+
+# Personal deploy commands (local only).
+.sync
