@@ -79,6 +79,7 @@ resources:                          # optional cgroup limits for this app
   max_cpu: 500m                     # "500m" or "1.5" (cores)
   max_memory: 256MiB
   max_swap: 0                       # 0 = no swap for this app
+  max_pids: 512                     # cap on processes+threads; omit = unlimited
 restart_policy:
   policy: always                    # "always" | "never"
   restart_backoff_ms: 1000

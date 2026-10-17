@@ -88,6 +88,7 @@ resources:
   max_cpu: 100m
   max_memory: 64MiB
   max_swap: 0
+  max_pids: 512           # cap on processes+threads (cgroup pids.max); contains fork bombs
 
 # Restart policy (mutually exclusive with process.schedule).
 restart_policy:

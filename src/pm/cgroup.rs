@@ -1,5 +1,12 @@
+//! Minimal cgroup-v2 helpers: process launching, cgroup membership, resource limits
+//! and kill/wait primitives.
+//!
+//! This module owns the privilege drop for every supervised process (see
+//! `build_command`), so changes here are security-sensitive.
+
 #![allow(dead_code)]
 
+use crate::pm::config::MasterConfig;
 use anyhow::Context as _;
 use nix::errno::Errno;
 use nix::sys::signal::{kill as kill_pid, Signal};
@@ -20,18 +27,31 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs as tokio_fs;
 use tokio::task;
 
-/// Minimal cgroup-v2 helpers: process launching, cgroup membership, resource limits
-/// and kill/wait primitives.
-///
-/// This module owns the privilege drop for every supervised process (see
-/// `build_command`), so changes here are security-sensitive.
-
 /// Write `content` to a cgroup control file.
 ///
 /// The `io::Error` is attached as the error *source* rather than being formatted into
 /// a string, so callers can still recover the errno with
 /// `downcast_ref::<io::Error>()` — several fail-safe branches depend on distinguishing
 /// `NotFound` (cgroup already gone) from a real failure.
+/// `<cgroup_root>/<cgroup_name>`: the parent of every cgroup processmaster manages.
+/// `cgroup_name` is checked by `config::validate_cgroup_name` when the config is loaded.
+/// The leading '/' is stripped because `join` with an absolute path would *replace* the
+/// root, putting app cgroups on the root filesystem.
+pub(crate) fn master_dir(cfg: &MasterConfig) -> PathBuf {
+    PathBuf::from(&cfg.cgroup_root).join(cfg.cgroup_name.trim().trim_start_matches('/'))
+}
+
+/// A service's cgroup. Prefixed so app names cannot collide with reserved or system cgroup
+/// names (e.g. "failure"); the caller is responsible for `app` being a valid service name.
+pub(crate) fn app_dir(cfg: &MasterConfig, app: &str) -> PathBuf {
+    master_dir(cfg).join(format!("pm-{app}"))
+}
+
+/// Parent of the per-action cgroups that admin actions run in.
+pub(crate) fn admin_actions_dir(cfg: &MasterConfig) -> PathBuf {
+    master_dir(cfg).join("admin_actions")
+}
+
 fn write_file(path: &Path, content: &str) -> anyhow::Result<()> {
     let mut f = fs::OpenOptions::new()
         .write(true)
@@ -386,6 +406,67 @@ pub(crate) fn wait_all_cancellable(cgroup_dir: &Path, cancel: &AtomicBool) -> an
     }
 }
 
+/// Watches a cgroup's `cgroup.events` for its `populated` flag dropping to 0, which the
+/// kernel sets once no process is left anywhere in the cgroup's subtree.
+///
+/// The kernel signals every change to that file as a priority event on the open file,
+/// so this waits in the async runtime without a thread per service and without
+/// rescanning the tree each time one of the service's processes exits.
+pub(crate) struct PopulatedWatch {
+    fd: tokio::io::unix::AsyncFd<std::fs::File>,
+}
+
+impl PopulatedWatch {
+    /// Opens the watch. `NotFound` means the cgroup does not exist (nothing to wait for).
+    /// Must be called inside the Tokio runtime.
+    pub(crate) fn open(cgroup_dir: &Path) -> io::Result<Self> {
+        let f = std::fs::File::open(cgroup_dir.join("cgroup.events"))?;
+        // Registering before the first read means a change between that read and the
+        // wait still leaves the fd ready: no exit can slip through unobserved.
+        let fd = tokio::io::unix::AsyncFd::with_interest(f, tokio::io::Interest::PRIORITY)?;
+        Ok(PopulatedWatch { fd })
+    }
+
+    /// Resolves once the cgroup is empty (or removed).
+    pub(crate) async fn wait_empty(&self) -> anyhow::Result<()> {
+        // Belt and braces: re-read now and then even without an event.
+        const RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
+        loop {
+            if !self.populated()? {
+                return Ok(());
+            }
+            tokio::select! {
+                ready = self.fd.ready(tokio::io::Interest::PRIORITY) => ready?.clear_ready(),
+                _ = tokio::time::sleep(RECHECK) => {}
+            }
+        }
+    }
+
+    /// Reads `populated` afresh (rereading also re-arms the kernel's change notification).
+    fn populated(&self) -> anyhow::Result<bool> {
+        use std::io::{Read as _, Seek as _};
+        let mut f = self.fd.get_ref();
+        let mut buf = String::new();
+        match f.seek(io::SeekFrom::Start(0)).and_then(|_| f.read_to_string(&mut buf)) {
+            Ok(_) => {}
+            // The cgroup was removed while we watched it: nothing can be left in it.
+            Err(e) if e.raw_os_error() == Some(libc::ENODEV) || e.kind() == io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(e) => return Err(e).context("read cgroup.events"),
+        }
+        parse_populated(&buf).ok_or_else(|| anyhow::anyhow!("cgroup.events has no populated line: {buf:?}"))
+    }
+}
+
+fn parse_populated(events: &str) -> Option<bool> {
+    events.lines().find_map(|l| match l.trim().strip_prefix("populated ")? {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    })
+}
+
 /// Owning wrapper for a `pidfd`, so it is closed on every path out of a scope.
 struct OwnedPidFd(RawFd);
 
@@ -399,6 +480,7 @@ impl Drop for OwnedPidFd {
 }
 
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub(crate) struct Resources {
     /// cgroup v2 `cpu.max` payload, e.g. `"max 100000"` or `"20000 100000"`.
     pub(crate) cpu_max: Option<String>,
@@ -406,6 +488,8 @@ pub(crate) struct Resources {
     pub(crate) memory_max: Option<String>,
     /// cgroup v2 `memory.swap.max` payload, e.g. `"max"` or `"0"`.
     pub(crate) swap_max: Option<String>,
+    /// cgroup v2 `pids.max`; `None` means unlimited.
+    pub(crate) pids_max: Option<u64>,
     /// cgroup v2 `cpu.weight` (1..=10000).
     pub(crate) cpu_weight: Option<u16>,
     /// cgroup v2 `io.weight` default weight (1..=10000). Written as `default <n>`.
@@ -414,18 +498,6 @@ pub(crate) struct Resources {
     pub(crate) io_max: Vec<String>,
 }
 
-impl Default for Resources {
-    fn default() -> Self {
-        Self {
-            cpu_max: None,
-            memory_max: None,
-            swap_max: None,
-            cpu_weight: None,
-            io_weight: None,
-            io_max: Vec::new(),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct LaunchParams {
@@ -480,6 +552,17 @@ fn apply_resources(cgroup_dir: &Path, res: &Resources) -> anyhow::Result<()> {
     if let Some(v) = &res.swap_max {
         write_file(&cgroup_dir.join("memory.swap.max"), &format!("{v}\n"))
             .with_context(|| format!("set memory.swap.max for {}", cgroup_dir.display()))?;
+    }
+    let pids_max = cgroup_dir.join("pids.max");
+    match res.pids_max {
+        Some(v) => write_file(&pids_max, &format!("{v}\n"))
+            .with_context(|| format!("set pids.max for {}", cgroup_dir.display()))?,
+        // The cgroup outlives a definition change: lift a limit that was removed. Best
+        // effort, since the pids controller may not be delegated where none is wanted.
+        None if pids_max.exists() => {
+            let _ = write_file(&pids_max, "max\n");
+        }
+        None => {}
     }
     if let Some(v) = res.cpu_weight {
         write_file(&cgroup_dir.join("cpu.weight"), &format!("{v}\n"))
@@ -954,7 +1037,7 @@ pub(crate) fn read_resource_snapshot(cgroup_dir: &Path) -> anyhow::Result<Cgroup
     let cpu_max = read_trimmed_opt(&cgroup_dir.join("cpu.max"))?;
     let cpu_stat = read_to_string_opt(&cgroup_dir.join("cpu.stat"))?
         .map(|s| parse_kv_u64_lines(&s))
-        .or_else(|| None);
+        .or(None);
 
     let cpu_pressure = parse_pressure_opt(read_to_string_opt(&cgroup_dir.join("cpu.pressure"))?);
     let memory_pressure =
@@ -989,6 +1072,35 @@ pub(crate) fn read_resource_snapshot(cgroup_dir: &Path) -> anyhow::Result<Cgroup
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A cgroup outlives a definition change, so dropping `max_pids` from a service must
+    // lift the old cap; where the pids controller is absent nothing is written at all.
+    #[test]
+    fn removing_max_pids_lifts_the_limit() {
+        let dir = std::env::temp_dir().join(format!("pm-cg-pids-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("pids.max");
+        fs::write(&file, "16\n").unwrap();
+
+        apply_resources(&dir, &Resources { pids_max: Some(32), ..Default::default() }).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "32\n");
+        apply_resources(&dir, &Resources::default()).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "max\n");
+
+        fs::remove_file(&file).unwrap();
+        apply_resources(&dir, &Resources::default()).unwrap();
+        assert!(!file.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn populated_is_read_from_cgroup_events() {
+        assert_eq!(parse_populated("populated 1\nfrozen 0\n"), Some(true));
+        assert_eq!(parse_populated("populated 0\nfrozen 0\n"), Some(false));
+        assert_eq!(parse_populated("frozen 0\npopulated 0\n"), Some(false));
+        assert_eq!(parse_populated("frozen 0\n"), None);
+        assert_eq!(parse_populated("populated x\n"), None);
+    }
 
     #[test]
     fn io_not_found_is_detected_through_context_layers() {

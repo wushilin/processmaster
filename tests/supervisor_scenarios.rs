@@ -34,11 +34,12 @@ struct Service {
     policy: &'static str,
     max_restarts: usize,
     stop_grace_period_ms: u64,
+    max_pids: Option<u64>,
 }
 
 impl Service {
     fn new(script: &'static str) -> Self {
-        Service { script, policy: "always", max_restarts: 50, stop_grace_period_ms: 2_000 }
+        Service { script, policy: "always", max_restarts: 50, stop_grace_period_ms: 2_000, max_pids: None }
     }
     fn policy(mut self, p: &'static str) -> Self {
         self.policy = p;
@@ -50,6 +51,10 @@ impl Service {
     }
     fn grace_ms(mut self, ms: u64) -> Self {
         self.stop_grace_period_ms = ms;
+        self
+    }
+    fn max_pids(mut self, n: u64) -> Self {
+        self.max_pids = Some(n);
         self
     }
 }
@@ -99,13 +104,14 @@ impl Harness {
         } else {
             String::new()
         };
+        let resources = svc.max_pids.map(|n| format!("resources:\n  max_pids: {n}\n")).unwrap_or_default();
         write_trusted(
             &dir.join("conf.d").join(format!("{APP}.yaml")),
             &format!(
                 "application: {APP}\n\
                  process:\n  working_directory: {}\n  start_command: [\"/bin/sh\", \"-c\", {script}]\n  \
                  stop_grace_period_ms: {}\n\
-                 restart_policy:\n  policy: {}\n{tolerance}",
+                 restart_policy:\n  policy: {}\n{tolerance}{resources}",
                 work.display(),
                 svc.stop_grace_period_ms,
                 svc.policy,
@@ -354,6 +360,58 @@ fn fan_out_children_are_all_tracked_and_all_killed() {
     h.stop();
     h.wait_for("every child to die", Duration::from_secs(15), || kids.iter().all(|&p| !pid_alive(p)));
     h.wait_for("an empty cgroup", Duration::from_secs(5), || h.status().pids.is_empty());
+}
+
+/// `max_pids` holds a fork bomb to its own cgroup: forks past the cap fail inside the
+/// service, the daemon is unaffected, and the service still stops cleanly.
+#[test]
+#[ignore = "needs root + cgroup v2"]
+fn max_pids_contains_a_fork_bomb() {
+    // The shell may give up once fork starts failing; the sleepers it did start remain.
+    let h = Harness::start(Service::new("for i in $(seq 1 64); do sleep 300 & done; wait").max_pids(16));
+    let limit = std::fs::read_to_string(h.cgroup.join(format!("pm-{APP}")).join("pids.max")).unwrap();
+    assert_eq!(limit.trim(), "16");
+    h.wait_for("the service to reach its cap", Duration::from_secs(10), || h.status().pids.len() >= 12);
+    std::thread::sleep(Duration::from_millis(500));
+    let pids = h.status().pids.len();
+    assert!(pids <= 16, "expected the cap to hold, got {pids} pids");
+
+    h.stop();
+    h.wait_for("an empty cgroup", Duration::from_secs(10), || h.status().pids.is_empty());
+}
+
+/// A full log filesystem must not kill the service. The log pump used to give up on the
+/// first failed write and close the pipe, so the service died of SIGPIPE on its next
+/// write; on a shared disk one chatty service took every service down with it.
+#[test]
+#[ignore = "needs root + cgroup v2"]
+fn full_log_disk_does_not_kill_the_service() {
+    let h = Harness::start(Service::new("exec yes processmaster-fills-the-disk"));
+    // A tiny filesystem over the log directory. Restart so the new pump opens its log
+    // there; the guard unmounts before the harness removes the directory.
+    let logs = h.work().join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let ok = Command::new("mount").args(["-t", "tmpfs", "-o", "size=256k", "tmpfs"]).arg(&logs).status().unwrap();
+    assert!(ok.success(), "mount tmpfs");
+    struct Unmount(PathBuf);
+    impl Drop for Unmount {
+        fn drop(&mut self) {
+            let _ = Command::new("umount").arg("-l").arg(&self.0).status();
+        }
+    }
+    let _unmount = Unmount(logs.clone());
+    let r = h.call(Request::Restart { name: APP.to_string(), force: false });
+    assert!(r.ok, "restart: {}", r.message);
+
+    h.wait_for("the log filesystem to fill up", Duration::from_secs(10), || {
+        std::fs::metadata(logs.join("stdout.log")).map(|m| m.len() >= 200 * 1024).unwrap_or(false)
+    });
+    let pid = h.status().pids.first().copied().expect("service running");
+    std::thread::sleep(Duration::from_secs(2));
+    let st = h.status();
+    assert_eq!(st.actual, "RUNNING");
+    assert_eq!(st.pids.first().copied(), Some(pid), "the service was restarted: {st:?}");
+    assert_eq!(st.restarts_10m, 0, "the service crashed: {st:?}");
 }
 
 /// Output on both streams is captured by the log pumps and served by `logs`.

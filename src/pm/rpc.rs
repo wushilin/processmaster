@@ -151,7 +151,7 @@ pub struct StatusEntry {
     pub schedule_max_time_per_run_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Response {
     pub ok: bool,
     #[serde(default)]
@@ -234,6 +234,11 @@ pub struct AdminActionInfo {
 }
 
 impl Response {
+    /// A plain reply: just the outcome and a human-readable message.
+    pub fn message(ok: bool, message: impl Into<String>) -> Self {
+        Response { ok, message: message.into(), ..Default::default() }
+    }
+
     pub fn render_text(&self) -> String {
         if !self.message.is_empty() && self.statuses.is_empty() {
             return self.message.clone();
@@ -353,8 +358,7 @@ impl Response {
             let _ = height; // (for readability: height is the number of ASCII rows this service occupies)
 
             let up0 = s
-                .pid_uptimes_ms
-                .get(0)
+                .pid_uptimes_ms.first()
                 .copied()
                 .map(fmt_uptime_ms)
                 .unwrap_or_else(|| "-".to_string());
