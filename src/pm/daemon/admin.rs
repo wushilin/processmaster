@@ -27,7 +27,7 @@ pub(crate) fn admin_action_pids_by_id(cfg: &MasterConfig) -> anyhow::Result<Vec<
 
 pub(super) fn do_admin_ps(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Response> {
     let cfg = {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
         st.cfg.clone()
     };
     let running = admin_action_pids_by_id(&cfg)?;
@@ -45,7 +45,7 @@ pub(super) fn do_admin_ps(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Res
 
 pub(super) fn do_admin_list(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Response> {
     let actions = {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
         st.cfg
             .admin_actions
             .iter()
@@ -65,7 +65,7 @@ pub(super) fn do_admin_list(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<R
 
 pub(super) fn do_admin_kill(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Response> {
     let cfg = {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
         st.cfg.clone()
     };
     let cg = cgroup::admin_actions_dir(&cfg);
@@ -91,7 +91,7 @@ pub(super) async fn do_admin_action_async(state: &Arc<Mutex<DaemonState>>, name:
     }
 
     let (label, argv, cfg) = {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
         match st.cfg.admin_actions.get(name) {
             Some(a) => (
                 a.label.clone().unwrap_or_else(|| name.to_string()),

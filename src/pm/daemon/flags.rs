@@ -442,8 +442,9 @@ pub(super) fn start_flag_maintenance_thread(state: Arc<Mutex<DaemonState>>) {
         loop {
             if state
                 .lock()
-                .map(|st| st.shutting_down.load(Ordering::Relaxed))
-                .unwrap_or(true)
+                .unwrap_or_else(|p| p.into_inner())
+                .shutting_down
+                .load(Ordering::Relaxed)
             {
                 break;
             }

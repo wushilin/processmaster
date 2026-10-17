@@ -21,9 +21,7 @@ pub(super) fn disowned_pids() -> &'static Mutex<std::collections::HashSet<i32>> 
 
 /// Hand a pid to the reaper. Call this immediately after dropping a `Child` handle.
 pub(super) fn disown_child_pid(pid: u32) {
-    if let Ok(mut set) = disowned_pids().lock() {
-        set.insert(pid as i32);
-    }
+    disowned_pids().lock().unwrap_or_else(|p| p.into_inner()).insert(pid as i32);
 }
 
 /// Give up the `Child` handle of a freshly spawned (non-scheduled) service and hand
@@ -53,10 +51,8 @@ pub(super) fn start_child_reaper_thread() {
         .name("pm-child-reaper".to_string())
         .spawn(move || loop {
             // Snapshot so the lock is not held across waitpid.
-            let pending: Vec<i32> = match disowned_pids().lock() {
-                Ok(set) => set.iter().copied().collect(),
-                Err(_) => Vec::new(),
-            };
+            let pending: Vec<i32> =
+                disowned_pids().lock().unwrap_or_else(|p| p.into_inner()).iter().copied().collect();
             let mut done: Vec<i32> = Vec::new();
             for pid in pending {
                 match waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)) {
@@ -67,10 +63,9 @@ pub(super) fn start_child_reaper_thread() {
                 }
             }
             if !done.is_empty() {
-                if let Ok(mut set) = disowned_pids().lock() {
-                    for pid in done {
-                        set.remove(&pid);
-                    }
+                let mut set = disowned_pids().lock().unwrap_or_else(|p| p.into_inner());
+                for pid in done {
+                    set.remove(&pid);
                 }
             }
             std::thread::sleep(Duration::from_millis(500));

@@ -463,7 +463,7 @@ fn start_signal_listener_async(flag: Arc<AtomicBool>) {
 async fn graceful_shutdown_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<()> {
     // Best-effort stop all services so we don't leave processes with broken stdout/stderr pipes.
     let (sock, cfg, shutting_down) = {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
         (st.cfg.sock.clone(), st.cfg.clone(), Arc::clone(&st.shutting_down))
     };
     shutting_down.store(true, Ordering::Relaxed);
@@ -589,8 +589,9 @@ fn start_task_stats_reporter(state: Arc<Mutex<DaemonState>>) {
             // If shutting down, stop reporting.
             if state
                 .lock()
-                .map(|st| st.shutting_down.load(Ordering::Relaxed))
-                .unwrap_or(true)
+                .unwrap_or_else(|p| p.into_inner())
+                .shutting_down
+                .load(Ordering::Relaxed)
             {
                 break;
             }
@@ -1031,6 +1032,31 @@ mod tests {
         );
         crate::pm::app::parse_app_definition_yaml(&yaml, &workdir.join("provtest.yaml"), None, None)
             .expect("parse test def")
+    }
+
+    // Regression: a panicked task in a bulk operation used to vanish from the reply and
+    // leave its slot unfilled, so every target queued behind it was silently skipped.
+    #[tokio::test]
+    async fn fan_out_reports_a_panic_and_still_runs_every_target() {
+        let targets: Vec<String> = (0..40).map(|i| format!("t{i:02}")).collect();
+        let results = fan_out(targets.clone(), 4, |t| async move {
+            if t == "t03" {
+                panic!("boom");
+            }
+            Ok(t)
+        })
+        .await;
+        assert_eq!(results.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>(), targets);
+        for (t, r) in &results {
+            match r {
+                Ok(v) => assert_eq!(v, t),
+                Err(e) => {
+                    assert_eq!(t, "t03");
+                    assert!(format!("{e}").contains("panic"), "{e}");
+                }
+            }
+        }
+        assert_eq!(results.iter().filter(|(_, r)| r.is_err()).count(), 1);
     }
 
     // Regression: a log that cannot be written used to end the pump, dropping the pipe's

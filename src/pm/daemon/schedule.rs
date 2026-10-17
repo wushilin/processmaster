@@ -11,8 +11,9 @@ pub(super) fn start_scheduler_thread(state: Arc<Mutex<DaemonState>>) {
             // Do not start cron jobs while shutting down.
             if state
                 .lock()
-                .map(|st| st.shutting_down.load(Ordering::Relaxed))
-                .unwrap_or(true)
+                .unwrap_or_else(|p| p.into_inner())
+                .shutting_down
+                .load(Ordering::Relaxed)
             {
                 pm_event("schedule", None, "exit reason=shutting_down");
                 break;
@@ -22,8 +23,9 @@ pub(super) fn start_scheduler_thread(state: Arc<Mutex<DaemonState>>) {
             loop {
                 if state
                     .lock()
-                    .map(|st| st.shutting_down.load(Ordering::Relaxed))
-                    .unwrap_or(true)
+                    .unwrap_or_else(|p| p.into_inner())
+                    .shutting_down
+                    .load(Ordering::Relaxed)
                 {
                     pm_event("schedule", None, "exit reason=shutting_down");
                     return;
@@ -56,8 +58,9 @@ pub(super) fn start_scheduler_thread(state: Arc<Mutex<DaemonState>>) {
             for (name, def) in defs {
                 if state
                     .lock()
-                    .map(|st| st.shutting_down.load(Ordering::Relaxed))
-                    .unwrap_or(true)
+                    .unwrap_or_else(|p| p.into_inner())
+                    .shutting_down
+                    .load(Ordering::Relaxed)
                 {
                     pm_event("schedule", None, "exit reason=shutting_down");
                     return;
@@ -141,8 +144,9 @@ pub(super) fn start_overtime_scheduler_thread(state: Arc<Mutex<DaemonState>>) {
         loop {
             if state
                 .lock()
-                .map(|st| st.shutting_down.load(Ordering::Relaxed))
-                .unwrap_or(true)
+                .unwrap_or_else(|p| p.into_inner())
+                .shutting_down
+                .load(Ordering::Relaxed)
             {
                 pm_event("schedule", None, "overtime_monitor exit reason=shutting_down");
                 break;

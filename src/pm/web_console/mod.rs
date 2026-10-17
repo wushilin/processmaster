@@ -26,8 +26,10 @@ use std::time::{Duration, Instant};
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::process::Command;
 
+mod console_rpc;
 mod systemd;
 mod tls;
+use console_rpc::*;
 use systemd::*;
 use tls::*;
 
@@ -654,8 +656,8 @@ async fn basic_auth_middleware(
             let locked = st
                 .auth_throttle
                 .lock()
-                .ok()
-                .and_then(|t| t.check(key, Instant::now()));
+                .unwrap_or_else(|p| p.into_inner())
+                .check(key, Instant::now());
             if let Some(wait) = locked {
                 note_lockout(&st, &ip, wait);
                 return too_many_attempts(wait);
@@ -685,16 +687,16 @@ async fn basic_auth_middleware(
                     let locked = st
                         .auth_throttle
                         .lock()
-                        .ok()
-                        .and_then(|mut t| t.record_failure(key, Instant::now()));
+                        .unwrap_or_else(|p| p.into_inner())
+                        .record_failure(key, Instant::now());
                     if let Some(wait) = locked {
                         note_lockout(&st, &ip, wait);
                     }
                 }
                 st.auth_failures
                     .lock()
-                    .ok()
-                    .and_then(|mut l| l.note(&ip, Instant::now()))
+                    .unwrap_or_else(|p| p.into_inner())
+                    .note(&ip, Instant::now())
             } else {
                 None
             };
@@ -726,8 +728,8 @@ fn note_lockout(st: &WebState, ip: &str, wait: Duration) {
     let emit = st
         .auth_lockouts
         .lock()
-        .ok()
-        .and_then(|mut l| l.note(ip, Instant::now()));
+        .unwrap_or_else(|p| p.into_inner())
+        .note(ip, Instant::now());
     if let Some(suppressed) = emit {
         crate::pm::daemon::pm_event(
             "web",
@@ -1192,18 +1194,7 @@ async fn jsonrpc(
     Json(req): Json<JsonRpcRequest>,
 ) -> impl IntoResponse {
     if req.jsonrpc != "2.0" {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(JsonRpcResponse::<serde_json::Value> {
-                jsonrpc: "2.0",
-                id: req.id,
-                result: None,
-                error: Some(JsonRpcError {
-                    code: -32600,
-                    message: "invalid jsonrpc version".to_string(),
-                }),
-            }),
-        );
+        return rpc_error(StatusCode::BAD_REQUEST, req.id, -32600, "invalid jsonrpc version".to_string());
     }
 
     // Audit trail: record *who* asked for every state change, before doing it, so an
@@ -1222,361 +1213,34 @@ async fn jsonrpc(
         );
     }
 
-    // Web-console specific methods (not routed through daemon::dispatch_async), used for UX features.
-    // These return lightweight objects (ok/message/...) and can directly inspect daemon config/state.
-    match req.method.as_str() {
-        "service_details" => {
-            let app = req
-                .params
-                .get("app")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if app.is_empty() {
-                let v = serde_json::json!({ "ok": false, "message": "missing/empty param: app" });
-                return (
-                    StatusCode::OK,
-                    Json(JsonRpcResponse::<serde_json::Value> {
-                        jsonrpc: "2.0",
-                        id: req.id,
-                        result: Some(v),
-                        error: None,
-                    }),
-                );
-            }
-
-            let cfg = {
-                let st = st.daemon.lock().unwrap_or_else(|p| p.into_inner());
-                st.cfg.clone()
-            };
-
-            let cg_dir = match service_cgroup_dir(&cfg, &app) {
-                Ok(p) => p,
-                Err(e) => {
-                    let v = serde_json::json!({ "ok": false, "message": e.to_string() });
-                    return (
-                        StatusCode::OK,
-                        Json(JsonRpcResponse::<serde_json::Value> {
-                            jsonrpc: "2.0",
-                            id: req.id,
-                            result: Some(v),
-                            error: None,
-                        }),
-                    );
-                }
-            };
-
-            if let Err(e) = std::fs::metadata(&cg_dir) {
-                let v = serde_json::json!({
-                    "ok": false,
-                    "message": format!("cgroup dir not found: {}: {e}", cg_dir.display()),
-                    "app": app,
-                    "cgroup_dir": cg_dir.display().to_string(),
-                });
-                return (
-                    StatusCode::OK,
-                    Json(JsonRpcResponse::<serde_json::Value> {
-                        jsonrpc: "2.0",
-                        id: req.id,
-                        result: Some(v),
-                        error: None,
-                    }),
-                );
-            }
-
-            let snap = match cgroup::read_resource_snapshot(&cg_dir) {
-                Ok(s) => s,
-                Err(e) => {
-                    let v = serde_json::json!({
-                        "ok": false,
-                        "message": e.to_string(),
-                        "app": app,
-                        "cgroup_dir": cg_dir.display().to_string(),
-                    });
-                    return (
-                        StatusCode::OK,
-                        Json(JsonRpcResponse::<serde_json::Value> {
-                            jsonrpc: "2.0",
-                            id: req.id,
-                            result: Some(v),
-                            error: None,
-                        }),
-                    );
-                }
-            };
-
-            let v = serde_json::json!({
-                "ok": true,
-                "message": "",
-                "app": app,
-                "snapshot": snap,
-            });
-            return (
-                StatusCode::OK,
-                Json(JsonRpcResponse::<serde_json::Value> {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: Some(v),
-                    error: None,
-                }),
-            );
-        }
-        "systemd_list" => {
-            let resp = match systemd_list_services().await {
-                Ok(v) => serde_json::json!({ "ok": true, "message": "", "services": v }),
-                Err(e) => serde_json::json!({ "ok": false, "message": e.to_string(), "services": [] }),
-            };
-            return (
-                StatusCode::OK,
-                Json(JsonRpcResponse::<serde_json::Value> {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: Some(resp),
-                    error: None,
-                }),
-            );
-        }
-        "systemd_action" => {
-            let unit = req
-                .params
-                .get("unit")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let action = req
-                .params
-                .get("action")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if unit.is_empty() || action.is_empty() {
-                let v = serde_json::json!({ "ok": false, "message": "missing/empty params: unit/action" });
-                return (
-                    StatusCode::OK,
-                    Json(JsonRpcResponse::<serde_json::Value> {
-                        jsonrpc: "2.0",
-                        id: req.id,
-                        result: Some(v),
-                        error: None,
-                    }),
-                );
-            }
-            let resp = match systemd_action(&unit, &action).await {
-                Ok(msg) => serde_json::json!({ "ok": true, "message": msg }),
-                Err(e) => serde_json::json!({ "ok": false, "message": e.to_string() }),
-            };
-            return (
-                StatusCode::OK,
-                Json(JsonRpcResponse::<serde_json::Value> {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: Some(resp),
-                    error: None,
-                }),
-            );
-        }
-        "systemd_logs" => {
-            let unit = req
-                .params
-                .get("unit")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let n = req
-                .params
-                .get("n")
-                .and_then(|v| v.as_u64())
-                .map(|x| x as usize)
-                .unwrap_or(200);
-            if unit.is_empty() {
-                let v = serde_json::json!({ "ok": false, "message": "missing/empty param: unit" });
-                return (
-                    StatusCode::OK,
-                    Json(JsonRpcResponse::<serde_json::Value> {
-                        jsonrpc: "2.0",
-                        id: req.id,
-                        result: Some(v),
-                        error: None,
-                    }),
-                );
-            }
-            let resp = match systemd_logs(&unit, n).await {
-                Ok(text) => serde_json::json!({ "ok": true, "message": text }),
-                Err(e) => serde_json::json!({ "ok": false, "message": e.to_string() }),
-            };
-            return (
-                StatusCode::OK,
-                Json(JsonRpcResponse::<serde_json::Value> {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: Some(resp),
-                    error: None,
-                }),
-            );
-        }
-        "systemd_service_details" => {
-            let unit = req
-                .params
-                .get("unit")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if unit.is_empty() {
-                let v = serde_json::json!({ "ok": false, "message": "missing/empty param: unit" });
-                return (
-                    StatusCode::OK,
-                    Json(JsonRpcResponse::<serde_json::Value> {
-                        jsonrpc: "2.0",
-                        id: req.id,
-                        result: Some(v),
-                        error: None,
-                    }),
-                );
-            }
-            let unit_ok = unit.clone();
-            let resp = match systemd_service_details(&unit).await {
-                Ok((cg, snap)) => serde_json::json!({
-                    "ok": true,
-                    "message": "",
-                    "unit": unit_ok,
-                    "cgroup_dir": cg.display().to_string(),
-                    "snapshot": snap,
-                }),
-                Err(e) => serde_json::json!({ "ok": false, "message": e.to_string(), "unit": unit }),
-            };
-            return (
-                StatusCode::OK,
-                Json(JsonRpcResponse::<serde_json::Value> {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: Some(resp),
-                    error: None,
-                }),
-            );
-        }
-        "admin_actions_pids" => {
-            let cfg = {
-                let st = st.daemon.lock().unwrap_or_else(|p| p.into_inner());
-                st.cfg.clone()
-            };
-            // Grouped by action id: "<id>: <pid>" per running process.
-            let v = match crate::pm::daemon::admin_action_pids_by_id(&cfg) {
-                Ok(running) => {
-                    let pids: Vec<String> = running
-                        .into_iter()
-                        .flat_map(|(id, pids)| pids.into_iter().map(move |p| format!("{id}: {p}")))
-                        .collect();
-                    serde_json::json!({ "ok": true, "message": "", "pids": pids })
-                }
-                Err(e) => serde_json::json!({ "ok": false, "message": e.to_string(), "pids": [] }),
-            };
-            return (
-                StatusCode::OK,
-                Json(JsonRpcResponse::<serde_json::Value> {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: Some(v),
-                    error: None,
-                }),
-            );
-        }
-        "admin_actions_kill" => {
-            let cfg = {
-                let st = st.daemon.lock().unwrap_or_else(|p| p.into_inner());
-                st.cfg.clone()
-            };
-            let admin_cg = cgroup::admin_actions_dir(&cfg);
-            let before = cgroup::list_pids(&admin_cg).unwrap_or_default();
-            if let Err(e) = cgroup::kill_all_pids(&admin_cg) {
-                let v = serde_json::json!({ "ok": false, "message": e.to_string() });
-                return (
-                    StatusCode::OK,
-                    Json(JsonRpcResponse::<serde_json::Value> {
-                        jsonrpc: "2.0",
-                        id: req.id,
-                        result: Some(v),
-                        error: None,
-                    }),
-                );
-            }
-            let v = serde_json::json!({
-                "ok": true,
-                "message": format!("sent cgroup.kill to {} (pids_before={})", admin_cg.display(), before.len()),
-            });
-            return (
-                StatusCode::OK,
-                Json(JsonRpcResponse::<serde_json::Value> {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: Some(v),
-                    error: None,
-                }),
-            );
-        }
-        _ => {}
+    if let Some(result) = console_method(&st, &req.method, &req.params).await {
+        return rpc_result(req.id, result);
     }
 
     let r = match map_method_to_request(&req.method, &req.params) {
         Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(JsonRpcResponse::<serde_json::Value> {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32602,
-                        message: e,
-                    }),
-                }),
-            );
-        }
+        Err(e) => return rpc_error(StatusCode::BAD_REQUEST, req.id, -32602, e),
     };
-
     match dispatch_async(Arc::clone(&st.daemon), r).await {
         Ok(resp) => {
             let v = serde_json::to_value(resp).unwrap_or_else(|e| {
                 serde_json::Value::String(format!("failed to serialize response: {e}"))
             });
-            (
-                StatusCode::OK,
-                Json(JsonRpcResponse::<serde_json::Value> {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: Some(v),
-                    error: None,
-                }),
-            )
+            rpc_result(req.id, v)
         }
-        Err(e) => (
-            StatusCode::OK,
-            Json(JsonRpcResponse::<serde_json::Value> {
-                jsonrpc: "2.0",
-                id: req.id,
-                result: None,
-                error: Some(JsonRpcError {
-                    code: -32000,
-                    message: e.to_string(),
-                }),
-            }),
-        ),
+        Err(e) => rpc_error(StatusCode::OK, req.id, -32000, e.to_string()),
     }
 }
 
-fn service_cgroup_dir(cfg: &crate::pm::config::MasterConfig, app: &str) -> anyhow::Result<PathBuf> {
-    let app = app.trim();
-    // Same rules as service definitions: rules out '/', '.', '..' and leading dots, while
-    // still allowing names such as `db..backup` that a config can legitimately define.
-    crate::pm::app::validate_application_name(app)?;
-    Ok(cgroup::app_dir(cfg, app))
+type RpcReply = (StatusCode, Json<JsonRpcResponse<serde_json::Value>>);
+
+fn rpc_result(id: serde_json::Value, result: serde_json::Value) -> RpcReply {
+    (StatusCode::OK, Json(JsonRpcResponse { jsonrpc: "2.0", id, result: Some(result), error: None }))
 }
 
+fn rpc_error(status: StatusCode, id: serde_json::Value, code: i32, message: String) -> RpcReply {
+    (status, Json(JsonRpcResponse { jsonrpc: "2.0", id, result: None, error: Some(JsonRpcError { code, message }) }))
+}
 
 /// Reads the `flags` param (comma-separated string or array), normalised to lowercase.
 ///

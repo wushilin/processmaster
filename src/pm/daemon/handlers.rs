@@ -94,7 +94,7 @@ pub(super) fn do_perf_metrics(state: &Arc<Mutex<DaemonState>>, name: &str) -> an
 
 pub(super) fn do_events(state: &Arc<Mutex<DaemonState>>, name: Option<&str>, n: usize) -> anyhow::Result<Response> {
     let events = {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
         Arc::clone(&st.events)
     };
     let q = events.lock().unwrap_or_else(|p| p.into_inner());
@@ -119,7 +119,7 @@ pub(super) fn do_events(state: &Arc<Mutex<DaemonState>>, name: Option<&str>, n: 
 
 pub(super) async fn do_set_enabled_async(state: &Arc<Mutex<DaemonState>>, name: &str, enabled: bool) -> anyhow::Result<Response> {
     let source_file = {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
         let def = st
             .defs
             .get(name)
@@ -175,7 +175,7 @@ pub(super) fn set_enabled_in_yaml(path: &Path, enabled: bool) -> anyhow::Result<
 
 pub(super) async fn do_update_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Response> {
     let (cfg, old_defs) = {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
         (st.cfg.clone(), st.defs.clone())
     };
 
@@ -227,7 +227,7 @@ pub(super) async fn do_update_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::
     // Clear it for other services that are currently defined.
     {
         let run_info = {
-            let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+            let st = state.lock().unwrap_or_else(|p| p.into_inner());
             Arc::clone(&st.run_info)
         };
         let mut ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
@@ -291,7 +291,7 @@ pub(super) async fn do_update_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::
     }
 
     {
-        let mut st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
         st.cfg = cfg.clone();
         st.defs = new_defs;
     }
@@ -309,7 +309,7 @@ pub(super) async fn do_update_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::
     let mut restarted: Vec<String> = vec![];
     for name in &modified_apps {
         let def = {
-            let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+            let st = state.lock().unwrap_or_else(|p| p.into_inner());
             st.defs.get(name).cloned()
         };
         let Some(def) = def else { continue };
@@ -457,7 +457,7 @@ pub(super) async fn start_enabled_services_async(state: &Arc<Mutex<DaemonState>>
     // Collect candidates without holding the lock during starts.
     // NOTE: scheduled jobs are not services; do not autostart them.
     let (cfg, names) = {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
         let mut names = vec![];
         for (name, def) in &st.defs {
             if def.enabled && def.schedule.is_none() {
@@ -471,50 +471,60 @@ pub(super) async fn start_enabled_services_async(state: &Arc<Mutex<DaemonState>>
         return Ok(());
     }
 
-    let mut js: JoinSet<()> = JoinSet::new();
-    for name in names {
+    // Bounded like every other bulk operation: each start occupies a blocking thread
+    // to launch and then polls the cgroup, so a large config would otherwise queue
+    // thousands of launches at once.
+    let results = fan_out(names, 32, |name| {
         let st = Arc::clone(state);
-        let cfg2 = cfg.clone();
-        js.spawn(async move {
-            // Respect operator intent to keep the service stopped ("user_stop" flag).
-            let run_info = {
-                let g = st.lock().unwrap_or_else(|p| p.into_inner());
-                Arc::clone(&g.run_info)
-            };
-            let stopped_by_user = {
-                let ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
-                ri.get(&name)
-                    .map(|i| sysflag_has(&i.system_flags, SYSFLAG_USER_STOP))
-                    .unwrap_or(false)
-            };
-            if stopped_by_user {
-                pm_event_state(&st, "autostart", Some(&name), "skip stopped_by_user");
-                return;
-            }
-            // If already running, skip.
-            match cgroup_running_async(&cfg2, &name).await {
-                Ok(true) => {
-                    pm_event_state(&st, "autostart", Some(&name), "skip already_running");
-                    return;
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    pm_event_state(&st, "autostart", Some(&name), format!("status_check_failed err={e}"));
-                    return;
-                }
-            }
-            pm_event_state(&st, "autostart", Some(&name), "attempt=set_desired enabled");
-            match boot_start_via_supervisor_async(&st, &name).await {
-                Ok(()) => pm_event_state(&st, "autostart", Some(&name), "outcome=accepted desired=RUNNING"),
-                Err(e) => pm_event_state(&st, "autostart", Some(&name), format!("outcome=error err={e}")),
-            }
-        });
+        let cfg = cfg.clone();
+        async move {
+            autostart_one(&st, &cfg, &name).await;
+            Ok(())
+        }
+    })
+    .await;
+    for (name, r) in results {
+        if let Err(e) = r {
+            pm_event_state(state, "autostart", Some(&name), format!("outcome=error err={e:#}"));
+        }
     }
-    while js.join_next().await.is_some() {}
     Ok(())
 }
 
-// record_start_attempt removed: desired state changes are handled via controller commands.
+async fn autostart_one(st: &Arc<Mutex<DaemonState>>, cfg: &MasterConfig, name: &str) {
+    // Respect operator intent to keep the service stopped ("user_stop" flag).
+    let run_info = {
+        let g = st.lock().unwrap_or_else(|p| p.into_inner());
+        Arc::clone(&g.run_info)
+    };
+    let stopped_by_user = {
+        let ri = run_info.lock().unwrap_or_else(|p| p.into_inner());
+        ri.get(name)
+            .map(|i| sysflag_has(&i.system_flags, SYSFLAG_USER_STOP))
+            .unwrap_or(false)
+    };
+    if stopped_by_user {
+        pm_event_state(st, "autostart", Some(name), "skip stopped_by_user");
+        return;
+    }
+    // If already running, skip.
+    match cgroup_running_async(cfg, name).await {
+        Ok(true) => {
+            pm_event_state(st, "autostart", Some(name), "skip already_running");
+            return;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            pm_event_state(st, "autostart", Some(name), format!("status_check_failed err={e}"));
+            return;
+        }
+    }
+    pm_event_state(st, "autostart", Some(name), "attempt=set_desired enabled");
+    match boot_start_via_supervisor_async(st, name).await {
+        Ok(()) => pm_event_state(st, "autostart", Some(name), "outcome=accepted desired=RUNNING"),
+        Err(e) => pm_event_state(st, "autostart", Some(name), format!("outcome=error err={e}")),
+    }
+}
 
 /// Runs `f` over every target with at most `limit` in flight and returns one result per
 /// target, sorted by name. A task that panics yields an error for its target instead of
@@ -595,7 +605,7 @@ pub(super) fn response_as_result(r: anyhow::Result<Response>) -> anyhow::Result<
 }
 
 pub(super) fn enabled_service_names(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Vec<String>> {
-    let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+    let st = state.lock().unwrap_or_else(|p| p.into_inner());
     let mut v: Vec<String> = st
         .defs
         .iter()
@@ -612,7 +622,7 @@ pub(super) async fn do_start_async(state: &Arc<Mutex<DaemonState>>, name: &str, 
     async fn start_one(st: Arc<Mutex<DaemonState>>, t: String, force2: bool) -> anyhow::Result<String> {
         let (st, t) = (&st, t.as_str());
         let def = {
-            let g = st.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+            let g = st.lock().unwrap_or_else(|p| p.into_inner());
             g.defs.get(t).cloned().ok_or_else(|| anyhow::anyhow!("unknown service: {t}"))?
         };
         // Cron jobs: "start" means run once, not set desired=RUNNING forever.
@@ -639,7 +649,7 @@ pub(super) async fn do_stop_async(state: &Arc<Mutex<DaemonState>>, name: &str) -
     async fn stop_one_cmd(st: Arc<Mutex<DaemonState>>, t: String) -> anyhow::Result<String> {
         let (st, t) = (&st, t.as_str());
         let def = {
-            let g = st.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+            let g = st.lock().unwrap_or_else(|p| p.into_inner());
             g.defs.get(t).cloned().ok_or_else(|| anyhow::anyhow!("unknown service: {t}"))?
         };
         if def.schedule.is_some() {
@@ -666,7 +676,7 @@ pub(super) async fn do_restart_async(state: &Arc<Mutex<DaemonState>>, name: &str
         let (st, t) = (&st, t.as_str());
         pm_event_state(st, "cmd", Some(t), format!("attempt=restart force={force2}"));
         let def = {
-            let g = st.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+            let g = st.lock().unwrap_or_else(|p| p.into_inner());
             g.defs.get(t).cloned().ok_or_else(|| anyhow::anyhow!("unknown service: {t}"))?
         };
         // Scheduled jobs restart as stop-now + run-once; services go through the supervisor's restart.
@@ -709,7 +719,7 @@ pub(super) async fn do_stop_all_async(state: &Arc<Mutex<DaemonState>>) -> anyhow
     // IMPORTANT: we set the intent marker BEFORE issuing the stop so the subsequent exit event
     // is reliably treated as "stopped by user" and will not auto-restart.
     let (cfg, run_info, names): (MasterConfig, _, Vec<String>) = {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
         let mut v: Vec<String> = st.defs.keys().cloned().collect();
         v.sort();
         (st.cfg.clone(), Arc::clone(&st.run_info), v)
@@ -785,7 +795,7 @@ pub(super) async fn do_restart_all_async(state: &Arc<Mutex<DaemonState>>, force:
 
 pub(super) fn do_flag(state: &Arc<Mutex<DaemonState>>, name: &str, flags: &[String], ttl: Option<&str>) -> anyhow::Result<Response> {
     let (run_info, events) = {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
         if name != "all" && !st.defs.contains_key(name) {
             anyhow::bail!("unknown service: {name}");
         }
@@ -793,7 +803,7 @@ pub(super) fn do_flag(state: &Arc<Mutex<DaemonState>>, name: &str, flags: &[Stri
     };
     // Mark appstate dirty (persist user flags).
     {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
         st.appstate_dirty.store(true, Ordering::Relaxed);
     }
 
@@ -875,14 +885,14 @@ pub(super) fn do_unflag(state: &Arc<Mutex<DaemonState>>, name: &str, flags: &[St
     // No charset check here: removing is harmless, and flags saved before the charset
     // rule existed must stay removable.
     let (run_info, events) = {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
         if name != "all" && !st.defs.contains_key(name) {
             anyhow::bail!("unknown service: {name}");
         }
         (Arc::clone(&st.run_info), Arc::clone(&st.events))
     };
     {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
         st.appstate_dirty.store(true, Ordering::Relaxed);
     }
 
@@ -926,7 +936,7 @@ pub(super) fn do_status(state: &Arc<Mutex<DaemonState>>, name: Option<&str>) -> 
     // with the number of processes the services run, and every other handler and the
     // scheduler wait on this lock.
     let (cfg, defs, run_info) = {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
         let want_one = name.filter(|n| *n != "all");
         if let Some(one) = want_one {
             if !st.defs.contains_key(one) {
@@ -1058,7 +1068,7 @@ pub(super) fn resolve_targets(
     name: &str,
     require_enabled: bool,
 ) -> anyhow::Result<Vec<String>> {
-    let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+    let st = state.lock().unwrap_or_else(|p| p.into_inner());
     if name == "all" {
         let mut out = vec![];
         for (n, def) in &st.defs {

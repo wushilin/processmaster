@@ -342,6 +342,9 @@ pub(super) fn validate_env_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How often the stop sequence checks whether the service has exited.
+pub(super) const GRACE_POLL: Duration = Duration::from_millis(50);
+
 pub(super) fn stop_common(
     events: Option<&Arc<Mutex<VecDeque<EventEntry>>>>,
     cfg: &MasterConfig,
@@ -440,10 +443,13 @@ pub(super) fn stop_common(
             log(format!("outcome=grace_exit elapsed_ms={}", grace_t0.elapsed().as_millis()));
             return Ok(StopResult::Stopped);
         }
-        if Instant::now() >= stop_deadline {
+        let now = Instant::now();
+        if now >= stop_deadline {
             break;
         }
-        std::thread::sleep(Duration::from_secs(1));
+        // Most services exit within milliseconds of the signal; a coarse poll would add
+        // up to its whole interval to every stop and restart.
+        std::thread::sleep(GRACE_POLL.min(stop_deadline - now));
     }
 
     // Still running after grace window => force kill-all.

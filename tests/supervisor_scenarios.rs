@@ -380,6 +380,40 @@ fn max_pids_contains_a_fork_bomb() {
     h.wait_for("an empty cgroup", Duration::from_secs(10), || h.status().pids.is_empty());
 }
 
+/// A full log filesystem must not kill the service. The log pump used to give up on the
+/// first failed write and close the pipe, so the service died of SIGPIPE on its next
+/// write; on a shared disk one chatty service took every service down with it.
+#[test]
+#[ignore = "needs root + cgroup v2"]
+fn full_log_disk_does_not_kill_the_service() {
+    let h = Harness::start(Service::new("exec yes processmaster-fills-the-disk"));
+    // A tiny filesystem over the log directory. Restart so the new pump opens its log
+    // there; the guard unmounts before the harness removes the directory.
+    let logs = h.work().join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let ok = Command::new("mount").args(["-t", "tmpfs", "-o", "size=256k", "tmpfs"]).arg(&logs).status().unwrap();
+    assert!(ok.success(), "mount tmpfs");
+    struct Unmount(PathBuf);
+    impl Drop for Unmount {
+        fn drop(&mut self) {
+            let _ = Command::new("umount").arg("-l").arg(&self.0).status();
+        }
+    }
+    let _unmount = Unmount(logs.clone());
+    let r = h.call(Request::Restart { name: APP.to_string(), force: false });
+    assert!(r.ok, "restart: {}", r.message);
+
+    h.wait_for("the log filesystem to fill up", Duration::from_secs(10), || {
+        std::fs::metadata(logs.join("stdout.log")).map(|m| m.len() >= 200 * 1024).unwrap_or(false)
+    });
+    let pid = h.status().pids.first().copied().expect("service running");
+    std::thread::sleep(Duration::from_secs(2));
+    let st = h.status();
+    assert_eq!(st.actual, "RUNNING");
+    assert_eq!(st.pids.first().copied(), Some(pid), "the service was restarted: {st:?}");
+    assert_eq!(st.restarts_10m, 0, "the service crashed: {st:?}");
+}
+
 /// Output on both streams is captured by the log pumps and served by `logs`.
 #[test]
 #[ignore = "needs root + cgroup v2"]

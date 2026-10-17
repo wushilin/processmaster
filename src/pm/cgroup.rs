@@ -406,6 +406,67 @@ pub(crate) fn wait_all_cancellable(cgroup_dir: &Path, cancel: &AtomicBool) -> an
     }
 }
 
+/// Watches a cgroup's `cgroup.events` for its `populated` flag dropping to 0, which the
+/// kernel sets once no process is left anywhere in the cgroup's subtree.
+///
+/// The kernel signals every change to that file as a priority event on the open file,
+/// so this waits in the async runtime without a thread per service and without
+/// rescanning the tree each time one of the service's processes exits.
+pub(crate) struct PopulatedWatch {
+    fd: tokio::io::unix::AsyncFd<std::fs::File>,
+}
+
+impl PopulatedWatch {
+    /// Opens the watch. `NotFound` means the cgroup does not exist (nothing to wait for).
+    /// Must be called inside the Tokio runtime.
+    pub(crate) fn open(cgroup_dir: &Path) -> io::Result<Self> {
+        let f = std::fs::File::open(cgroup_dir.join("cgroup.events"))?;
+        // Registering before the first read means a change between that read and the
+        // wait still leaves the fd ready: no exit can slip through unobserved.
+        let fd = tokio::io::unix::AsyncFd::with_interest(f, tokio::io::Interest::PRIORITY)?;
+        Ok(PopulatedWatch { fd })
+    }
+
+    /// Resolves once the cgroup is empty (or removed).
+    pub(crate) async fn wait_empty(&self) -> anyhow::Result<()> {
+        // Belt and braces: re-read now and then even without an event.
+        const RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
+        loop {
+            if !self.populated()? {
+                return Ok(());
+            }
+            tokio::select! {
+                ready = self.fd.ready(tokio::io::Interest::PRIORITY) => ready?.clear_ready(),
+                _ = tokio::time::sleep(RECHECK) => {}
+            }
+        }
+    }
+
+    /// Reads `populated` afresh (rereading also re-arms the kernel's change notification).
+    fn populated(&self) -> anyhow::Result<bool> {
+        use std::io::{Read as _, Seek as _};
+        let mut f = self.fd.get_ref();
+        let mut buf = String::new();
+        match f.seek(io::SeekFrom::Start(0)).and_then(|_| f.read_to_string(&mut buf)) {
+            Ok(_) => {}
+            // The cgroup was removed while we watched it: nothing can be left in it.
+            Err(e) if e.raw_os_error() == Some(libc::ENODEV) || e.kind() == io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(e) => return Err(e).context("read cgroup.events"),
+        }
+        parse_populated(&buf).ok_or_else(|| anyhow::anyhow!("cgroup.events has no populated line: {buf:?}"))
+    }
+}
+
+fn parse_populated(events: &str) -> Option<bool> {
+    events.lines().find_map(|l| match l.trim().strip_prefix("populated ")? {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    })
+}
+
 /// Owning wrapper for a `pidfd`, so it is closed on every path out of a scope.
 struct OwnedPidFd(RawFd);
 
@@ -1023,6 +1084,35 @@ pub(crate) fn read_resource_snapshot(cgroup_dir: &Path) -> anyhow::Result<Cgroup
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A cgroup outlives a definition change, so dropping `max_pids` from a service must
+    // lift the old cap; where the pids controller is absent nothing is written at all.
+    #[test]
+    fn removing_max_pids_lifts_the_limit() {
+        let dir = std::env::temp_dir().join(format!("pm-cg-pids-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("pids.max");
+        fs::write(&file, "16\n").unwrap();
+
+        apply_resources(&dir, &Resources { pids_max: Some(32), ..Default::default() }).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "32\n");
+        apply_resources(&dir, &Resources::default()).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "max\n");
+
+        fs::remove_file(&file).unwrap();
+        apply_resources(&dir, &Resources::default()).unwrap();
+        assert!(!file.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn populated_is_read_from_cgroup_events() {
+        assert_eq!(parse_populated("populated 1\nfrozen 0\n"), Some(true));
+        assert_eq!(parse_populated("populated 0\nfrozen 0\n"), Some(false));
+        assert_eq!(parse_populated("frozen 0\npopulated 0\n"), Some(false));
+        assert_eq!(parse_populated("frozen 0\n"), None);
+        assert_eq!(parse_populated("populated x\n"), None);
+    }
 
     #[test]
     fn io_not_found_is_detected_through_context_layers() {

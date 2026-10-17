@@ -34,7 +34,7 @@ pub(super) fn start_log_maintenance_thread(state: Arc<Mutex<DaemonState>>) {
 
 pub(super) async fn run_log_maintenance_tick_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<()> {
     let defs: Vec<AppDefinition> = {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
         st.defs.values().cloned().collect()
     };
 
@@ -174,7 +174,7 @@ pub(super) fn log_follow_semaphore() -> &'static Arc<tokio::sync::Semaphore> {
 
 pub(super) fn do_logs(state: &Arc<Mutex<DaemonState>>, name: &str, n: usize) -> anyhow::Result<Response> {
     let def = {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
         st.defs
             .get(name)
             .cloned()
@@ -254,7 +254,7 @@ pub(super) fn handle_logs_follow(
 
     // Collect candidate files across apps (or one app if specified).
     let defs: Vec<AppDefinition> = {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(ref n) = name {
             vec![st
                 .defs
@@ -785,6 +785,8 @@ pub(super) async fn log_pump_async<P: IntoRawFd>(
         }
     };
     let mut out = PumpOutput {
+        display_path: base_path.clone(),
+        failing: false,
         base_path: log.base.clone(),
         dir: Arc::clone(&log.dir),
         f: None,
@@ -796,8 +798,9 @@ pub(super) async fn log_pump_async<P: IntoRawFd>(
         pm_event(
             "logpump",
             Some(&def.application),
-            format!("outcome=discarding_output log={} err={e:#}", out.base_path.display()),
+            format!("outcome=discarding_output log={} err={e:#}", out.display_path.display()),
         );
+        out.failing = true;
         out.retry_at = Some(Instant::now() + LOG_REOPEN_RETRY);
     }
     let mut buf = vec![0u8; 16 * 1024];
@@ -810,20 +813,32 @@ pub(super) async fn log_pump_async<P: IntoRawFd>(
         // directory) must not end the pump: dropping the read end would SIGPIPE the
         // service on its next write. On a shared full disk that would kill every
         // service at once. Discard output until the log can be reopened instead.
-        if out.f.is_none() && !out.try_reopen(&def).await {
+        if out.f.is_none() && !out.try_reopen().await {
             continue;
         }
-        if let Err(e) = out.write_chunk(&def, &buf[..n]).await {
-            pm_event(
-                "logpump",
-                Some(&def.application),
-                format!(
-                    "outcome=write_error log={} action=discarding_until_writable err={e:#}",
-                    out.base_path.display()
-                ),
-            );
-            out.f = None;
-            out.retry_at = Some(Instant::now() + LOG_REOPEN_RETRY);
+        match out.write_chunk(&def, &buf[..n]).await {
+            // Only transitions are logged: a disk that stays full would otherwise add
+            // two events per retry for as long as the service runs.
+            Ok(()) if out.failing => {
+                out.failing = false;
+                pm_event("logpump", Some(&def.application), format!("outcome=resumed log={}", out.display_path.display()));
+            }
+            Ok(()) => {}
+            Err(e) => {
+                if !out.failing {
+                    out.failing = true;
+                    pm_event(
+                        "logpump",
+                        Some(&def.application),
+                        format!(
+                            "outcome=write_error log={} action=discarding_until_writable err={e:#}",
+                            out.display_path.display()
+                        ),
+                    );
+                }
+                out.f = None;
+                out.retry_at = Some(Instant::now() + LOG_REOPEN_RETRY);
+            }
         }
     }
     if let Some(f) = out.f.as_mut() {
@@ -837,6 +852,10 @@ pub(super) const LOG_REOPEN_RETRY: Duration = if cfg!(test) { Duration::from_mil
 
 /// The writing side of a log pump: the open log (if any) and its rotation state.
 struct PumpOutput {
+    /// The configured log path, for messages (`base_path` goes through /proc/self/fd).
+    display_path: PathBuf,
+    /// Writes are failing; set until one succeeds again.
+    failing: bool,
     base_path: PathBuf,
     dir: Arc<OwnedFd>,
     /// `None` while output is being discarded after a write error.
@@ -848,15 +867,12 @@ struct PumpOutput {
 
 impl PumpOutput {
     /// Reopens the log once the retry delay has passed. Returns whether it is open.
-    async fn try_reopen(&mut self, def: &AppDefinition) -> bool {
+    async fn try_reopen(&mut self) -> bool {
         if self.retry_at.is_some_and(|t| Instant::now() < t) {
             return false;
         }
         match self.open().await {
-            Ok(()) => {
-                pm_event("logpump", Some(&def.application), format!("outcome=resumed log={}", self.base_path.display()));
-                true
-            }
+            Ok(()) => true,
             Err(_) => {
                 self.retry_at = Some(Instant::now() + LOG_REOPEN_RETRY);
                 false

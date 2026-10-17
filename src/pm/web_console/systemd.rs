@@ -74,7 +74,9 @@ pub(super) async fn systemd_list_services() -> anyhow::Result<Vec<SystemdService
         .arg("--all")
         .arg("--no-pager")
         .arg("--property=Id,ActiveState,SubState,MainPID,ControlGroup,UnitFileState,FragmentPath,ExecStart");
-    let out = run_cmd_timeout(cmd, 3000).await?;
+    // Generous: the first full listing after boot can take several seconds while systemd
+    // loads every unit file; 3s made the console's first systemd view fail.
+    let out = run_cmd_timeout(cmd, 10_000).await?;
 
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();

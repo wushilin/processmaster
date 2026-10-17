@@ -382,7 +382,8 @@ resources:
   max_cpu: 100m                 # e.g. "100m" or "1.5"
   max_memory: 64MiB             # e.g. "64MiB", "1GiB"
   max_swap: 0                   # "0" disables swap for this cgroup
-  max_pids: 512                 # cap on processes+threads (pids.max); omit for unlimited
+  max_pids: 512                 # cap on processes+threads (pids.max); omit for unlimited.
+                                # Threads count too: size it from the cgroup's pids.peak.
 
 restart_policy:
   # Restart strategy for non-scheduled services. (Must not be present when process.schedule is set.)

@@ -110,7 +110,7 @@ pub(super) async fn ask_supervisor(
     cmd: impl FnOnce(oneshot::Sender<anyhow::Result<()>>) -> SupervisorCmd,
 ) -> anyhow::Result<()> {
     let tx = {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
         st.supervisors.get(name).map(|h| h.tx.clone())
     }
     .ok_or_else(|| anyhow::anyhow!("no controller for service: {name}"))?;
@@ -158,7 +158,7 @@ pub(super) async fn overtime_stop_via_supervisor_async(state: &Arc<Mutex<DaemonS
 
 pub(super) fn refresh_supervisors(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<()> {
     let (cfg, defs, existing, shutting_down) = {
-        let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
         (
             st.cfg.clone(),
             st.defs.clone(),
@@ -180,7 +180,7 @@ pub(super) fn refresh_supervisors(state: &Arc<Mutex<DaemonState>>) -> anyhow::Re
     for name in existing {
         if !defs.contains_key(&name) {
             let tx = {
-                let mut st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+                let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
                 st.supervisors.remove(&name).map(|h| h.tx)
             };
             if let Some(tx) = tx {
@@ -198,7 +198,7 @@ pub(super) fn refresh_supervisors(state: &Arc<Mutex<DaemonState>>) -> anyhow::Re
             // If we can't create the cgroup dir, we can still keep the daemon running;
             // starts/stops for this app will fail later and should be visible to operators.
             let (events, ) = {
-                let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+                let st = state.lock().unwrap_or_else(|p| p.into_inner());
                 (Arc::clone(&st.events),)
             };
             push_event(&events, "cgroup", Some(&name), format!("ensure_dir_failed dir={} err={e}", cg_dir.display()));
@@ -210,7 +210,7 @@ pub(super) fn refresh_supervisors(state: &Arc<Mutex<DaemonState>>) -> anyhow::Re
         }
 
         let tx_opt = {
-            let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+            let st = state.lock().unwrap_or_else(|p| p.into_inner());
             st.supervisors.get(&name).map(|h| h.tx.clone())
         };
         if let Some(tx) = tx_opt {
@@ -238,12 +238,12 @@ pub(super) fn refresh_supervisors(state: &Arc<Mutex<DaemonState>>) -> anyhow::Re
         }
 
         let (run_info, events) = {
-            let st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+            let st = state.lock().unwrap_or_else(|p| p.into_inner());
             (Arc::clone(&st.run_info), Arc::clone(&st.events))
         };
         pm_event("supervisor", Some(&name), "spawn");
         let handle = spawn_supervisor_thread(cfg.clone(), def.clone(), run_info, events, Arc::clone(&shutting_down));
-        let mut st = state.lock().map_err(|p| anyhow::anyhow!("{p}"))?;
+        let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
         st.supervisors.insert(name.clone(), handle);
     }
     Ok(())
@@ -334,14 +334,12 @@ pub(super) fn spawn_supervisor_thread(
     // keeps running with nobody watching it and commands fail with a closed channel;
     // say so loudly. `pmctl update` replaces it (see refresh_supervisors).
     tasks().spawn(async move {
-        if let Err(e) = task.await {
-            if e.is_panic() {
-                pm_event(
-                    "supervisor",
-                    Some(&app),
-                    "outcome=panicked service=unsupervised action=run `pmctl update` to replace the supervisor",
-                );
-            }
+        if task.await.is_err_and(|e| e.is_panic()) {
+            pm_event(
+                "supervisor",
+                Some(&app),
+                "outcome=panicked service=unsupervised action=run `pmctl update` to replace the supervisor",
+            );
         }
     });
     SupervisorHandle { tx }
@@ -365,7 +363,7 @@ struct Supervisor {
     /// Bumped whenever the current waiter is replaced or abandoned; a waiter's report
     /// carrying an older epoch is stale and ignored.
     waiter_epoch: u64,
-    waiter_cancel: Option<Arc<AtomicBool>>,
+    waiter_cancel: Option<WaiterCancel>,
     /// When set, a `FailureAutoRestart` fires at this instant (BACKOFF).
     pending_failure_restart_at: Option<Instant>,
 }
@@ -516,7 +514,7 @@ impl Supervisor {
                     return Err(e);
                 }
             };
-            self.attach_process_waiter(child);
+            self.attach_process_waiter(child).await;
         } else {
             disown_service_child(child_r?);
         }
@@ -648,7 +646,7 @@ impl Supervisor {
         self.set_phase(Phase::Restarting, "manual_restart_start");
         let child = self.spawn_child().await??;
         if self.def.schedule.is_some() {
-            self.attach_process_waiter(child);
+            self.attach_process_waiter(child).await;
         } else {
             disown_service_child(child);
         }
@@ -771,7 +769,7 @@ impl Supervisor {
         };
         // For scheduled jobs, attach a process waiter to capture the real exit code (0 vs non-0).
         // The cgroup-only waiter cannot provide an exit status and would report code=None.
-        self.attach_process_waiter(child);
+        self.attach_process_waiter(child).await;
         if !self.wait_for_cgroup_nonempty().await {
             // Same reasoning as manual_start_timeout: don't guess failure for cron jobs here.
             push_event(&self.events, "schedule", Some(&app), "event=start_timeout scope=cron detail=cgroup_stayed_empty");
@@ -1128,8 +1126,7 @@ impl Supervisor {
             return;
         }
         self.detach_waiter();
-        let cancel = Arc::new(AtomicBool::new(false));
-        if spawn_cgroup_waiter(&self.cfg, &self.app, &self.tx_self, self.waiter_epoch, Arc::clone(&cancel)).is_ok() {
+        if let Ok(cancel) = spawn_cgroup_waiter(&self.cfg, &self.app, &self.tx_self, self.waiter_epoch) {
             self.waiter_running = true;
             self.waiter_cancel = Some(cancel);
             push_event(&self.events, "watch", Some(&self.app), "waiter=attached");
@@ -1138,10 +1135,22 @@ impl Supervisor {
 
     /// Replaces the cgroup waiter with one that waits on `child` itself, so a scheduled
     /// job's real exit status is reported (the cgroup waiter can only say "empty").
-    fn attach_process_waiter(&mut self, child: std::process::Child) {
+    async fn attach_process_waiter(&mut self, child: std::process::Child) {
         self.detach_waiter();
-        self.waiter_running = true;
-        let _ = spawn_process_waiter(child, &self.tx_self, &self.app, self.waiter_epoch);
+        match spawn_process_waiter(child, &self.tx_self, &self.app, self.waiter_epoch) {
+            Ok(()) => self.waiter_running = true,
+            Err(e) => {
+                // No thread to wait on the child (it went to the reaper). Watch the
+                // cgroup instead: the exit is still seen, only without its status.
+                push_event(
+                    &self.events,
+                    "watch",
+                    Some(&self.app),
+                    format!("process_waiter=failed fallback=cgroup_waiter err={e:#}"),
+                );
+                self.ensure_waiter_attached(true).await;
+            }
+        }
     }
 
     /// Abandons the current waiter: a later report from it carries a stale epoch.
@@ -1149,7 +1158,7 @@ impl Supervisor {
         self.waiter_epoch = self.waiter_epoch.wrapping_add(1);
         self.waiter_running = false;
         if let Some(c) = self.waiter_cancel.take() {
-            c.store(true, Ordering::Relaxed);
+            c.cancel();
         }
     }
 
@@ -1170,41 +1179,81 @@ impl Supervisor {
     }
 }
 
+/// Stops a cgroup waiter that is no longer wanted.
+pub(super) enum WaiterCancel {
+    Task(tokio::task::AbortHandle),
+    /// The thread fallback notices on its next poll (within a few seconds).
+    Thread(Arc<AtomicBool>),
+    /// The waiter has already reported.
+    Done,
+}
+
+impl WaiterCancel {
+    fn cancel(self) {
+        match self {
+            WaiterCancel::Task(h) => h.abort(),
+            WaiterCancel::Thread(flag) => flag.store(true, Ordering::Relaxed),
+            WaiterCancel::Done => {}
+        }
+    }
+}
+
+/// Watches the service's cgroup and reports `WaiterExited` once it is empty. Must be
+/// called inside the runtime.
 pub(super) fn spawn_cgroup_waiter(
     cfg: &MasterConfig,
     app: &str,
     tx: &tokio_mpsc::UnboundedSender<SupervisorCmd>,
     epoch: u64,
-    cancel: Arc<AtomicBool>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<WaiterCancel> {
     let app_s = app.to_string();
     let tx2 = tx.clone();
     let cg_dir = cgroup::app_dir(cfg, &app_s);
-    let tname = format!("pm-waiter-{}", app_s);
-    let _ = std::thread::Builder::new().name(tname).spawn(move || {
-        match cgroup::wait_all_cancellable(&cg_dir, &cancel) {
-            Ok(true) => {
-                let _ = tx2.send(SupervisorCmd::WaiterExited { epoch, code: None });
-            }
-            Ok(false) => {
-                // cancelled
-            }
-            Err(e) => {
-                // NOT an exit. Synthesising `code: Some(1)` here made an unreadable
-                // cgroup indistinguishable from a crashed service: the supervisor
-                // recorded a crash, restarted, and ended up with two live instances
-                // sharing one cgroup. Report the failure and let the reconcile loop
-                // re-observe actual state instead.
-                pm_event(
-                    "watch",
-                    Some(&app_s),
-                    format!("waiter=error (not treated as an exit) err={e:#}"),
-                );
-                let _ = tx2.send(SupervisorCmd::WaiterFailed { epoch });
-            }
+    // NOT an exit. Synthesising `code: Some(1)` for an error made an unreadable cgroup
+    // indistinguishable from a crashed service: the supervisor recorded a crash,
+    // restarted, and ended up with two live instances sharing one cgroup. Report the
+    // failure and let the reconcile loop re-observe actual state instead.
+    let report_error = move |tx: &tokio_mpsc::UnboundedSender<SupervisorCmd>, app: &str, e: anyhow::Error| {
+        pm_event("watch", Some(app), format!("waiter=error (not treated as an exit) err={e:#}"));
+        let _ = tx.send(SupervisorCmd::WaiterFailed { epoch });
+    };
+
+    match cgroup::PopulatedWatch::open(&cg_dir) {
+        Ok(watch) => {
+            let task = tasks().spawn(async move {
+                match watch.wait_empty().await {
+                    Ok(()) => {
+                        let _ = tx2.send(SupervisorCmd::WaiterExited { epoch, code: None });
+                    }
+                    Err(e) => report_error(&tx2, &app_s, e),
+                }
+            });
+            Ok(WaiterCancel::Task(task.abort_handle()))
         }
-    })?;
-    Ok(())
+        // No cgroup: nothing is running in it. Report that as an exit at once, as the
+        // poll-based waiter always has.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let _ = tx2.send(SupervisorCmd::WaiterExited { epoch, code: None });
+            Ok(WaiterCancel::Done)
+        }
+        // The events file cannot be watched (unusual kernel or fs): fall back to a
+        // thread that follows the cgroup's processes with pidfds.
+        Err(e) => {
+            pm_event("watch", Some(&app_s), format!("waiter=thread_fallback reason={e}"));
+            let cancel = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&cancel);
+            std::thread::Builder::new().name(format!("pm-waiter-{app_s}")).spawn(move || {
+                match cgroup::wait_all_cancellable(&cg_dir, &flag) {
+                    Ok(true) => {
+                        let _ = tx2.send(SupervisorCmd::WaiterExited { epoch, code: None });
+                    }
+                    Ok(false) => {} // cancelled
+                    Err(e) => report_error(&tx2, &app_s, e),
+                }
+            })?;
+            Ok(WaiterCancel::Thread(cancel))
+        }
+    }
 }
 
 pub(super) fn spawn_process_waiter(
