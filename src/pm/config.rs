@@ -312,17 +312,11 @@ fn default_subtree_control_allow() -> bool {
 }
 /// Default control-socket path.
 ///
-/// `/run/processmaster/` rather than `/tmp`: `/tmp` is world-writable, so any local user
-/// can pre-create the socket path before the daemon starts. That both denies service
-/// (the daemon sees a live socket and refuses to start a second instance) and lets the
-/// squatter answer `pmctl` with fabricated status. `/run` is root-owned, and the daemon
-/// creates its subdirectory 0700.
-///
 /// NOTE: this changes the default. Deployments that relied on the old default must set
-/// `unix_socket.path: /tmp/processmaster.sock` explicitly, and point `PMCTL_SOCK` at
+/// `unix_socket.path: /run/processmaster.sock` explicitly, and point `PMCTL_SOCK` at
 /// whichever path they choose.
 fn default_sock() -> PathBuf {
-    "/run/processmaster/processmaster.sock".into()
+    "/run/processmaster.sock".into()
 }
 fn default_sock_mode() -> u32 {
     0o600

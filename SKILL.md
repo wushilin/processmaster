@@ -140,14 +140,14 @@ Re-apply is automatic after editing `provisioning:` or replacing a target file. 
 
 **`pmctl` does NOT read the processmaster config file.** It finds the daemon socket in this order (`resolve_sock` in `src/pm/pmctl_cli.rs`):
 
-1. `--sock` / `-s` flag: `pmctl --sock /tmp/processmaster.sock status`
-2. `PMCTL_SOCK` environment variable: `export PMCTL_SOCK=/tmp/processmaster.sock`
+1. `--sock` / `-s` flag: `pmctl --sock /run/processmaster.sock status`
+2. `PMCTL_SOCK` environment variable: `export PMCTL_SOCK=/run/processmaster.sock`
 3. Neither set → hard error with usage help.
 
 The value must match `unix_socket.path` in the daemon's master config. For interactive shells, export `PMCTL_SOCK` in the profile of whoever operates the box. Exceptions that need no socket: `pmctl version` and `pmctl password ...` (local-only).
 
 ```bash
-export PMCTL_SOCK=/tmp/processmaster.sock
+export PMCTL_SOCK=/run/processmaster.sock
 pmctl status            # no subcommand also defaults to status
 ```
 
@@ -157,7 +157,7 @@ There is no auth on the socket protocol; **filesystem permissions on the socket 
 
 ```yaml
 unix_socket:
-  path: /tmp/processmaster.sock   # default if omitted
+  path: /run/processmaster.sock   # default if omitted
   owner: root                     # default root
   group: root                     # default root
   mode: 0600                      # DEFAULT IS 0600 (octal; accepts 660, "660", or "0660")

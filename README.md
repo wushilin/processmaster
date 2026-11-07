@@ -115,7 +115,7 @@ cgroup:
   subtree_control_allow: true # default true. if enabled, it will auto enable all controllers listed in cgroup.controllers into cgroup.subtree_control for children cgroups.
 
 unix_socket:
-  path: /tmp/processmaster.sock   # pmctl/web UI connect to this socket
+  path: /run/processmaster.sock   # pmctl/web UI connect to this socket
   owner: root                     # chown socket file (requires root)
   group: root                     # chgrp socket file (requires root)
   mode: 0660                      # octal; accepts 660, "660", or "0660"
