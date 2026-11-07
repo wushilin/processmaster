@@ -7,7 +7,7 @@ cgroup:
   cpu_max: MAX
 
 unix_socket:
-  path: /tmp/processmaster.sock
+  path: /run/processmaster.sock
   owner: root
   group: root
   mode: 0600

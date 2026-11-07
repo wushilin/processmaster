@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::borrow::Cow;
 use std::io::{BufRead, IsTerminal};
 use std::path::PathBuf;
-use std::{env, fmt};
+use std::env;
 
 #[derive(Debug, Parser)]
 #[command(name = "pmctl", version, about = "processmaster control client")]
@@ -163,31 +163,7 @@ fn resolve_sock(args: &PmctlArgs) -> anyhow::Result<PathBuf> {
         }
     }
 
-    anyhow::bail!("{}", MissingSockHelp);
-}
-
-struct MissingSockHelp;
-
-impl fmt::Display for MissingSockHelp {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "no processmaster socket specified")?;
-        writeln!(f)?;
-        writeln!(f, "pmctl does not read the processmaster config file.")?;
-        writeln!(f, "You must provide the daemon unix socket path via one of:")?;
-        writeln!(f, "  - pmctl --sock /path/to/processmaster.sock <command>")?;
-        writeln!(f, "  - pmctl -s /path/to/processmaster.sock <command>")?;
-        writeln!(f, "  - export PMCTL_SOCK=/path/to/processmaster.sock")?;
-        writeln!(f)?;
-        writeln!(f, "Examples:")?;
-        writeln!(f, "  pmctl --sock /tmp/processmaster.sock status")?;
-        writeln!(f, "  PMCTL_SOCK=/tmp/processmaster.sock pmctl events -n 200")?;
-        writeln!(f)?;
-        writeln!(
-            f,
-            "If you start the daemon with a custom socket, pass the same path here."
-        )?;
-        Ok(())
-    }
+    return Ok(PathBuf::from("/run/processmaster.sock"));
 }
 
 

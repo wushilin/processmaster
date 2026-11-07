@@ -23,7 +23,7 @@ cgroup:
 
 unix_socket:
   # unix socket path used by pmctl + web console JSON-RPC
-  path: /tmp/processmaster.sock
+  path: /run/processmaster.sock
 
   # Optional. If set, daemon must run as root to apply chown/chgrp.
   owner: root
