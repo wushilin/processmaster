@@ -597,3 +597,7 @@ The resource constraints are all honored in an ancester - descendent way.
 
 That means we will use the parent's CGROUP node as root. And treat it as our root for new cgroups.
 Things should generally work.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
