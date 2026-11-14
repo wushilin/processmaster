@@ -42,6 +42,12 @@ struct Harness {
     cgroup: PathBuf,
     instance: String,
     daemon: Option<Child>,
+    /// The service under test.
+    app: String,
+    /// Its working directory (host side).
+    work: PathBuf,
+    /// Root-controlled directory created for an example test; deleted afterwards.
+    example_root: Option<PathBuf>,
 }
 
 fn podman(args: &[&str]) -> std::process::Output {
@@ -72,12 +78,63 @@ impl Harness {
     }
 
     fn start_in(service: &str, private: Option<(String, String)>, auto_dir: Option<&Path>) -> Harness {
-        assert!(nix::unistd::geteuid().is_root(), "container scenarios need root; see the module docs");
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let name = format!("pmctest-{}-{id}", std::process::id());
         let dir = PathBuf::from(format!("/tmp/{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
         let work = dir.join("work");
+        let yaml = compose(&work, service);
+        Self::launch(name, dir, yaml, APP.to_string(), work, None, private, auto_dir)
+    }
+
+    /// Run a shipped example (`examples/<file>`) as it is, except that its
+    /// `working_directory` becomes a fresh root-controlled folder (archives and mounts
+    /// need one) and the listed `(from, to)` substitutions are applied (host ports,
+    /// host paths outside the working directory; `{root}` in a replacement is the test's
+    /// root-controlled folder, the parent of the working directory). Shared store.
+    fn start_example(file: &str, subst: &[(&str, &str)], prepare: impl FnOnce(&Path)) -> Harness {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples").join(file);
+        let mut yaml = std::fs::read_to_string(&path).unwrap();
+        let app = yaml
+            .lines()
+            .find_map(|l| l.strip_prefix("application:"))
+            .expect("example has application:")
+            .trim()
+            .to_string();
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let name = format!("pmctest-{}-{id}", std::process::id());
+        let root = PathBuf::from(format!("/var/lib/{name}-ex"));
+        let _ = std::fs::remove_dir_all(&root);
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        for d in [&root, &work] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let wd_line = yaml.lines().find(|l| l.trim_start().starts_with("working_directory:")).expect("example sets working_directory").to_string();
+        let indent = &wd_line[..wd_line.len() - wd_line.trim_start().len()];
+        yaml = yaml.replace(&wd_line, &format!("{indent}working_directory: {}", work.display()));
+        for (from, to) in subst {
+            assert!(yaml.contains(from), "{file}: substitution source {from:?} not found");
+            yaml = yaml.replace(from, &to.replace("{root}", &root.display().to_string()));
+        }
+        prepare(&work);
+        let dir = PathBuf::from(format!("/tmp/{name}"));
+        Self::launch(name, dir, yaml, app, work, Some(root), None, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch(
+        name: String,
+        dir: PathBuf,
+        yaml: String,
+        app: String,
+        work: PathBuf,
+        example_root: Option<PathBuf>,
+        private: Option<(String, String)>,
+        auto_dir: Option<&Path>,
+    ) -> Harness {
+        assert!(nix::unistd::geteuid().is_root(), "container scenarios need root; see the module docs");
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("conf.d")).unwrap();
         std::fs::create_dir_all(&work).unwrap();
         let sock = dir.join("pm.sock");
@@ -96,7 +153,7 @@ impl Harness {
                 private.is_some(),
             ),
         );
-        write_trusted(&dir.join("conf.d").join(format!("{APP}.yaml")), &compose(&work, service));
+        write_trusted(&dir.join("conf.d").join(format!("{app}.yaml")), &yaml);
         let log = std::fs::File::create(dir.join("daemon.out")).unwrap();
         let daemon = Command::new(env!("CARGO_BIN_EXE_processmaster"))
             .arg("-c")
@@ -117,6 +174,9 @@ impl Harness {
             cgroup: PathBuf::from("/sys/fs/cgroup").join(&name),
             instance: name,
             daemon: Some(daemon),
+            app,
+            work,
+            example_root,
         };
         h.wait_for("the daemon to answer", Duration::from_secs(15), || {
             rpc::client_call(&h.sock, Request::ServerVersion).map(|r| r.ok).unwrap_or(false)
@@ -134,25 +194,28 @@ impl Harness {
     }
 
     fn work(&self) -> PathBuf {
-        self.dir.join("work")
+        self.work.clone()
     }
     fn container(&self) -> String {
-        format!("pm-{}-{APP}", self.instance)
+        format!("pm-{}-{}", self.instance, self.app)
+    }
+    fn log(&self, rel: &str) -> String {
+        std::fs::read_to_string(self.work.join(rel)).unwrap_or_default()
     }
     fn call(&self, req: Request) -> Response {
         rpc::client_call(&self.sock, req).expect("rpc")
     }
     fn status(&self) -> StatusEntry {
-        let mut r = self.call(Request::Status { name: Some(APP.to_string()) });
+        let mut r = self.call(Request::Status { name: Some(self.app.clone()) });
         assert_eq!(r.statuses.len(), 1, "status: {}", r.message);
         r.statuses.remove(0)
     }
     fn start_svc(&self) -> Response {
-        self.call(Request::Start { name: APP.to_string(), force: false })
+        self.call(Request::Start { name: self.app.clone(), force: false })
     }
     fn stop_svc(&self) -> Duration {
         let t0 = Instant::now();
-        let r = self.call(Request::Stop { name: APP.to_string() });
+        let r = self.call(Request::Stop { name: self.app.clone() });
         assert!(r.ok, "stop: {}\n{}", r.message, self.daemon_output());
         t0.elapsed()
     }
@@ -202,7 +265,7 @@ impl Harness {
             }
         }
         let mut v = vec![];
-        walk(&self.cgroup.join(format!("pm-{APP}")), &mut v);
+        walk(&self.cgroup.join(format!("pm-{}", self.app)), &mut v);
         v
     }
 }
@@ -221,6 +284,9 @@ impl Drop for Harness {
         }
         let _ = std::fs::write(self.cgroup.join("cgroup.kill"), "1");
         let _ = self.podman(&["rm", "-f", "--volumes", "--ignore", "-t", "0", &self.container()]);
+        if let Some(root) = &self.example_root {
+            let _ = std::fs::remove_dir_all(root);
+        }
         if self.private_store {
             let _ = self.podman(&["system", "reset", "--force"]);
             let _ = std::fs::remove_dir_all(&self.store.0);
@@ -722,6 +788,156 @@ fn named_network_dns_helper_does_not_hold_the_service() {
     assert!(!in_cgroup.iter().any(|c| c.contains("aardvark")), "aardvark-dns in the service cgroup: {in_cgroup:?}");
     assert!(took < Duration::from_secs(5), "stop took {took:?} (something kept the cgroup busy)");
     assert!(h.service_pids().is_empty());
+}
+
+// ---- the shipped examples ------------------------------------------------------------
+//
+// Every container example in examples/ is run here as shipped: only its working
+// directory, host ports and host paths outside the working directory are substituted.
+
+fn root_file(path: &Path, contents: &str, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::write(path, contents).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Send inline Redis commands; returns everything the server answered.
+fn redis(port: u16, cmds: &[&str]) -> String {
+    let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) else { return String::new() };
+    let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+    for c in cmds {
+        let _ = write!(s, "{c}\r\n");
+    }
+    let _ = write!(s, "QUIT\r\n");
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    out
+}
+
+#[test]
+#[ignore = "needs root + podman + network (pulls redis)"]
+fn example_service_container_reference() {
+    let port = free_port();
+    let h = Harness::start_example(
+        "service.container.yaml",
+        &[("127.0.0.1:6379:6379", &format!("127.0.0.1:{port}:6379"))],
+        |work| std::fs::create_dir_all(work.join("data")).unwrap(),
+    );
+    h.wait_for("redis (pulled if missing) to answer", Duration::from_secs(300), || redis(port, &["PING"]).contains("+PONG"));
+    assert!(redis(port, &["SET pmkey pmval"]).contains("+OK"));
+    h.stop_svc();
+    assert!(h.start_svc().ok);
+    h.wait_for("redis to keep its data across a restart", Duration::from_secs(60), || redis(port, &["GET pmkey"]).contains("pmval"));
+    h.stop_svc();
+    assert!(!h.container_exists());
+}
+
+#[test]
+#[ignore = "needs root + podman + images"]
+fn example_nginx() {
+    let port = free_port();
+    let h = Harness::start_example("containers/nginx.yaml", &[("127.0.0.1:8080:", &format!("127.0.0.1:{port}:"))], |work| {
+        std::fs::create_dir_all(work.join("html")).unwrap();
+        root_file(&work.join("html/index.html"), "example-nginx-ok\n", 0o644);
+    });
+    h.wait_for("nginx to serve the mounted site", Duration::from_secs(60), || http_get(port, "/").contains("example-nginx-ok"));
+    h.wait_for("the access log", Duration::from_secs(10), || h.log("logs/access.log").contains("GET /"));
+    let took = h.stop_svc();
+    assert!(took < Duration::from_secs(8), "graceful stop (SIGQUIT) took {took:?}");
+    assert!(http_get(port, "/").is_empty() && !h.container_exists());
+}
+
+#[test]
+#[ignore = "needs root + podman + network (pulls redis)"]
+fn example_redis() {
+    let port = free_port();
+    let h = Harness::start_example(
+        "containers/redis.yaml",
+        &[("127.0.0.1:6379:6379", &format!("127.0.0.1:{port}:6379")), ("/etc/secrets/redis", "{root}/redis-secret")],
+        |work| {
+            std::fs::create_dir_all(work.join("data")).unwrap();
+            root_file(&work.parent().unwrap().join("redis-secret"), "example-secret", 0o600);
+        },
+    );
+    h.wait_for("redis (pulled if missing) to answer", Duration::from_secs(300), || !redis(port, &["PING"]).is_empty());
+    assert!(redis(port, &["PING"]).contains("NOAUTH"), "the password from the file is not in force");
+    assert!(redis(port, &["AUTH example-secret", "SET pmkey pmval"]).contains("+OK\r\n+OK"));
+    for pid in h.service_pids() {
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        assert!(!String::from_utf8_lossy(&cmdline).contains("example-secret"), "secret on a command line (pid {pid})");
+    }
+    h.stop_svc();
+    assert!(h.start_svc().ok);
+    h.wait_for("redis to keep its data across a restart", Duration::from_secs(60), || {
+        redis(port, &["AUTH example-secret", "GET pmkey"]).contains("pmval")
+    });
+    h.stop_svc();
+}
+
+#[test]
+#[ignore = "needs root + podman + images"]
+fn example_kafka() {
+    let port = free_port();
+    let h = Harness::start_example("containers/kafka.yaml", &[("127.0.0.1:9092:9092", &format!("127.0.0.1:{port}:9092"))], |work| {
+        std::fs::create_dir_all(work.join("data")).unwrap()
+    });
+    let started = |n: usize| h.stdout_log().matches("Kafka Server started").count() >= n;
+    h.wait_for("kafka to start", Duration::from_secs(120), || started(1));
+    h.wait_for("the forwarded port", Duration::from_secs(30), || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+    h.stop_svc();
+    assert!(h.stdout_log().contains("shut down completed"), "no controlled shutdown");
+    // Restart on the kept data folder.
+    assert!(h.start_svc().ok);
+    h.wait_for("kafka to start again on its data", Duration::from_secs(120), || started(2));
+    assert!(!h.stdout_log().contains("Exception in thread"), "{}", h.stdout_log());
+    h.stop_svc();
+}
+
+#[test]
+#[ignore = "needs root + podman + images (localhost/rusts3:test)"]
+fn example_s3_server_archive() {
+    let (api, console) = (free_port(), free_port());
+    let h = Harness::start_example(
+        "containers/s3-server-archive.yaml",
+        &[
+            ("127.0.0.1:8002:8002", &format!("127.0.0.1:{api}:8002")),
+            ("127.0.0.1:8003:8003", &format!("127.0.0.1:{console}:8003")),
+        ],
+        |work| {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::create_dir_all(work.join("data")).unwrap();
+            std::fs::create_dir_all(work.join("images")).unwrap();
+            std::fs::set_permissions(work.join("images"), std::fs::Permissions::from_mode(0o755)).unwrap();
+            let tar = work.join("images/rusts3-1.0.tar");
+            assert!(podman(&["tag", "localhost/rusts3:test", "localhost/rusts3:1.0"]).status.success());
+            assert!(podman(&["save", "-o", tar.to_str().unwrap(), "localhost/rusts3:1.0"]).status.success());
+            assert!(podman(&["rmi", "localhost/rusts3:1.0"]).status.success());
+            std::fs::set_permissions(&tar, std::fs::Permissions::from_mode(0o644)).unwrap();
+        },
+    );
+    h.wait_for("the S3 API (image loaded from the archive)", Duration::from_secs(120), || http_get(api, "/").starts_with("HTTP/"));
+    assert!(http_get(console, "/").starts_with("HTTP/"), "console port");
+    h.stop_svc();
+    assert!(!h.container_exists());
+    let _ = podman(&["rmi", "localhost/rusts3:1.0"]);
+}
+
+#[test]
+#[ignore = "needs root + podman + network (pulls alpine)"]
+fn example_nightly_backup() {
+    let h = Harness::start_example("containers/nightly-backup.yaml", &[("/srv/myapp/data", "{root}/source")], |work| {
+        let src = work.parent().unwrap().join("source");
+        std::fs::create_dir_all(&src).unwrap();
+        root_file(&src.join("app.conf"), "setting=1\n", 0o644);
+        std::fs::create_dir_all(work.join("out")).unwrap();
+    });
+    // A cron service runs now on start; the run's exit code is recorded.
+    assert!(h.start_svc().ok);
+    h.wait_for("the backup run to finish with exit 0", Duration::from_secs(300), || h.status().last_exit_code == Some(0));
+    assert!(h.log("logs/backup.log").contains("wrote /backup/myapp-"), "{}", h.log("logs/backup.err.log"));
+    let made: Vec<_> = std::fs::read_dir(h.work().join("out")).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert!(made.iter().any(|n| n.to_string_lossy().ends_with(".tar.gz")), "{made:?}");
+    h.wait_for("the run's container record to go", Duration::from_secs(10), || !h.container_exists());
 }
 
 // ---- compatibility with real images -------------------------------------------------

@@ -40,7 +40,7 @@ container:
   # else in the container is gone after a stop. Options are podman's: ro, rw, z/Z
   # (SELinux relabel), U (chown to the container user); z/Z/U are refused for system paths.
   volumes:
-    - ./data:/data:Z
+    - ./data:/data:Z,U                    # U: chown to the container user below
 
   # [ip:][host_port:]container_port[/tcp|udp|sctp]
   ports: ["127.0.0.1:6379:6379"]

@@ -1,0 +1,26 @@
+# A single-node Kafka (KRaft) broker: a JVM that needs time to start and to stop.
+#   mkdir -p /srv/kafka/data
+#
+# The apache/kafka image runs its built-in single-node configuration unless KAFKA_*
+# broker settings are passed; passing any of them replaces that whole configuration.
+# So data is kept by mounting the image's default log directory, and only JVM options
+# (KAFKA_HEAP_OPTS) are set.
+application: kafka
+
+container:
+  image: docker.io/apache/kafka:3.9.0
+  ports: ["127.0.0.1:9092:9092"]
+  env:
+    KAFKA_HEAP_OPTS: "-Xms512m -Xmx512m"
+  volumes:
+    - ./data:/tmp/kraft-combined-logs:Z,U # the image's default log.dirs; U: chown to its user
+  working_directory: /srv/kafka
+  stop_grace_period_ms: 60000             # controlled shutdown; SIGKILL only after a minute
+
+resources:
+  max_memory: 1GiB                        # heap + JVM overhead + podman (~20MB)
+  max_cpu: 2000m
+  max_pids: 1024                          # JVM threads count against pids.max
+
+restart_policy:
+  policy: always

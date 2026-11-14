@@ -1,0 +1,26 @@
+# An image delivered as a file instead of from a registry (offline / air-gapped hosts).
+# Build or fetch the image elsewhere, then:
+#   podman save -o rusts3-1.0.tar localhost/rusts3:1.0
+#   install -o root -g root -m 0644 rusts3-1.0.tar /srv/rusts3/images/
+# The archive and every directory above it must be root-owned and not group/other-
+# writable. It is loaded on the first start after each daemon start, and again whenever
+# the file changes; `image` is the tag inside the archive.
+#   mkdir -p /srv/rusts3/data
+application: rusts3
+
+container:
+  image: localhost/rusts3:1.0
+  image_archive: ./images/rusts3-1.0.tar  # implies pull: never
+  ports:
+    - "127.0.0.1:8002:8002"               # S3 API
+    - "127.0.0.1:8003:8003"               # console
+  volumes:
+    - ./data:/data:Z,U                    # the image runs as a non-root user
+  working_directory: /srv/rusts3
+  stop_grace_period_ms: 15000
+
+resources:
+  max_memory: 512MiB
+
+restart_policy:
+  policy: always

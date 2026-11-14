@@ -75,6 +75,7 @@ fn every_example_service_definition_loads() {
     for dir in [
         repo_root().join("examples"),
         repo_root().join("examples").join("config.d"),
+        repo_root().join("examples").join("containers"),
     ] {
         for path in yaml_files_in(&dir) {
             // Master configs live alongside the service samples; skip them here.

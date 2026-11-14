@@ -280,11 +280,13 @@ fn resolve_host_path(s: &str, working_directory: &Path, field: &str) -> anyhow::
 /// changing system content breaks other services (see podman-run(1), "Labeling Volume
 /// Mounts").
 fn is_system_path(p: &Path) -> bool {
+    // `/var/lib/<app>` is ordinary application data and may be relabelled; `/var/lib`
+    // itself and podman's own state are not.
     const TREES: &[&str] = &[
         "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/proc", "/sys", "/dev", "/run", "/var/run",
-        "/var/lib",
+        "/var/lib/containers",
     ];
-    const EXACT: &[&str] = &["/", "/home", "/root", "/var", "/opt", "/srv", "/tmp", "/mnt", "/media"];
+    const EXACT: &[&str] = &["/", "/home", "/root", "/var", "/var/lib", "/opt", "/srv", "/tmp", "/mnt", "/media"];
     EXACT.iter().any(|e| p == Path::new(e)) || TREES.iter().any(|t| p.starts_with(t))
 }
 
@@ -752,7 +754,9 @@ mod tests {
         assert!(lower("image: x\ncommand: []").is_err());
         assert!(lower("image: x\nenv: {'A*': '1'}").is_err());
         assert!(lower("image: x\nvolumes: ['/etc/app:/x:U']").is_err());
-        assert!(lower("image: x\nvolumes: ['/var/lib/app:/x:Z']").is_err());
+        assert!(lower("image: x\nvolumes: ['/var/lib:/x:Z']").is_err());
+        assert!(lower("image: x\nvolumes: ['/var/lib/containers/storage:/x:U']").is_err());
+        assert!(lower("image: x\nvolumes: ['/var/lib/myapp:/x:Z,U']").is_ok());
     }
 
     #[test]

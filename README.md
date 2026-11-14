@@ -467,22 +467,40 @@ host commands. The container runs in the service's own cgroup, so its limits, st
 logging, restart policy and cron all behave the same.
 
 ```yaml
-# conf.d/web.yaml
+# conf.d/web.yaml (examples/containers/nginx.yaml)
 application: web
+
 container:
   image: docker.io/library/nginx:1.27-alpine
-  ports: ["127.0.0.1:8080:80"]
-  volumes: ["./html:/usr/share/nginx/html:ro,Z"]
-  env: { TZ: Asia/Singapore }
-  working_directory: /srv/web       # host side: ./html and the logs resolve here
+  ports: ["127.0.0.1:8080:80"]            # host 127.0.0.1:8080 -> container 80
+  volumes:
+    - ./html:/usr/share/nginx/html:ro,Z    # relative to working_directory
+  working_directory: /srv/web             # host side: ./html and ./logs live here
+  stop_signal: SIGQUIT                    # nginx's graceful shutdown signal
   stop_grace_period_ms: 10000
+
+logs:
+  stdout: ./logs/access.log               # nginx logs to stdout/stderr in this image
+  stderr: ./logs/error.log
+
 resources:
-  max_memory: 256MiB
+  max_memory: 128MiB
+
 restart_policy:
   policy: always
 ```
 
-The full commented example is `examples/service.container.yaml`.
+More examples, each run end to end by the container tests
+(`tests/container_scenarios.rs`), are in `examples/containers/`:
+
+| file | shows |
+|---|---|
+| `examples/service.container.yaml` | every `container:` key, annotated (a Redis server) |
+| `examples/containers/nginx.yaml` | a web server: port forwarding, a read-only mounted site, graceful SIGQUIT |
+| `examples/containers/redis.yaml` | persistent data, a non-root container user (`:U`), a password from a root-only file |
+| `examples/containers/kafka.yaml` | a slow-to-stop JVM: long grace period, memory/CPU/pids limits |
+| `examples/containers/s3-server-archive.yaml` | an offline image loaded from a `podman save` archive |
+| `examples/containers/nightly-backup.yaml` | a container cron job with `max_time_per_run`, recording its exit code |
 
 **Requirements:** rootful podman (tested with 5.8) and cgroup v2. **Docker is not
 supported:** `docker run` only asks dockerd to start the container, and dockerd puts
@@ -658,7 +676,9 @@ as for host commands.
 - **SELinux:** bind mounts usually need `:z` (shared) or `:Z` (private). If the image
   runs as a non-root user, add `U` (`./data:/data:Z,U`) so podman chowns the source to
   that user; otherwise the app gets "permission denied". `z`, `Z` and `U` are refused
-  for system paths (`/etc`, `/usr`, `/var/lib`, `/run`, …).
+  for system paths (`/etc`, `/usr`, `/run`, `/var/lib` itself, `/var/lib/containers`, …);
+  `/var/lib/<app>` is fine. A container cannot read an unlabelled host folder on an
+  SELinux host, so read-only mounts need `:ro,z` too.
 - **Startup window:** RUNNING means podman is in the service's cgroup; the container
   itself may still be being created for a moment (a stop at that point still stops it
   gracefully). Health checks are not supported: podman runs them from systemd timers,

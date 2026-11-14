@@ -1,0 +1,26 @@
+# A database with persistent data and a password from a root-only file.
+#   mkdir -p /srv/redis/data
+#   install -m 0600 /dev/stdin /etc/secrets/redis <<< 'change-me'
+application: redis
+
+container:
+  image: docker.io/library/redis:7.4
+  command: [sh, -c, 'exec redis-server --appendonly yes --requirepass "$REDIS_PASSWORD"']
+  env:
+    REDIS_PASSWORD: "@file:///etc/secrets/redis"   # read by processmaster; not on any command line
+  volumes:
+    - ./data:/data:Z,U                    # U: chown to the image's redis user
+  ports: ["127.0.0.1:6379:6379"]
+  working_directory: /srv/redis
+  stop_grace_period_ms: 15000             # time to flush the append-only file
+
+resources:
+  max_memory: 512MiB
+  max_cpu: 1000m
+
+restart_policy:
+  policy: always
+  restart_backoff_ms: 2000
+  tolerance:
+    max_restarts: 5
+    duration: 10m

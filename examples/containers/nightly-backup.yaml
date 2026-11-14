@@ -1,0 +1,31 @@
+# A container cron job: runs at 02:30 every day, at most 30 minutes per run.
+# The exit code of each run is recorded (`pmctl status nightly-backup`), and its output
+# goes to the logs below. Runs never overlap.
+#   mkdir -p /srv/backup/out   (and /srv/myapp/data is the folder being backed up)
+application: nightly-backup
+
+container:
+  image: docker.io/library/alpine:3.20
+  command:
+    - sh
+    - -c
+    - |
+      set -e
+      out=/backup/myapp-$(date +%F).tar.gz
+      tar -czf "$out" -C /source .
+      echo "wrote $out"
+      find /backup -name 'myapp-*.tar.gz' -mtime +14 -delete
+  volumes:
+    # On SELinux hosts a container can only read a host folder labelled for it: `z` is
+    # the shared label, so the services that own the folder keep their access (`Z` would
+    # make it private to this container). System folders such as /etc cannot be
+    # relabelled (refused), so back up application data folders like this one.
+    - /srv/myapp/data:/source:ro,z
+    - ./out:/backup:Z
+  working_directory: /srv/backup
+  schedule: "30 2 * * *"
+  max_time_per_run: 30m                   # stopped (podman stop, then kill) if exceeded
+
+logs:
+  stdout: ./logs/backup.log
+  stderr: ./logs/backup.err.log

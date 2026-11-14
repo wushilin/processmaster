@@ -119,20 +119,27 @@ Runs never overlap: if the previous run is still going at the next tick, that ti
 Use `container:` instead of `process:`. A file with both is refused. Full example: `examples/service.container.yaml`. Put it in config_directory (e.g. `conf.d/redis.yaml`). Auto services never generate a container definition (the default is always `./run.sh`). A hand-written `service.yml` with `container:` in an auto-service folder does work, with working_directory defaulting to that folder.
 
 ```yaml
+# examples/containers/nginx.yaml (tested; see examples/containers/ for redis, kafka, archive, cron)
 application: web
+
 container:
-  image: docker.io/library/nginx:1.27-alpine   # pull: missing (default) | always | never
-  ports: ["127.0.0.1:8080:80"]
-  volumes: ["./html:/usr/share/nginx/html:ro,Z"]   # relative to working_directory; Z = SELinux relabel
-  env: { TZ: Asia/Singapore }                       # map or list; @file:// etc. supported
-  # user: "999:999"            # user INSIDE the container (podman itself runs as root)
-  # image_archive: ./img.tar   # load a `podman save` archive instead of pulling (root-owned path)
-  # extra_args: [--init]       # -d/--rm/--name/--restart/-t/-i/--cgroups/-v/... are refused
-  working_directory: /srv/web   # host side: relative volumes/logs/image_archive resolve here
-  stop_signal: SIGTERM          # sent by `podman stop`; SIGKILL after stop_grace_period_ms
-  # schedule / not_before / not_after / max_time_per_run: cron, as under process:
+  image: docker.io/library/nginx:1.27-alpine
+  ports: ["127.0.0.1:8080:80"]            # host 127.0.0.1:8080 -> container 80
+  volumes:
+    - ./html:/usr/share/nginx/html:ro,Z    # relative to working_directory
+  working_directory: /srv/web             # host side: ./html and ./logs live here
+  stop_signal: SIGQUIT                    # nginx's graceful shutdown signal
+  stop_grace_period_ms: 10000
+
+logs:
+  stdout: ./logs/access.log               # nginx logs to stdout/stderr in this image
+  stderr: ./logs/error.log
+
 resources:
-  max_memory: 256MiB            # ≥ 64MiB and max_pids ≥ 64 when set (podman runs in the cgroup)
+  max_memory: 128MiB
+
+restart_policy:
+  policy: always
 ```
 
 - It is supervised like any other service: it runs in its own cgroup, restart_policy/schedule work, logs go to the usual files, and a stop is definite (podman stop → cgroup.kill → podman rm).
