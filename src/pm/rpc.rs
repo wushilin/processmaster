@@ -44,6 +44,8 @@ pub enum Request {
     AdminPs,
     /// Return server build info (build_host/build_time).
     ServerVersion,
+    /// Where processmaster keeps container images and state (for `pmctl podman`).
+    ContainerStore,
     /// Read per-app performance metrics from cgroup (same snapshot as the web UI modal).
     PerfMetrics { name: String },
     Start { name: String, #[serde(default)] force: bool },
@@ -137,6 +139,9 @@ pub struct StatusEntry {
     pub last_run_at_ms: Option<i64>,
     #[serde(default)]
     pub last_exit_code: Option<i32>,
+    /// Container image, if this is a container (podman) service.
+    #[serde(default)]
+    pub image: Option<String>,
     /// Cron schedule expression, if this is a scheduled job.
     #[serde(default)]
     pub schedule: Option<String>,
@@ -169,6 +174,17 @@ pub struct Response {
     /// Per-app cgroup resource snapshot (for `PerfMetrics`).
     #[serde(default)]
     pub perf_metrics: Option<PerfMetricsSnapshot>,
+    /// processmaster's podman store (for `ContainerStore`).
+    #[serde(default)]
+    pub container_store: Option<ContainerStoreInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerStoreInfo {
+    pub storage_root: String,
+    pub run_root: String,
+    #[serde(default)]
+    pub tmp_dir: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -297,6 +297,11 @@ pub(super) enum SupervisorCmd {
         epoch: u64,
         code: Option<i32>,
     },
+    /// A container image pull/load finished. `stamp` identifies a loaded archive.
+    FetchDone {
+        epoch: u64,
+        result: Result<Option<podman::ArchiveStamp>, String>,
+    },
     /// The cgroup waiter could not determine liveness (I/O error, fd exhaustion).
     /// Distinct from `WaiterExited` on purpose: "I could not look" is not "it exited".
     WaiterFailed {
@@ -326,6 +331,11 @@ pub(super) fn spawn_supervisor_thread(
         waiter_epoch: 0,
         waiter_cancel: None,
         pending_failure_restart_at: None,
+        fetch: None,
+        fetch_epoch: 0,
+        image_ready_once: false,
+        loaded_archive: None,
+        started_def: None,
     };
     let app = sup.app.clone();
     let task = tasks().spawn(sup.run(rx, shutting_down));
@@ -365,6 +375,54 @@ struct Supervisor {
     waiter_cancel: Option<WaiterCancel>,
     /// When set, a `FailureAutoRestart` fires at this instant (BACKOFF).
     pending_failure_restart_at: Option<Instant>,
+    /// Container services: an image pull/load in flight. It runs as a task so the
+    /// supervisor keeps handling commands (a stop cancels it); when it finishes the
+    /// start that needed it is run again.
+    fetch: Option<FetchJob>,
+    fetch_epoch: u64,
+    /// Set right after a successful fetch so the re-run start skips the image check.
+    image_ready_once: bool,
+    /// The image archive this daemon last loaded for the service.
+    loaded_archive: Option<podman::ArchiveStamp>,
+    /// The definition the running instance was started with. A reload replaces `def`
+    /// before the old instance is stopped, and a container must be stopped as a
+    /// container (and a plain process as a plain process).
+    started_def: Option<AppDefinition>,
+}
+
+struct FetchJob {
+    epoch: u64,
+    /// What was fetched for; if the definition changes meanwhile, the start re-checks.
+    spec: Option<crate::pm::container::ContainerSpec>,
+    cancel: Arc<AtomicBool>,
+    origin: StartOrigin,
+}
+
+
+/// Which start a finished image fetch resumes.
+#[derive(Debug, Clone, Copy)]
+enum StartOrigin {
+    Manual { force: bool },
+    Reload { force: bool },
+    ManualRestart { force: bool },
+    ReloadRestart { force: bool },
+    Boot,
+    Scheduled,
+    AutoRestart,
+}
+
+impl StartOrigin {
+    fn as_str(&self) -> &'static str {
+        match self {
+            StartOrigin::Manual { .. } => "manual_start",
+            StartOrigin::Reload { .. } => "reload_start",
+            StartOrigin::ManualRestart { .. } => "manual_restart",
+            StartOrigin::ReloadRestart { .. } => "reload_restart",
+            StartOrigin::Boot => "boot_start",
+            StartOrigin::Scheduled => "scheduled_start",
+            StartOrigin::AutoRestart => "failure_auto_restart",
+        }
+    }
 }
 
 /// Bounded wait for a fresh start to show up in the service's cgroup.
@@ -397,7 +455,14 @@ impl Supervisor {
             let Some(cmd) = cmd else { break };
 
             match cmd {
-                SupervisorCmd::Update { def } => self.def = *def,
+                SupervisorCmd::Update { def } => {
+                    // A fetch for an image the service no longer uses (or a service that is
+                    // now disabled) must not go on to start it.
+                    if self.fetch.is_some() && (!def.enabled || def.container != self.def.container) {
+                        self.cancel_fetch("definition_changed");
+                    }
+                    self.def = *def;
+                }
                 SupervisorCmd::ReloadStart { force, resp } => {
                     let _ = resp.send(self.reload_start(force).await);
                 }
@@ -426,10 +491,19 @@ impl Supervisor {
                     let _ = resp.send(self.scheduled_start().await);
                 }
                 SupervisorCmd::FailureAutoRestart => self.failure_auto_restart().await,
+                // Never start anything once shutdown has begun.
+                SupervisorCmd::FetchDone { .. } if shutting_down.load(Ordering::Relaxed) => {
+                    self.fetch = None;
+                }
+                SupervisorCmd::FetchDone { epoch, result } => self.fetch_done(epoch, result).await,
                 SupervisorCmd::WaiterFailed { epoch } => self.waiter_failed(epoch),
                 SupervisorCmd::WaiterExited { epoch, code } => self.waiter_exited(epoch, code),
                 SupervisorCmd::Shutdown => break,
             }
+        }
+        // Do not leave a pull running for minutes after the supervisor is gone.
+        if let Some(job) = self.fetch.take() {
+            job.cancel.store(true, Ordering::Relaxed);
         }
     }
 
@@ -459,6 +533,9 @@ impl Supervisor {
         // Not running: clear crash history, and start now.
         self.update_info(|e| e.recent_system_crashes_ms.clear());
 
+        if !self.image_gate(StartOrigin::Reload { force }).await? {
+            return Ok(());
+        }
         self.set_phase(Phase::Starting, "reload_start");
         disown_service_child(self.spawn_child().await??);
 
@@ -494,6 +571,9 @@ impl Supervisor {
         // Clear crash history on accepted manual start attempts.
         self.update_info(|e| e.recent_system_crashes_ms.clear());
 
+        if !self.image_gate(StartOrigin::Manual { force }).await? {
+            return Ok(());
+        }
         self.set_phase(Phase::Starting, "manual_start");
         let child_r = self.spawn_child().await?;
         if self.def.schedule.is_some() {
@@ -539,6 +619,15 @@ impl Supervisor {
 
     async fn manual_stop(&mut self) -> anyhow::Result<()> {
         let app = self.app.clone();
+        if self.cancel_fetch("manual_stop") {
+            self.update_info(|e| sysflag_set_with_rules(&app, &mut e.system_flags, SYSFLAG_USER_STOP, None));
+        }
+        // A container that died on its own (OOM, crash) may have left podman's record,
+        // network namespace and port rules behind; a stop clears them even then.
+        if self.def.container.is_some() && !cgroup_running_or_assume_running(&self.cfg, &app).await {
+            let (cfg, app2) = (self.cfg.clone(), app.clone());
+            let _ = tasks().spawn_blocking(move || podman::remove_container(&cfg, &app2)).await;
+        }
         // If already stopped, do NOT update markers OR clear FAILED/BACKOFF/history.
         // "Stop" should be a no-op if nothing is running; keeping FAILED makes sense for failed/stopped services.
         if !cgroup_running_or_assume_running(&self.cfg, &app).await {
@@ -589,6 +678,7 @@ impl Supervisor {
         // System stop should not persist operator intent.
         // A restart scheduled during backoff must not fire mid-shutdown.
         self.pending_failure_restart_at = None;
+        self.cancel_fetch("shutdown");
         if !cgroup_running_or_assume_running(&self.cfg, &self.app).await {
             self.set_phase(Phase::Stopped, "stop_noop_already_stopped");
             return Ok(());
@@ -625,6 +715,7 @@ impl Supervisor {
             anyhow::bail!("service {app} is disabled");
         }
         self.update_info(|e| e.recent_system_crashes_ms.clear());
+        self.cancel_fetch("manual_restart");
         // Stop step
         if cgroup_running_or_assume_running(&self.cfg, &app).await {
             // IMPORTANT: during manual restart we intentionally stop the cgroup.
@@ -640,6 +731,9 @@ impl Supervisor {
         // Start step
         if cgroup_running_or_assume_running(&self.cfg, &app).await {
             self.ensure_waiter_attached(false).await;
+            return Ok(());
+        }
+        if !self.image_gate(StartOrigin::ManualRestart { force }).await? {
             return Ok(());
         }
         self.set_phase(Phase::Restarting, "manual_restart_start");
@@ -679,6 +773,7 @@ impl Supervisor {
             anyhow::bail!("{app}: scheduled jobs do not support reload restart");
         }
         self.update_info(|e| e.recent_system_crashes_ms.clear());
+        self.cancel_fetch("reload_restart");
         // Stop step (same invalidation as manual restart).
         if cgroup_running_or_assume_running(&self.cfg, &app).await {
             self.detach_waiter();
@@ -693,6 +788,9 @@ impl Supervisor {
             self.ensure_waiter_attached(false).await;
             record_started_in_store(&self.run_info, &app, StartKind::Restart, SystemFlag::SystemStart);
             self.set_phase(Phase::Running, "reload_restart_completed");
+            return Ok(());
+        }
+        if !self.image_gate(StartOrigin::ReloadRestart { force }).await? {
             return Ok(());
         }
         self.set_phase(Phase::Starting, "reload_restart_start");
@@ -731,6 +829,9 @@ impl Supervisor {
             self.ensure_waiter_attached(false).await;
             return Ok(());
         }
+        if !self.image_gate(StartOrigin::Boot).await? {
+            return Ok(());
+        }
         self.set_phase(Phase::Starting, "boot_start");
         disown_service_child(self.spawn_child().await??);
         if !self.wait_for_cgroup_nonempty().await {
@@ -756,6 +857,14 @@ impl Supervisor {
         if cgroup_running_or_assume_running(&self.cfg, &app).await {
             self.ensure_waiter_attached(false).await;
             return Ok(());
+        }
+        match self.image_gate(StartOrigin::Scheduled).await {
+            Ok(true) => {}
+            Ok(false) => return Ok(()),
+            Err(e) => {
+                record_cron_failed_start_in_store(&self.run_info, &self.events, &app, "scheduled_start_image_error", &format!("{e:#}"), 1);
+                return Err(e);
+            }
         }
         self.set_phase(Phase::Starting, "scheduled_start");
         let child = match self.spawn_child().await {
@@ -807,8 +916,16 @@ impl Supervisor {
             return;
         }
 
+        let gate = self.image_gate(StartOrigin::AutoRestart).await;
+        if matches!(gate, Ok(false)) {
+            return;
+        }
         self.set_phase(Phase::Restarting, "failure_auto_restart");
-        let spawn_err = match self.spawn_child().await {
+        let spawn_r = match gate {
+            Ok(_) => self.spawn_child().await,
+            Err(e) => Ok(Err(e)),
+        };
+        let spawn_err = match spawn_r {
             Ok(Ok(child)) => {
                 disown_service_child(child);
                 None
@@ -876,6 +993,113 @@ impl Supervisor {
         record_started_in_store(&self.run_info, &app, StartKind::Restart, SystemFlag::SystemStart);
         self.ensure_waiter_attached(true).await;
         self.set_phase(Phase::Running, "failure_auto_restart_completed");
+    }
+
+    // ---- container images ----------------------------------------------------------
+
+    /// Before a container start: make sure the image is in processmaster's store.
+    /// `Ok(true)`: start now. `Ok(false)`: a pull/load is running in the background and
+    /// re-runs this start when it finishes (phase PULLING).
+    async fn image_gate(&mut self, origin: StartOrigin) -> anyhow::Result<bool> {
+        let Some(spec) = self.def.container.clone() else { return Ok(true) };
+        if self.fetch.is_some() {
+            return Ok(false);
+        }
+        if std::mem::take(&mut self.image_ready_once) {
+            return Ok(true);
+        }
+        let (cfg, app, loaded) = (self.cfg.clone(), self.app.clone(), self.loaded_archive);
+        let spec2 = spec.clone();
+        let plan = tasks()
+            .spawn_blocking(move || podman::plan_image(&cfg, &app, &spec2, loaded))
+            .await
+            .map_err(|e| anyhow::anyhow!("join error: {e}"))??;
+        let (what, stamp) = match &plan {
+            podman::ImagePlan::Ready => return Ok(true),
+            podman::ImagePlan::Pull => ("pull", None),
+            podman::ImagePlan::Load { stamp, .. } => ("load", Some(*stamp)),
+        };
+        self.fetch_epoch = self.fetch_epoch.wrapping_add(1);
+        let epoch = self.fetch_epoch;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (cfg, def, tx, cancel2) = (self.cfg.clone(), self.def.clone(), self.tx_self.clone(), Arc::clone(&cancel));
+        tasks().spawn_blocking(move || {
+            // Always report back: a lost FetchDone would leave the service PULLING forever.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                podman::fetch_image(&cfg, &def, &spec, &plan, &cancel2)
+            }))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("image fetch panicked")))
+            .map(|()| stamp)
+            .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(SupervisorCmd::FetchDone { epoch, result });
+        });
+        self.fetch = Some(FetchJob { epoch, spec: self.def.container.clone(), cancel, origin });
+        push_event(
+            &self.events,
+            "container",
+            Some(&self.app),
+            format!("image={} fetch={what} origin={}", self.def.container.as_ref().map(|c| c.image.as_str()).unwrap_or(""), origin.as_str()),
+        );
+        self.set_phase(Phase::Pulling, origin.as_str());
+        Ok(false)
+    }
+
+    /// Cancel an in-flight image fetch. Returns whether there was one.
+    fn cancel_fetch(&mut self, reason: &str) -> bool {
+        let Some(job) = self.fetch.take() else { return false };
+        job.cancel.store(true, Ordering::Relaxed);
+        push_event(&self.events, "container", Some(&self.app), format!("fetch=cancelled reason={reason}"));
+        self.set_phase(Phase::Stopped, &format!("{reason}_cancelled_fetch"));
+        true
+    }
+
+    async fn fetch_done(&mut self, epoch: u64, result: Result<Option<podman::ArchiveStamp>, String>) {
+        let Some(job) = self.fetch.take_if(|j| j.epoch == epoch) else { return };
+        let app = self.app.clone();
+        let origin = job.origin;
+        match result {
+            Ok(stamp) => {
+                if stamp.is_some() {
+                    self.loaded_archive = stamp;
+                }
+                push_event(&self.events, "container", Some(&app), format!("fetch=done outcome=ok origin={}", origin.as_str()));
+                self.image_ready_once = job.spec == self.def.container;
+                let r = match origin {
+                    StartOrigin::Manual { force } => self.manual_start(force).await,
+                    StartOrigin::Reload { force } => self.reload_start(force).await,
+                    StartOrigin::ManualRestart { force } => self.manual_restart(force).await,
+                    StartOrigin::ReloadRestart { force } => self.reload_restart(force).await,
+                    StartOrigin::Boot => self.boot_start().await,
+                    StartOrigin::Scheduled => self.scheduled_start().await,
+                    StartOrigin::AutoRestart => {
+                        self.failure_auto_restart().await;
+                        Ok(())
+                    }
+                };
+                self.image_ready_once = false;
+                if let Err(e) = r {
+                    push_event(&self.events, "container", Some(&app), format!("start_after_fetch outcome=error err={e:#}"));
+                }
+                // The resumed start may have bailed out early (disabled, stopped by user,
+                // ...) without setting a phase.
+                if self.fetch.is_none() && self.info().last_emitted_phase == Some(Phase::Pulling) {
+                    self.set_phase(Phase::Stopped, "start_after_fetch_skipped");
+                }
+            }
+            Err(e) => {
+                push_event(&self.events, "container", Some(&app), format!("fetch=done outcome=error origin={} err={e}", origin.as_str()));
+                if self.def.schedule.is_some() {
+                    record_cron_failed_start_in_store(&self.run_info, &self.events, &app, "image_fetch_failed", &e, 1);
+                    self.set_phase(Phase::Stopped, "image_fetch_failed");
+                } else {
+                    // Same policy as a start that fails at once: back off and retry
+                    // within the restart tolerance, then FAILED.
+                    self.set_phase(Phase::Stopped, "image_fetch_failed");
+                    let msg = self.handle_exit_during_start(origin.as_str());
+                    push_event(&self.events, "container", Some(&app), format!("decision={msg}"));
+                }
+            }
+        }
     }
 
     fn waiter_failed(&mut self, epoch: u64) {
@@ -1086,14 +1310,16 @@ impl Supervisor {
 
     /// Launches the service off the async runtime. The outer error is a failed join of
     /// the blocking task, the inner one a failed launch.
-    async fn spawn_child(&self) -> anyhow::Result<anyhow::Result<std::process::Child>> {
+    async fn spawn_child(&mut self) -> anyhow::Result<anyhow::Result<std::process::Child>> {
         let cfg = self.cfg.clone();
         let def = self.def.clone();
+        self.started_def = Some(self.def.clone());
         Ok(tasks().spawn_blocking(move || spawn_launcher_child(&cfg, &def)).await?)
     }
 
     async fn exec_stop(&self) -> anyhow::Result<StopResult> {
-        let (cfg, def, app, events) = (self.cfg.clone(), self.def.clone(), self.app.clone(), Arc::clone(&self.events));
+        let def = self.started_def.clone().unwrap_or_else(|| self.def.clone());
+        let (cfg, app, events) = (self.cfg.clone(), self.app.clone(), Arc::clone(&self.events));
         tasks()
             .spawn_blocking(move || stop_common(Some(&events), &cfg, &def, &app))
             .await

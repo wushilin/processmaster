@@ -85,6 +85,13 @@ pub enum Cmd {
     Version,
     /// Print server build info (requires daemon socket)
     ServerVersion,
+    /// Run podman against processmaster's own container store
+    /// (e.g. `pmctl podman images`, `pmctl podman image prune`, `pmctl podman load -i x.tar`)
+    #[command(trailing_var_arg = true, allow_hyphen_values = true)]
+    Podman {
+        /// Arguments passed to podman
+        args: Vec<std::ffi::OsString>,
+    },
     /// Show per-app performance/resource metrics from cgroup (memory/swap/cpu + pressure/throttling)
     PerfMetrics {
         name: String,
@@ -293,6 +300,23 @@ pub fn run() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Password { .. } => unreachable!("handled before sock resolution"),
+        Cmd::Podman { args } => {
+            let resp = rpc::client_call(&sock, rpc::Request::ContainerStore)?;
+            let store = resp
+                .container_store
+                .ok_or_else(|| anyhow::anyhow!("daemon did not report a container store: {}", resp.message))?;
+            use std::os::unix::process::CommandExt as _;
+            let err = std::process::Command::new("podman")
+                .arg("--root")
+                .arg(&store.storage_root)
+                .arg("--runroot")
+                .arg(&store.run_root)
+                .arg("--tmpdir")
+                .arg(&store.tmp_dir)
+                .args(&args)
+                .exec();
+            Err(anyhow::anyhow!("exec podman: {err}"))
+        }
         Cmd::PerfMetrics {
             name,
             interval_ms,

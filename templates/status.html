@@ -649,11 +649,15 @@
     if (badge.includes("pm-state-warn")) return "pm-row-warn";
     return "";
   }
+  // Container services: the image, under the service name.
+  function imageLine(s) {
+    return s.image ? `<div class="pm-truncate"><small class="text-muted" title="podman image">${esc(s.image)}</small></div>` : "";
+  }
   function badgeForState(s) {
     const phase = (s.phase || (s.running ? "RUNNING" : "STOPPED")).toUpperCase();
     if (phase.includes("RUN")) return 'pm-state pm-state-run';
     if (phase.includes("FAIL") || phase.includes("CRASH")) return 'pm-state pm-state-bad';
-    if (phase.includes("BACKOFF")) return 'pm-state pm-state-warn';
+    if (phase.includes("BACKOFF") || phase.includes("PULLING")) return 'pm-state pm-state-warn';
     return 'pm-state pm-state-idle';
   }
   // Desired state was removed (daemon is synchronous-command driven).
@@ -687,7 +691,7 @@
       const pids = (s.pids || []);
       const ups = (s.pid_uptimes_ms || []);
       const [pidLines, upLines] = pidCells(pids, ups, `data-app="${esc(app)}"`);
-      const appBtn = `<button type="button" class="btn btn-link btn-sm p-0 text-decoration-none" data-action="details" data-app="${esc(app)}" title="Show service details"><code>${esc(app)}</code></button>`;
+      const appBtn = `<button type="button" class="btn btn-link btn-sm p-0 text-decoration-none" data-action="details" data-app="${esc(app)}" title="Show service details"><code>${esc(app)}</code></button>` + imageLine(s);
       const actions = [
         iconButton("play", "Start", "start", app),
         iconButton("stop", "Stop", "stop", app),
@@ -718,7 +722,7 @@
       const pids = (s.pids || []);
       const ups = (s.pid_uptimes_ms || []);
       const [pidLines, upLines] = pidCells(pids, ups, `data-app="${esc(app)}"`);
-      const appBtn = `<button type="button" class="btn btn-link btn-sm p-0 text-decoration-none" data-action="details" data-app="${esc(app)}" title="Show service details"><code>${esc(app)}</code></button>`;
+      const appBtn = `<button type="button" class="btn btn-link btn-sm p-0 text-decoration-none" data-action="details" data-app="${esc(app)}" title="Show service details"><code>${esc(app)}</code></button>` + imageLine(s);
       const scheduleBtn = `<button type="button" class="btn btn-sm btn-outline-info" data-action="schedule" data-app="${esc(app)}"><code>${esc(expr)}</code></button>`;
       const actions = [
         iconButton("play", "Run now", "start", app),

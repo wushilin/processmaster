@@ -72,6 +72,22 @@ pub struct MasterConfig {
     /// Optional: operator-triggered admin commands (run as root, from working dir '.').
     #[serde(default)]
     pub admin_actions: BTreeMap<String, AdminActionConfig>,
+
+    /// Container services always use processmaster's own podman store, never the host's
+    /// shared one. `None` means the default under `/var/lib/processmaster/<instance>`.
+    #[serde(default)]
+    pub container_storage_root: Option<PathBuf>,
+    /// Podman runtime state for that store. `None` means `/run/processmaster/<instance>`.
+    #[serde(default)]
+    pub container_run_root: Option<PathBuf>,
+    /// Remove images in processmaster's store that no service definition uses
+    /// (at boot, after each reload, and hourly). Default true.
+    #[serde(default = "default_true")]
+    pub container_prune_unused_images: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +252,9 @@ impl Default for MasterConfig {
             default_service_group: "root".to_string(),
             web_console: WebConsoleConfig::default(),
             admin_actions: BTreeMap::new(),
+            container_storage_root: None,
+            container_run_root: None,
+            container_prune_unused_images: true,
         }
     }
 }
@@ -287,6 +306,21 @@ struct MasterConfigFile {
     web_console: Option<WebConsoleConfigFile>,
     #[serde(default)]
     admin_actions: Option<BTreeMap<String, AdminActionConfigFile>>,
+    #[serde(default)]
+    containers: Option<ContainersConfigFile>,
+}
+
+/// `containers:` in the master config. processmaster always keeps container images and
+/// state in its own store; these only move it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContainersConfigFile {
+    #[serde(default)]
+    storage_root: Option<PathBuf>,
+    #[serde(default)]
+    run_root: Option<PathBuf>,
+    #[serde(default = "default_true")]
+    prune_unused_images: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -626,6 +660,59 @@ fn check_trusted_chain(path: &Path, trusted_uids: &[u32]) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Where processmaster keeps container images and state: `(storage_root, run_root)`.
+///
+/// Always processmaster's own store, scoped by instance so nested daemons never share
+/// (or sweep) each other's containers.
+pub fn container_store(cfg: &MasterConfig) -> (PathBuf, PathBuf) {
+    let instance = crate::pm::container::instance_id(&cfg.cgroup_name);
+    (
+        cfg.container_storage_root
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(format!("/var/lib/processmaster/{instance}/containers"))),
+        cfg.container_run_root
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(format!("/run/processmaster/{instance}/containers"))),
+    )
+}
+
+/// podman's `--tmpdir` for processmaster's store: inside its run root (a tmpfs, so it is
+/// reset at reboot, which is what podman expects of it).
+pub fn container_tmp_dir(run_root: &Path) -> PathBuf {
+    run_root.join("libpod")
+}
+
+/// Container images must live in processmaster's own store: refuse podman's shared one.
+pub(crate) fn validate_container_store(cfg: &MasterConfig) -> anyhow::Result<()> {
+    let (storage, run) = container_store(cfg);
+    for (p, field) in [(&storage, "containers.storage_root"), (&run, "containers.run_root")] {
+        anyhow::ensure!(p.is_absolute(), "{field} {} must be absolute", p.display());
+        anyhow::ensure!(
+            !p.components().any(|c| matches!(c, std::path::Component::ParentDir)),
+            "{field} {} must not contain '..'",
+            p.display()
+        );
+        for shared in ["/var/lib/containers", "/run/containers", "/var/run/containers"] {
+            anyhow::ensure!(
+                !p.starts_with(shared) && !Path::new(shared).starts_with(p),
+                "{field} {} overlaps podman's shared store {shared}; processmaster keeps its own",
+                p.display()
+            );
+        }
+    }
+    anyhow::ensure!(
+        !storage.starts_with(&run) && !run.starts_with(&storage),
+        "containers.storage_root and containers.run_root must not contain each other"
+    );
+    Ok(())
+}
+
+/// Refuse a file that a non-root user could replace: the file and every ancestor
+/// directory must be root-owned and not group/other-writable.
+pub(crate) fn ensure_root_controlled(path: &Path) -> anyhow::Result<()> {
+    check_trusted_chain(path, &[0])
+}
+
 /// `cgroup.name` becomes a path under `cgroup.root`, so it must stay there. A leading '/'
 /// is allowed for convenience and ignored (see `cgroup::master_dir`).
 pub(crate) fn validate_cgroup_name(name: &str) -> anyhow::Result<()> {
@@ -735,6 +822,13 @@ pub fn load_master_config(config_path: &Path) -> anyhow::Result<MasterConfig> {
             );
         }
     }
+
+    if let Some(c) = file_cfg.containers {
+        cfg.container_storage_root = c.storage_root;
+        cfg.container_run_root = c.run_root;
+        cfg.container_prune_unused_images = c.prune_unused_images;
+    }
+    validate_container_store(&cfg)?;
 
     // Validate uniqueness of action ids (names) in a canonicalized form.
     // This prevents confusing configs like `Foo` vs `foo` or trailing whitespace variants.

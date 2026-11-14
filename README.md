@@ -20,6 +20,7 @@ It runs on ubuntu 22, ubuntu 24, redhat 8 and any cgroup v2 supported platform.
 - Supports one time setup required as root. like allowing your CADDY to bind on port 443
 - Auto restart failed daemons. Subject to a tolerance (Max of X failure in Y minutes, if exceeded, service marked as failed and won't restart again but you can set X to a huge number to keep restarting, if you like)
 - Supports background task. Foreground background, forking, do whatever you want! thanks to cgroup API, we know how to stop it, we know what is running under your service!
+- Runs container images too (podman), with the same cgroup limits, deterministic stop, logging, restart and cron as any other service
 - Modern, well maintained
 
 
@@ -279,19 +280,22 @@ cp /other/path/run.sh /path_to_process_master/auto_services/test2/run.sh
 chmod +x /path_to_process_master/auto_services/test2/run.sh
 ```
 
-the service defaults to run as root, use SIGTERM to stop, and start using run.sh. 
+then run `pmctl update` (or restart the daemon). The service defaults to run as root, use SIGTERM to stop, and start using run.sh.
 
-Isn't that simple? of course, you would want to customize it. see below!
+Isn't that simple? Of course, you will want to customize it; see below.
 
-The daemon generates a service.yaml with assumed defaults. if your app comforms to the defaults, it will work out of the box. see below.
+The daemon generates a `service.yml` with these defaults. If your app conforms to them, it works out of the box. If it doesn't, it will fail to start; edit the generated `service.yml`, and you've still saved writing it by hand.
 
-If your job did not match, it is okay, they will fail to start, you can edit the generated `service.yml` and at least you saved handcoding the services.
+Folders are scanned only at daemon start and on `pmctl update`. Nothing watches the directory, so creating a folder does nothing until then.
 
 - **App name**: the directory name (trimmed). Any directory ending with `.disabled` is ignored.
 - **Config file**: inside each app directory it prefers:
   - `service.yml` (preferred), otherwise
   - `service.yaml`, otherwise
-  - no config file → processmaster uses built-in defaults (working_directory = that dir, start_command = `./run.sh`, logs under `./logs/`, etc).
+  - no config file, but a `run.sh` → processmaster uses built-in defaults (working_directory = that dir, start_command = `./run.sh`, logs under `./logs/`, etc.) and writes them to a generated `service.yml`;
+  - neither a config file nor a `run.sh` → the folder is **skipped** (warning `auto_service_skipped ... reason=no_service_yml_or_run_sh`), and nothing is generated. Add a `run.sh` or write a `service.yml`, then run `pmctl update`. This lets you prepare a folder (e.g. a hand-written container `service.yml`) without a default being generated behind your back.
+- **Generation never overwrites**: a `service.yml` you wrote is loaded as is, with `process:` or `container:`. Only an explicit `.regen_pm_config` marker replaces it, after backing it up as `service.yml.bak`. In a folder without `run.sh`, the marker is ignored (warning `auto_service_regen_marker_ignored ... reason=no_run_sh`), so it never replaces a container definition with the `run.sh` default.
+- **Container services** are never generated (there is nothing to derive an image from). Prefer defining them in `config_directory`; a hand-written `service.yml` with `container:` in an auto folder also works. See [Container services](#container-services-podman).
 - **Collision rule**: if an app name exists in `config_directory` and `auto_service_directory`, that is a **hard error**.
 - **`%app_dir%`**: inside an auto-service `service.yml`, `%app_dir%` expands to that service's directory (`<auto_service_directory>/<app>`), so paths need not be hard-coded. It is expanded first, in `working_directory`, `start_command`, `stop_command`, `environment` values (including `@file://%app_dir%/...`), `logs.*` paths and `provisioning[].path`. The generated `service.yml` uses `working_directory: '%app_dir%'`.
   - `working_directory` may be omitted (defaults to `%app_dir%`) or relative (resolved under `%app_dir%`); it must not contain `..`.
@@ -348,11 +352,16 @@ process:
   # Default: 5000.
   stop_grace_period_ms: 5000
 
-  # Environment variables passed to the service.
+  # Environment variables passed to the service (names must not contain '=').
   # Values can be literal strings or indirections like @file://..., @base64://..., @hex://...
+  # Map form; integers and booleans are taken as text, decimals must be quoted ("1.10").
   environment:
-    - name: FOO                                            # must not contain '='
-      value: bar
+    FOO: bar
+    PORT: 8080
+  # The list form is also accepted:
+  # environment:
+  #   - name: FOO
+  #     value: bar
 
 logs:
   # Where processmaster writes captured stdout/stderr.
@@ -448,6 +457,244 @@ Environment values support indirections for secrets/config blobs:
 - `@file://...`
 - `@base64://...`
 - `@hex://...`
+
+## Container services (podman)
+
+A service can run an OCI image (anything from Docker Hub or another registry) instead
+of a host command. Each service file has either `process:` (a host command) or
+`container:` (an image), never both. Container services get the same supervision as
+host commands. The container runs in the service's own cgroup, so its limits, stop,
+logging, restart policy and cron all behave the same.
+
+```yaml
+# conf.d/web.yaml (examples/containers/nginx.yaml)
+application: web
+
+container:
+  image: docker.io/library/nginx:1.27-alpine
+  ports: ["127.0.0.1:8080:80"]            # host 127.0.0.1:8080 -> container 80
+  volumes:
+    - ./html:/usr/share/nginx/html:ro,Z    # relative to working_directory
+  working_directory: /srv/web             # host side: ./html and ./logs live here
+  stop_signal: SIGQUIT                    # nginx's graceful shutdown signal
+  stop_grace_period_ms: 10000
+
+logs:
+  stdout: ./logs/access.log               # nginx logs to stdout/stderr in this image
+  stderr: ./logs/error.log
+
+resources:
+  max_memory: 128MiB
+
+restart_policy:
+  policy: always
+```
+
+More examples, each run end to end by the container tests
+(`tests/container_scenarios.rs`), are in `examples/containers/`:
+
+| file | shows |
+|---|---|
+| `examples/service.container.yaml` | every `container:` key, annotated (a Redis server) |
+| `examples/containers/nginx.yaml` | a web server: port forwarding, a read-only mounted site, graceful SIGQUIT |
+| `examples/containers/redis.yaml` | persistent data, a non-root container user (`:U`), a password from a root-only file |
+| `examples/containers/kafka.yaml` | a slow-to-stop JVM: long grace period, memory/CPU/pids limits |
+| `examples/containers/s3-server-archive.yaml` | an offline image loaded from a `podman save` archive |
+| `examples/containers/nightly-backup.yaml` | a container cron job with `max_time_per_run`, recording its exit code |
+
+**Requirements:** rootful podman (tested with 5.8) and cgroup v2. **Docker is not
+supported:** `docker run` only asks dockerd to start the container, and dockerd puts
+it in its own cgroup (`system.slice/docker-<id>.scope`), outside processmaster's
+control. None of the guarantees below could hold.
+
+### Where to define them
+
+Put container services in `config_directory` (e.g. `conf.d/web.yaml`). Auto services
+never generate a container definition, because there is nothing to derive the image,
+ports or mounts from. If you prefer the folder layout, you can write a `service.yml`
+with `container:` into an auto-service folder by hand. It is loaded and reloaded by
+`pmctl update` like any other definition, with `working_directory` defaulting to that
+folder. See [Auto-services](#auto-services-implicit-services).
+
+### Guarantees
+
+**Cgroup: everything stays inside the service's cgroup.** processmaster runs
+`podman run --cgroups=split` attached, as the service's process, in the service's own
+cgroup (`<cgroup.root>/<cgroup.name>/pm-<app>/run`). Podman's CLI and its conmon monitor
+go in `run/runtime`, the container in `run/libpod-payload-<id>`. So:
+- `resources.*` limits (memory, cpu, pids, io) apply to the container together with
+  podman's own processes;
+- the process view and `pmctl perf-metrics` show the container's processes;
+- liveness is the cgroup's `populated` state, exactly as for a host command.
+
+The one podman process outside the service's cgroup is shared network infrastructure.
+With a named `network:`, podman's DNS helper `aardvark-dns` serves every container on
+that network from its own systemd scope, and exits when the last one leaves. It is not
+part of any service and does not delay a stop.
+
+`memory.oom.group` is set (where the memory controller is enabled), so an OOM kill takes
+down the whole service, never podman's monitor alone, which would leave a container
+running without its output pipes.
+Helper commands (`podman pull`, `stop`, `rm`) run in a separate cgroup
+(`<cgroup.name>/container_ctl/`), so a pull never makes the service look running.
+
+**Stop: stopped means definitely stopped.**
+1. `podman stop` sends `container.stop_signal` (default SIGTERM) to the container's
+   init only. Podman sends SIGKILL itself after `stop_grace_period_ms`. Right after a
+   start, `podman run` may still be creating the container; processmaster keeps
+   retrying within the grace period, so even a very young container gets its graceful
+   stop.
+2. If anything is still in the cgroup after that, processmaster kills the whole
+   cgroup (`cgroup.kill`), the same final step as for host commands.
+3. `podman rm` always runs last. It removes the container record and what podman set
+   up around it: mounts, network namespace, port-forwarding firewall rules, and
+   anonymous volumes. Every start also begins with `podman rm`, so a crash or an OOM
+   kill never leaves a stale container that blocks the next start.
+
+When `pmctl stop` returns, no process of the service exists, and its podman record has
+been removed. A failed removal is logged and retried at the next start. `pmctl stop` on
+a container that already died on its own also clears what it left behind. The same
+holds when a service changes between `process:` and `container:` (the running instance
+is stopped the way it was started), and when its definition is deleted. If processmaster
+itself is killed or crashes, the records left behind are cleared at its next start.
+
+**Logging: the container's stdout and stderr go to the service's log files.** The
+container runs attached with podman's own logging off (`--log-driver=none`). Its output
+goes through processmaster's log pumps into `logs.stdout` / `logs.stderr`, with the usual
+rotation and compression, and appears in `pmctl logs`, `pmctl logs -f` and the web UI.
+`podman logs` and journald get nothing. Image pull and load progress is written to the
+stderr log.
+
+**Restart and cron work unchanged.** `restart_policy` (backoff, tolerance, FAILED) applies
+to container exits and failed starts. With `container.schedule`, the container is a cron
+job: runs never overlap, `max_time_per_run` stops it through the same stop path, and the
+container's exit code is recorded (`last_exit_code`). For long-running services, the
+exit code is not available, the same as for host commands.
+
+### Images
+
+- `pull: missing` (the default) pulls only when the image is not in the store;
+  `always` pulls before every start; `never` requires the image to be there already.
+- A pull or load runs **before** the start, as status **PULLING**. The supervisor stays
+  responsive: a stop or restart cancels the fetch, and nothing starts afterwards. A pull
+  that fails is handled like a start that fails (backoff, then FAILED, per
+  `restart_policy`). Pull time does not count towards a cron job's `max_time_per_run`.
+  Changing the service's `container:` definition during PULLING cancels that fetch too.
+- `image_archive: ./images/web.tar` loads a `podman save` archive instead of pulling
+  (`image` is then the tag inside the archive). It is loaded on the first start after
+  each daemon start, and again whenever the file changes. Because root runs whatever is inside, the archive
+  (after following symlinks) and every directory above it must be root-owned and not
+  group/other-writable.
+- An interrupted pull or load can't damage an image: layers are digest-checked, and an
+  image is only tagged once complete. A pull or load killed midway can leave orphan
+  layer data that no image refers to. processmaster runs
+  `podman system check --quick --repair` right after a killed fetch and hourly. Layer
+  data with no layer record is removed at once. Complete layers that no image refers to
+  are removed once they are older than 24h (podman's `--max`). That age limit protects
+  the layers of a pull still in progress, such as a `pmctl podman pull` you run by hand.
+- **Unused images are cleaned up** at boot, after every `pmctl update`, and hourly. Images
+  in processmaster's store that no loaded service definition uses are removed. This
+  covers images of deleted services, and old versions left behind when a tag is
+  re-pulled.
+  - Kept: any image a loaded definition uses, whether that service is running,
+    stopped, FAILED or disabled (`enabled: false`).
+  - The cleanup never runs during a pull or load, and it reads the definitions only
+    once no fetch is in progress. Removal is never forced, so an image a container
+    uses is never deleted.
+  - Not kept: an image pulled or loaded by hand (`pmctl podman pull`) before any
+    definition names it is removed within the hour. Write the definition first, then
+    let it pull. Renaming an auto-service folder to `<name>.disabled` removes its
+    definition, so its image is cleaned up as well; use `pmctl disable` to keep it.
+  - Turn the cleanup off with `containers.prune_unused_images: false`.
+
+### processmaster's own container store
+
+Images and containers always live in processmaster's own podman store, never in podman's
+shared one (`/var/lib/containers`, which is refused). The defaults are
+`/var/lib/processmaster/<instance>/containers` (images, containers) and
+`/run/processmaster/<instance>/containers` (runtime state). `<instance>` is
+`cgroup.name`, with characters other than letters, digits, `_`, `.` and `-` replaced
+(plus a short hash when anything was replaced). To move them, set:
+
+```yaml
+# master config
+containers:
+  storage_root: /data/processmaster/containers
+  run_root: /run/processmaster/containers
+  prune_unused_images: true
+```
+
+Both must be root-controlled. Podman's runtime state (normally `/run/libpod`, shared by
+every rootful podman on the host) is also kept separately, in `<run_root>/libpod`, so
+nothing done to the host's default podman store (even `podman system reset`) affects
+processmaster's containers. Don't share one store between two processmaster
+instances: each would clean up the other's images.
+
+A plain `podman ps` does not show these containers. Use `pmctl podman <args>`, which
+runs podman against processmaster's store: `pmctl podman ps -a`, `pmctl podman images`,
+`pmctl podman pull <image>`, `pmctl podman load -i x.tar`, `pmctl podman system df`.
+
+### `container:` keys
+
+| key | meaning |
+|---|---|
+| `image` | Required. Image reference, e.g. `docker.io/library/redis:7.4`. |
+| `pull` | `missing` (default), `always`, `never`. |
+| `image_archive` | Load this `podman save` archive instead of pulling (root-controlled path). |
+| `command` | Replaces the image's CMD. |
+| `env` | Environment inside the container: a map or a `[{name, value}]` list, with `@file://`, `@base64://`, `@hex://`. |
+| `volumes` | `host:container[:options]`. Always host folders or files: absolute, or relative to `working_directory`. |
+| `ports` | `[ip:][host_port:]container_port[/tcp\|udp\|sctp]`, ranges allowed (`8000-8010:8000-8010`). |
+| `network` | `bridge` (default), `host`, `none`, or a named podman network. |
+| `user` | User inside the container (`name` or `uid[:gid]`). Podman itself always runs as root. |
+| `extra_args` | Other `podman run` options, placed before the image (see the refusals below). |
+| `working_directory` | Host directory that relative volumes, `image_archive` and logs resolve under. Inside the container, the image's `WORKDIR` applies. |
+| `stop_signal`, `stop_grace_period_ms` | As for host commands; sent by `podman stop`. |
+| `schedule`, `not_before`, `not_after`, `max_time_per_run` | Cron, as for host commands. |
+
+`logs:`, `resources:`, `restart_policy:`, `global:` and `provisioning:` are the same
+as for host commands.
+
+### Details and limits
+
+- **Mounts are always explicit host folders.** Podman named volumes are not supported, so
+  no data is hidden inside the container store, where it could be lost without anyone
+  noticing. `-v`/`--volume`/`--mount`/`--volumes-from` in `extra_args` are refused.
+  Anything a container writes outside its mounts, including the anonymous volumes
+  podman creates for an image's `VOLUME` paths, is removed with the container when it
+  stops. A missing mount source is reported as a start error.
+- **Port forwarding** is podman's (`-p`). Rootful podman sets it up with firewall rules,
+  which `podman rm` removes again on every stop.
+- **Minimum limits:** podman needs about 20 MB and about 20 tasks inside the service
+  cgroup to start a container. If you set `max_memory` or `max_pids`, they must be at
+  least 64MiB / 64.
+- **Environment values** travel through podman's environment, not its command line, so
+  `ps` and the web UI don't show them. Podman does keep them in its container config,
+  inside the root-only store. A short list of names podman itself reads (`PATH`,
+  `HOME`, `TMPDIR`, `GOMAXPROCS`, `GOMEMLIMIT`, `XDG_*`, `CONTAINERS_*`, `LISTEN_*`, …)
+  are passed on the command line instead, so don't put secrets in those.
+- **SELinux:** bind mounts usually need `:z` (shared) or `:Z` (private). If the image
+  runs as a non-root user, add `U` (`./data:/data:Z,U`) so podman chowns the source to
+  that user; otherwise the app gets "permission denied". `z`, `Z` and `U` are refused
+  for system paths (`/etc`, `/usr`, `/run`, `/var/lib` itself, `/var/lib/containers`, …);
+  `/var/lib/<app>` is fine. A container cannot read an unlabelled host folder on an
+  SELinux host, so read-only mounts need `:ro,z` too.
+- **Startup window:** RUNNING means podman is in the service's cgroup; the container
+  itself may still be being created for a moment (a stop at that point still stops it
+  gracefully). Health checks are not supported: podman runs them from systemd timers,
+  outside the service cgroup. An image's own `HEALTHCHECK` is disabled.
+- **Refused in `extra_args`:**
+  - options processmaster sets itself: `-d`, `--rm`, `--name`, `--replace`,
+    `--restart`, `--cgroups`, `--cgroup-parent`, `-t`/`-i`/`-a`, `--sig-proxy`,
+    `--log-driver`, `--stop-signal`, `--stop-timeout`, `--pull`;
+  - podman's global options, which would move the container to a store or runtime
+    processmaster does not manage: `--root`, `--runroot`, `--storage-*`,
+    `--cgroup-manager`, `--runtime`, `--remote`, `--syslog`, …;
+  - `--health-*`, `--rootfs`, pods, `--label-file`, and `processmaster.*` labels;
+  - stray arguments, which would become the image.
+
+  A container definition is as powerful as a `start_command` running as root (it can
+  mount any host path, or use `--privileged`). Treat it with the same care.
 
 ## Provisioning (workdir setup, re-applied on change)
 

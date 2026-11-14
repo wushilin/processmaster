@@ -47,6 +47,47 @@ pub(crate) fn app_dir(cfg: &MasterConfig, app: &str) -> PathBuf {
     master_dir(cfg).join(format!("pm-{app}"))
 }
 
+/// Parent of the per-service cgroups that container helpers (podman pull/stop/rm) run in.
+/// Kept outside the service cgroup so a helper never counts as the service running.
+pub(crate) fn container_ctl_dir(cfg: &MasterConfig, app: &str) -> PathBuf {
+    master_dir(cfg).join("container_ctl").join(format!("pm-{app}"))
+}
+
+/// Return a launch leaf (`<app>/run`) to a state a new process can join.
+///
+/// `podman run --cgroups=split` creates `runtime/` and `libpod-payload-*/` under the
+/// leaf it starts in and enables controllers in the leaf's `cgroup.subtree_control`.
+/// Both survive the container, and cgroup v2 then refuses (EBUSY) to put a process in
+/// the leaf ("no internal processes"), so the next start would fail. Fails if any
+/// child cgroup still has processes.
+pub(crate) fn reset_leaf(leaf: &Path) -> anyhow::Result<()> {
+    if !leaf.exists() {
+        return Ok(());
+    }
+    fn remove_children(dir: &Path) -> anyhow::Result<()> {
+        for ent in fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
+            let ent = ent?;
+            if ent.file_type()?.is_dir() {
+                let child = ent.path();
+                remove_children(&child)?;
+                fs::remove_dir(&child).with_context(|| {
+                    format!("remove leftover cgroup {} (still has processes?)", child.display())
+                })?;
+            }
+        }
+        Ok(())
+    }
+    remove_children(leaf)?;
+    let subtree = leaf.join("cgroup.subtree_control");
+    let enabled = fs::read_to_string(&subtree).with_context(|| format!("read {}", subtree.display()))?;
+    let disable: Vec<String> = enabled.split_whitespace().map(|c| format!("-{c}")).collect();
+    if !disable.is_empty() {
+        write_file(&subtree, &format!("{}\n", disable.join(" ")))
+            .with_context(|| format!("disable controllers in {}", subtree.display()))?;
+    }
+    Ok(())
+}
+
 /// Parent of the per-action cgroups that admin actions run in.
 pub(crate) fn admin_actions_dir(cfg: &MasterConfig) -> PathBuf {
     master_dir(cfg).join("admin_actions")
@@ -520,6 +561,8 @@ pub(crate) struct LaunchParams {
     /// forcing those to re-declare every variable would be worse than letting them say so.
     pub(crate) inherit_environment: bool,
     pub(crate) resources: Resources,
+    /// Child of `cgroup_dir` the process joins (default `run`).
+    pub(crate) leaf: String,
 }
 
 impl LaunchParams {
@@ -534,6 +577,7 @@ impl LaunchParams {
             environment: Vec::new(),
             inherit_environment: false,
             resources: Resources::default(),
+            leaf: "run".to_string(),
         }
     }
 }
@@ -773,7 +817,7 @@ pub(crate) fn build_command(p: &LaunchParams) -> anyhow::Result<Command> {
     // otherwise attaching a process can fail with EBUSY. To avoid that, we always attach the process
     // into a dedicated leaf child cgroup `${p.cgroup_dir}/run`.
     apply_resources(&p.cgroup_dir, &p.resources)?;
-    let attach_cgroup_dir = p.cgroup_dir.join("run");
+    let attach_cgroup_dir = p.cgroup_dir.join(&p.leaf);
     ensure_dir(&attach_cgroup_dir)?;
 
     // Identity used for the minimal environment below. With no user configured the

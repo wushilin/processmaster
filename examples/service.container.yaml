@@ -1,0 +1,86 @@
+# Container (podman) service: runs an OCI image instead of a host command.
+#
+# A service is either a host command (`process:`) or a container (`container:`), never
+# both. The container runs inside the service's own cgroup, so it is supervised like any
+# other service: resources limits apply to it, restart_policy / schedule work, stdout
+# and stderr go to the logs below, and stop is deterministic (podman stop, then
+# cgroup.kill, then podman rm). Images live in processmaster's own store
+# (see `containers:` in the master config); manage it with `pmctl podman ...`.
+#
+# Requirements: podman (rootful), cgroup v2.
+
+application: redis
+
+container:
+  # Required. Any registry reference.
+  image: docker.io/library/redis:7.4
+
+  # always | missing (default) | never. Pulls run before the start (phase PULLING),
+  # can be cancelled by a stop, and their output goes to the stderr log.
+  pull: missing
+
+  # Instead of pulling: load an image archive (`podman save` output). It is loaded on the
+  # first start and again whenever the file changes. The file and every directory above
+  # it must be root-owned and not group/other-writable (root runs what is inside).
+  # image_archive: ./images/redis-7.4.tar   # then `image:` is the tag inside the archive
+
+  # Optional: replaces the image's CMD.
+  command: [redis-server, --appendonly, "yes"]
+
+  # Environment inside the container. Map or [{name, value}] list. Values support
+  # @file:// @base64:// @hex://. Values are passed through podman's environment, not its
+  # command line, so they do not show in `ps`; podman does store them in its (root-only)
+  # container config.
+  env:
+    TZ: Asia/Singapore
+    # REDIS_PASSWORD: "@file:///etc/secrets/redis"
+
+  # host:container[:options]. Always a host folder or file: absolute, or relative to
+  # working_directory. Podman named volumes are not supported, and data written anywhere
+  # else in the container is gone after a stop. Options are podman's: ro, rw, z/Z
+  # (SELinux relabel), U (chown to the container user); z/Z/U are refused for system paths.
+  volumes:
+    - ./data:/data:Z,U                    # U: chown to the container user below
+
+  # [ip:][host_port:]container_port[/tcp|udp|sctp]
+  ports: ["127.0.0.1:6379:6379"]
+
+  # bridge (default) | host | none | <named network>
+  # network: bridge
+
+  # User inside the container (name or uid[:gid]). podman itself always runs as root.
+  user: "999:999"
+
+  # Anything else podman run accepts, placed before the image. Flags processmaster
+  # manages itself (-d, --rm, --name, --restart, --cgroups, -t, -i, --log-driver,
+  # --stop-signal, --pull, health checks, ...) are refused.
+  # extra_args: [--init, --read-only, --cap-add=NET_ADMIN, --userns=auto]
+
+  # Lifecycle settings. A container service has no `process:` section (a file with both
+  # is refused); these mean the same as their process.* namesakes.
+  #
+  # Host directory that relative volume sources, image_archive and the logs resolve
+  # under (inside the container the image's WORKDIR applies). Auto services default to
+  # their own directory; in config_directory, absolute or omitted
+  # (<auto_service_directory>/<application>).
+  working_directory: /srv/redis
+  # Sent to the container's init by `podman stop`; SIGKILL after the grace period.
+  stop_signal: SIGTERM
+  stop_grace_period_ms: 10000
+  # Container cron jobs work too (the exit code is recorded); then omit restart_policy.
+  # schedule: "0 3 * * *"
+  # max_time_per_run: 30m
+  # not_before: "2026-01-01"
+  # not_after: "2026-12-31"
+
+logs:
+  stdout: ./logs/stdout.log
+  stderr: ./logs/stderr.log
+
+resources:
+  # podman itself runs inside this cgroup: at least 64MiB / 64 pids when set.
+  max_memory: 512MiB
+  max_cpu: 1000m
+
+restart_policy:
+  policy: always

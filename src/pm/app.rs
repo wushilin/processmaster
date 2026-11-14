@@ -342,6 +342,11 @@ pub struct AppDefinition {
     #[serde(default)]
     pub provisioning: Vec<ProvisioningEntry>,
 
+    /// Set for container services: `start_command` is then only descriptive and the
+    /// service runs `podman run` built from this spec.
+    #[serde(default)]
+    pub container: Option<crate::pm::container::ContainerSpec>,
+
     #[serde(skip)]
     pub source_file: Option<PathBuf>,
 
@@ -449,11 +454,74 @@ fn parse_mode_value(v: serde_yaml::Value) -> Result<Option<u32>, String> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentVar {
     pub name: String,
     pub value: String,
+}
+
+/// `process.environment` accepts two forms:
+///
+/// ```yaml
+/// environment:                # map form
+///   FOO: bar
+///   PORT: 8080                # numbers and booleans are taken as their YAML text
+///   TOKEN: "@file:///etc/secret"
+/// environment:                # list form (original)
+///   - name: FOO
+///     value: bar
+/// ```
+///
+/// The map form keeps file order. Duplicate keys are rejected by the YAML parser.
+pub(crate) fn deserialize_environment<'de, D>(deserializer: D) -> Result<Vec<EnvironmentVar>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let v = serde_yaml::Value::deserialize(deserializer)?;
+    match v {
+        serde_yaml::Value::Null => Ok(vec![]),
+        serde_yaml::Value::Sequence(_) => serde_yaml::from_value(v).map_err(D::Error::custom),
+        serde_yaml::Value::Mapping(m) => m
+            .into_iter()
+            .map(|(k, val)| {
+                let name = match k {
+                    serde_yaml::Value::String(s) => s,
+                    other => {
+                        return Err(D::Error::custom(format!(
+                            "environment: variable names must be strings, got {other:?}"
+                        )))
+                    }
+                };
+                let value = match val {
+                    serde_yaml::Value::String(s) => s,
+                    // Floats are refused: YAML would turn `VERSION: 1.10` into "1.1".
+                    serde_yaml::Value::Number(n) if !n.is_f64() => n.to_string(),
+                    serde_yaml::Value::Number(_) => {
+                        return Err(D::Error::custom(format!(
+                            "environment.{name}: quote decimal values so they keep their exact text"
+                        )))
+                    }
+                    serde_yaml::Value::Bool(b) => b.to_string(),
+                    serde_yaml::Value::Null => {
+                        return Err(D::Error::custom(format!(
+                            "environment.{name}: value is missing (use \"\" for an empty value)"
+                        )))
+                    }
+                    _ => {
+                        return Err(D::Error::custom(format!(
+                            "environment.{name}: value must be a string, number or boolean"
+                        )))
+                    }
+                };
+                Ok(EnvironmentVar { name, value })
+            })
+            .collect(),
+        _ => Err(D::Error::custom(
+            "environment must be a map (NAME: value) or a list of {name, value}",
+        )),
+    }
 }
 
 fn default_enabled() -> bool {
@@ -504,7 +572,32 @@ pub(crate) struct LogsSection {
     hints: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+impl ProcessSection {
+    /// A process section carrying only lifecycle settings (used for container services,
+    /// which set these under `container:`).
+    pub(crate) fn lifecycle(
+        working_directory: Option<PathBuf>,
+        stop_signal: Option<String>,
+        stop_grace_period_ms: Option<u64>,
+        schedule: Option<String>,
+        not_before: Option<String>,
+        not_after: Option<String>,
+        max_time_per_run: Option<String>,
+    ) -> Self {
+        Self {
+            working_directory,
+            stop_signal,
+            stop_grace_period_ms,
+            schedule,
+            not_before,
+            not_after,
+            max_time_per_run,
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProcessSection {
     #[serde(default)]
@@ -535,7 +628,7 @@ pub(crate) struct ProcessSection {
     user: Option<String>,
     #[serde(default)]
     group: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_environment")]
     environment: Vec<EnvironmentVar>,
     /// See `AppDefinition::inherit_environment`.
     #[serde(default)]
@@ -587,7 +680,12 @@ struct AppConfigFile {
     application: Option<String>,
     #[serde(default)]
     logs: Option<LogsSection>,
-    process: ProcessSection,
+    /// A host command. Exactly one of `process:` and `container:` is required.
+    #[serde(default)]
+    process: Option<ProcessSection>,
+    /// Run an OCI image with podman instead of a host command.
+    #[serde(default)]
+    container: Option<crate::pm::container::ContainerSection>,
     #[serde(default)]
     global: Option<GlobalSection>,
     #[serde(default)]
@@ -669,6 +767,35 @@ impl AppConfigFile {
         auto_service_directory: Option<&Path>,
         app_dir: Option<&Path>,
     ) -> anyhow::Result<AppDefinition> {
+        // A container service writes its lifecycle keys under `container:`; name them so
+        // in errors (the checks below are shared with host commands).
+        let is_container = self.container.is_some() && self.process.is_none();
+        self.into_definition_inner(source_file, auto_service_directory, app_dir).map_err(|e| {
+            if is_container {
+                anyhow::anyhow!("{}", format!("{e:#}").replace("process.", "container."))
+            } else {
+                e
+            }
+        })
+    }
+
+    fn into_definition_inner(
+        self,
+        source_file: Option<PathBuf>,
+        auto_service_directory: Option<&Path>,
+        app_dir: Option<&Path>,
+    ) -> anyhow::Result<AppDefinition> {
+        let mut container_section = self.container;
+        let process = match (self.process, container_section.as_mut()) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "`process:` and `container:` cannot both be set: a service is either a host command \
+                 or a container (container services set working_directory, stop_signal, \
+                 stop_grace_period_ms and schedule under container:)"
+            ),
+            (Some(p), None) => p,
+            (None, Some(c)) => c.take_process(),
+            (None, None) => anyhow::bail!("missing service definition: set `process:` (a host command) or `container:` (an image)"),
+        };
         let application: String = match self.application {
             Some(a) if !a.trim().is_empty() => a.trim().to_string(),
             _ => {
@@ -702,7 +829,7 @@ impl AppConfigFile {
         validate_application_name(&application)?;
 
         // Mutual exclusivity: schedule vs restart_policy
-        if self.process.schedule.is_some() && self.restart_policy.is_some() {
+        if process.schedule.is_some() && self.restart_policy.is_some() {
             anyhow::bail!(
                 "service {}: `process.schedule` and `restart_policy` are mutually exclusive",
                 application
@@ -740,8 +867,8 @@ impl AppConfigFile {
             Ok(Some(local.timestamp_millis()))
         }
 
-        let schedule_not_before_ms = parse_schedule_boundary_ms(self.process.not_before.clone(), "process.not_before", false)?;
-        let schedule_not_after_ms = parse_schedule_boundary_ms(self.process.not_after.clone(), "process.not_after", true)?;
+        let schedule_not_before_ms = parse_schedule_boundary_ms(process.not_before.clone(), "process.not_before", false)?;
+        let schedule_not_after_ms = parse_schedule_boundary_ms(process.not_after.clone(), "process.not_after", true)?;
         if let (Some(nb), Some(na)) = (schedule_not_before_ms, schedule_not_after_ms) {
             anyhow::ensure!(
                 na >= nb,
@@ -750,7 +877,7 @@ impl AppConfigFile {
             );
         }
 
-        let schedule_max_time_per_run_ms: Option<u64> = match self.process.max_time_per_run.clone() {
+        let schedule_max_time_per_run_ms: Option<u64> = match process.max_time_per_run.clone() {
             None => None,
             Some(s) => {
                 let t = s.trim();
@@ -769,7 +896,7 @@ impl AppConfigFile {
         };
 
         // Stop behavior: stop_command vs stop_signal cannot both be set.
-        if self.process.stop_command.is_some() && self.process.stop_signal.is_some() {
+        if process.stop_command.is_some() && process.stop_signal.is_some() {
             anyhow::bail!(
                 "service {}: choose exactly one of process.stop_command or process.stop_signal",
                 application
@@ -805,7 +932,7 @@ impl AppConfigFile {
         if let Some(d) = app_dir {
             anyhow::ensure!(d.is_absolute(), "service {application}: app dir {} is not absolute", d.display());
         }
-        let working_directory = match self.process.working_directory {
+        let working_directory = match process.working_directory {
             Some(wd) => {
                 let wd = expand_app_dir_path(wd, app_dir)
                     .map_err(|e| anyhow::anyhow!("service {application}: process.working_directory: {e}"))?;
@@ -852,8 +979,8 @@ impl AppConfigFile {
                 .transpose()
                 .map_err(|e| anyhow::anyhow!("service {application}: {field}: {e}"))
         };
-        let start_command = expand_cmd(self.process.start_command, "start_command")?;
-        let stop_command = expand_cmd(self.process.stop_command, "stop_command")?;
+        let start_command = expand_cmd(process.start_command, "start_command")?;
+        let stop_command = expand_cmd(process.stop_command, "stop_command")?;
         let log_stdout = expand_path(logs.stdout, "logs.stdout")?;
         let log_stderr = expand_path(logs.stderr, "logs.stderr")?;
         let stop_command_stdout = expand_path(logs.stop_command_stdout, "logs.stop_command_stdout")?;
@@ -865,8 +992,7 @@ impl AppConfigFile {
             .collect::<anyhow::Result<Vec<_>>>()
             .map_err(|e| anyhow::anyhow!("service {application}: logs.hints: {e}"))?;
         // Values may be indirections (`@file://%app_dir%/secret`), resolved later.
-        let environment = self
-            .process
+        let environment = process
             .environment
             .into_iter()
             .map(|v| {
@@ -887,11 +1013,47 @@ impl AppConfigFile {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        // Default start command if omitted.
-        let start_command = start_command.unwrap_or_else(default_start_command);
+        // Container services: podman runs the image; the process-level command and
+        // environment fields do not apply.
+        let container = match container_section {
+            None => None,
+            Some(sec) => {
+                let ctx = |e: anyhow::Error| anyhow::anyhow!("service {application}: {e:#}");
+                if let Some(m) = resources.max_memory.as_deref() {
+                    let m = normalize_memory_string(m).map_err(ctx)?;
+                    if m != "MAX" {
+                        let bytes = crate::pm::daemon::parse_size_spec_bytes(&m)
+                            .map_err(|e| anyhow::anyhow!("service {application}: resources.max_memory: {e}"))?;
+                        anyhow::ensure!(
+                            bytes >= crate::pm::container::MIN_CONTAINER_MEMORY_BYTES,
+                            "service {application}: resources.max_memory {m} is below 64MiB; podman itself \
+                             needs about 20MB inside the service cgroup to start a container"
+                        );
+                    }
+                }
+                if let Some(n) = resources.max_pids {
+                    anyhow::ensure!(
+                        n >= crate::pm::container::MIN_CONTAINER_PIDS,
+                        "service {application}: resources.max_pids {n} is below 64; podman itself needs \
+                         about 20 tasks inside the service cgroup to start a container"
+                    );
+                }
+                let expand = |s: &str| expand_app_dir(s, app_dir);
+                Some(
+                    crate::pm::container::lower_container_section(sec, &working_directory, &expand)
+                        .map_err(ctx)?,
+                )
+            }
+        };
+
+        // Default start command if omitted. For containers it only describes the service.
+        let start_command = match &container {
+            Some(c) => vec!["podman".to_string(), "run".to_string(), c.image.clone()],
+            None => start_command.unwrap_or_else(default_start_command),
+        };
 
         // Default restart config for non-scheduled apps if omitted.
-        let restart = if self.process.schedule.is_some() {
+        let restart = if process.schedule.is_some() {
             None
         } else {
             match self.restart_policy {
@@ -975,7 +1137,7 @@ impl AppConfigFile {
 
         // If neither stop_command nor stop_signal provided, default to SIGTERM.
         let stop_signal = if stop_command.is_none() {
-            Some(self.process.stop_signal.unwrap_or_else(|| "SIGTERM".to_string()))
+            Some(process.stop_signal.unwrap_or_else(|| "SIGTERM".to_string()))
         } else {
             None
         };
@@ -991,7 +1153,7 @@ impl AppConfigFile {
         if let Some(n) = resources.max_pids {
             anyhow::ensure!(n >= 1, "service {application}: resources.max_pids must be at least 1");
         }
-        if let Some(g) = self.process.stop_grace_period_ms {
+        if let Some(g) = process.stop_grace_period_ms {
             anyhow::ensure!(
                 g <= MAX_DURATION_MS,
                 "service {application}: stop_grace_period_ms={g} exceeds {MAX_DURATION_MS} (30 days)"
@@ -1007,12 +1169,11 @@ impl AppConfigFile {
             alt_log_file_hint,
             start_command,
             environment,
-            inherit_environment: self.process.inherit_environment,
+            inherit_environment: process.inherit_environment,
             restart,
             stop_signal,
             stop_command,
-            stop_grace_period_ms: self
-                .process
+            stop_grace_period_ms: process
                 .stop_grace_period_ms
                 .unwrap_or_else(default_stop_grace_period_ms),
             max_cpu: resources.max_cpu,
@@ -1021,8 +1182,8 @@ impl AppConfigFile {
             max_pids: resources.max_pids,
             io_weight: resources.io_weight,
             io_bandwidth: resources.io_bandwidth,
-            user: self.process.user,
-            group: self.process.group,
+            user: process.user,
+            group: process.group,
             rotation_mode,
             rotation_frequency,
             rotation_max_age_ms,
@@ -1030,11 +1191,12 @@ impl AppConfigFile {
             rotation_backups,
             log_compression_enabled: logs.compression_enabled,
             enabled: global.enabled,
-            schedule: self.process.schedule,
+            schedule: process.schedule,
             schedule_not_before_ms,
             schedule_not_after_ms,
             schedule_max_time_per_run_ms,
             provisioning,
+            container,
             source_file,
             source_mtime_ms: None,
         })
@@ -1404,6 +1566,116 @@ provisioning:
         assert_eq!(def.alt_log_file_hint, [PathBuf::from("/srv/apps/web/logs/extra.log")]);
         assert_eq!(def.environment[0].value, "@file:///srv/apps/web/secret");
         assert_eq!(def.provisioning[0].path, Path::new("/srv/apps/web/bin/run"));
+    }
+
+    #[test]
+    fn environment_map_form() {
+        let def = parse_auto(
+            r#"
+application: web
+process:
+  environment:
+    ZED: last-alpha-first-in-file
+    PORT: 8080
+    DEBUG: true
+    EMPTY: ""
+    SECRET: "@file://%app_dir%/secret"
+"#,
+        )
+        .unwrap();
+        let got: Vec<(&str, &str)> = def
+            .environment
+            .iter()
+            .map(|e| (e.name.as_str(), e.value.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("ZED", "last-alpha-first-in-file"),
+                ("PORT", "8080"),
+                ("DEBUG", "true"),
+                ("EMPTY", ""),
+                ("SECRET", "@file:///srv/apps/web/secret"),
+            ]
+        );
+    }
+
+    #[test]
+    fn environment_list_form_still_works_and_empty_forms_are_empty() {
+        let def = parse_auto(
+            "application: web\nprocess:\n  environment:\n    - name: FOO\n      value: bar\n",
+        )
+        .unwrap();
+        assert_eq!(def.environment[0].name, "FOO");
+        assert_eq!(def.environment[0].value, "bar");
+        for empty in ["environment:", "environment: {}", "environment: []"] {
+            let def = parse_auto(&format!("application: web\nprocess:\n  {empty}\n")).unwrap();
+            assert!(def.environment.is_empty(), "{empty}");
+        }
+    }
+
+    #[test]
+    fn environment_map_form_rejects_bad_values() {
+        for (bad, why) in [
+            ("VERSION: 1.10", "quote decimal"),
+            ("FOO:", "value is missing"),
+            ("FOO: [a, b]", "string, number or boolean"),
+            ("FOO: a\n    FOO: b", "duplicate"),
+            ("1: a", "must be strings"),
+        ] {
+            let err = parse_auto(&format!("application: web\nprocess:\n  environment:\n    {bad}\n"))
+                .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains(why), "{bad:?}: {msg}");
+        }
+        let err = parse_auto("application: web\nprocess:\n  environment: FOO=bar\n").unwrap_err();
+        assert!(format!("{err:#}").contains("must be a map"), "{err:#}");
+    }
+
+    #[test]
+    fn container_service_has_no_process_section() {
+        let def = parse_auto("application: web\ncontainer:\n  image: nginx:1.27\n  volumes: ['./html:/usr/share/nginx/html:ro']\n").unwrap();
+        let c = def.container.as_ref().unwrap();
+        assert_eq!(c.image, "nginx:1.27");
+        assert_eq!(c.volumes[0].to_arg(), "/srv/apps/web/html:/usr/share/nginx/html:ro");
+        assert_eq!(def.start_command, ["podman", "run", "nginx:1.27"]);
+        assert_eq!(def.stop_signal.as_deref(), Some("SIGTERM"));
+        assert_eq!(def.working_directory, Path::new("/srv/apps/web"));
+        // Neither section: refused.
+        let err = parse_auto("application: web\n").unwrap_err();
+        assert!(format!("{err:#}").contains("process:"), "{err:#}");
+        // Both sections: refused, even with only lifecycle keys under process:.
+        let err = parse_auto("application: web\ncontainer: {image: x}\nprocess: {stop_signal: SIGINT}\n").unwrap_err();
+        assert!(format!("{err:#}").contains("cannot both be set"), "{err:#}");
+    }
+
+    #[test]
+    fn container_lifecycle_settings_live_under_container() {
+        let def = parse_auto(
+            "application: web\ncontainer:\n  image: x\n  working_directory: data\n  stop_signal: SIGINT\n  \
+             stop_grace_period_ms: 30000\n  schedule: '0 * * * *'\n  max_time_per_run: 10m\n  volumes: ['./v:/v']\n",
+        )
+        .unwrap();
+        assert_eq!(def.working_directory, Path::new("/srv/apps/web/data"));
+        assert_eq!(def.stop_signal.as_deref(), Some("SIGINT"));
+        assert_eq!(def.stop_grace_period_ms, 30_000);
+        assert_eq!(def.schedule.as_deref(), Some("0 * * * *"));
+        assert_eq!(def.schedule_max_time_per_run_ms, Some(600_000));
+        // Relative volume sources resolve under the container's working_directory.
+        assert_eq!(def.container.unwrap().volumes[0].to_arg(), "/srv/apps/web/data/v:/v");
+        // Process-only keys do not exist under container:.
+        for bad in ["start_command: [x]", "environment: {A: b}", "group: app", "inherit_environment: true"] {
+            assert!(parse_auto(&format!("application: web\ncontainer:\n  image: x\n  {bad}\n")).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn container_service_resource_floors() {
+        for (extra, needle) in [("resources: {max_memory: 32MiB}", "64MiB"), ("resources: {max_pids: 16}", "below 64")] {
+            let err = parse_auto(&format!("application: web\ncontainer: {{image: x}}\n{extra}\n")).unwrap_err();
+            assert!(format!("{err:#}").contains(needle), "{extra}: {err:#}");
+        }
+        parse_auto("application: web\ncontainer: {image: x}\nresources: {max_memory: 64MiB, max_pids: 64}\n").unwrap();
     }
 
     #[test]

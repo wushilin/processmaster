@@ -1,0 +1,23 @@
+# A web server serving a site from a host folder.
+#   mkdir -p /srv/web/html && echo hello > /srv/web/html/index.html
+#   curl http://127.0.0.1:8080/
+application: web
+
+container:
+  image: docker.io/library/nginx:1.27-alpine
+  ports: ["127.0.0.1:8080:80"]            # host 127.0.0.1:8080 -> container 80
+  volumes:
+    - ./html:/usr/share/nginx/html:ro,Z    # relative to working_directory
+  working_directory: /srv/web             # host side: ./html and ./logs live here
+  stop_signal: SIGQUIT                    # nginx's graceful shutdown signal
+  stop_grace_period_ms: 10000
+
+logs:
+  stdout: ./logs/access.log               # nginx logs to stdout/stderr in this image
+  stderr: ./logs/error.log
+
+resources:
+  max_memory: 128MiB
+
+restart_policy:
+  policy: always
