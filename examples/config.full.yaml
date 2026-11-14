@@ -74,6 +74,15 @@ web_console:
         # htpasswd bcrypt entry. Replace in production.
         - "admin:$2a$10$jqNWtAzhWEVlPnvJwyI6g.Nwb8YPU5ypCED9lBEhahUSs13ac1MPe"
 
+# Container (podman) services keep images and containers in processmaster's own store,
+# never in podman's shared one (/var/lib/containers). Both paths are optional; the
+# defaults are per instance (cgroup.name). Use `pmctl podman <args>` to manage the store
+# (`pmctl podman images`, `pmctl podman image prune`, `pmctl podman load -i x.tar`).
+containers:
+  storage_root: /var/lib/processmaster/processmaster/containers   # images, containers, volumes (0700)
+  run_root: /run/processmaster/processmaster/containers           # runtime state (tmpfs)
+  prune_unused_images: true   # default; remove images no service definition uses (boot, update, hourly)
+
 # Operator-triggered admin commands (run as root, cwd=".", fire-and-forget).
 # - The web UI shows them under the "Admin actions" modal.
 # - Output is appended to ./logs/admin_action_stdout.log and ./logs/admin_action_stderr.log (daemon cwd).

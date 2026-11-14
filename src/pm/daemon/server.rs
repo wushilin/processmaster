@@ -129,6 +129,7 @@ pub(crate) async fn dispatch_async(state: Arc<Mutex<DaemonState>>, req: Request)
         Request::AdminKill => do_admin_kill(&state),
         Request::AdminPs => do_admin_ps(&state),
         Request::ServerVersion => do_server_version(),
+        Request::ContainerStore => do_container_store(&state),
         Request::PerfMetrics { name } => {
             tasks()
                 .spawn_blocking({

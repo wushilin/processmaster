@@ -367,6 +367,7 @@ pub(super) fn build_auto_service_def(
         schedule_not_after_ms: None,
         schedule_max_time_per_run_ms: None,
         provisioning: vec![],
+        container: None,
         source_file: Some(source_file),
         source_mtime_ms,
     })
@@ -433,7 +434,7 @@ pub(super) fn merge_auto_services_best_effort(
             warnings.push(format!(
                 "auto_service_dir_not_root_controlled app={} dir={} not_loaded=true \
                  hint=\"a directory a non-root user can write cannot hold a trusted definition; \
-                 move it to config_directory with process.working_directory: {}\"",
+                 move it to config_directory with working_directory: {}\"",
                 app,
                 path.display(),
                 path.display()
@@ -476,6 +477,20 @@ pub(super) fn merge_auto_services_best_effort(
                 ok
             }
             Err(_) => false,
+        };
+        // The marker regenerates the `./run.sh` default; in a folder without run.sh (e.g. a
+        // hand-written container service) that would replace a working definition with
+        // one that cannot start.
+        let regen_requested = regen_requested && {
+            let has_run_sh = fs::symlink_metadata(path.join("run.sh")).is_ok();
+            if !has_run_sh {
+                warnings.push(format!(
+                    "auto_service_regen_marker_ignored app={} file={} reason=no_run_sh",
+                    app,
+                    regen_marker.display()
+                ));
+            }
+            has_run_sh
         };
         if regen_requested {
             fn next_bak_path(dir: &Path) -> PathBuf {
@@ -671,8 +686,22 @@ pub(super) fn merge_auto_services_best_effort(
                 }
             }
         } else {
-            // No service.yml: synthesize a default service AND (best-effort) auto-generate
-            // a full `service.yml` for convenience.
+            // No service.yml: only a folder with a `run.sh` is a default service. Anything
+            // else (an empty folder, or one being prepared for a container service) has
+            // nothing to derive a definition from, and generating the run.sh default for it
+            // would just leave a service that fails on every start.
+            let run_sh = path.join("run.sh");
+            if !fs::symlink_metadata(&run_sh).is_ok_and(|m| m.is_file() || m.file_type().is_symlink()) {
+                warnings.push(format!(
+                    "auto_service_skipped app={} dir={} reason=no_service_yml_or_run_sh \
+                     hint=\"add run.sh (default service) or write service.yml (e.g. a container: service)\"",
+                    app,
+                    path.display()
+                ));
+                continue;
+            }
+            // Synthesize the default service AND (best-effort) auto-generate a full
+            // `service.yml` for convenience.
             //
             // We only create the file if missing; we never overwrite.
             let target = path.join("service.yml");

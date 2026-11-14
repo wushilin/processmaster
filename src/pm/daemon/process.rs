@@ -277,7 +277,23 @@ pub(super) fn spawn_launcher_child(cfg: &MasterConfig, def: &AppDefinition) -> a
 
     // processmaster is now self-contained: we launch directly and self-attach into the app cgroup.
     // Keep the start/stop launch path consistent by using the shared LaunchParams builder.
-    let lp = build_launch_params_for_app(cfg, def, &argv, Some(def.application.clone()))?;
+    let lp = match &def.container {
+        None => {
+            // A service that ran as a container before may have left podman's
+            // sub-cgroups (EBUSY on attach) and memory.oom.group behind. Best effort:
+            // the service is not running, so whatever is left is empty.
+            let app_cg = cgroup::app_dir(cfg, &def.application);
+            if let Err(e) = cgroup::reset_leaf(&app_cg.join("run")) {
+                pm_event("cgroup", Some(&def.application), format!("reset_leaf outcome=error err={e:#}"));
+            }
+            let oom_group = app_cg.join("memory.oom.group");
+            if fs::read_to_string(&oom_group).is_ok_and(|v| v.trim() == "1") {
+                let _ = fs::write(&oom_group, "0\n");
+            }
+            build_launch_params_for_app(cfg, def, &argv, Some(def.application.clone()))?
+        }
+        Some(spec) => podman::container_launch_params(cfg, def, spec)?,
+    };
 
     let mut cmd = cgroup::build_command(&lp)
         .with_context(|| format!("build command app={} cgroup_dir={}", def.application, lp.cgroup_dir.display()))?;
@@ -360,6 +376,10 @@ pub(super) fn stop_common(
 
     // Ensure user/group requirements are consistent when processmaster runs unprivileged.
     enforce_app_user_group_rules(def)?;
+
+    if def.container.is_some() {
+        return stop_container_service(&log, cfg, def, name);
+    }
 
     if !cgroup_running(cfg, name)? {
         log("attempt=stop outcome=not_running".to_string());
@@ -471,6 +491,79 @@ pub(super) fn stop_common(
 
     log("outcome=stopped".to_string());
     Ok(StopResult::Stopped)
+}
+
+/// Stop a container service: `podman stop` (stop signal to the container's init, SIGKILL
+/// after the grace period), then `cgroup.kill` if anything is left, then `podman rm`.
+///
+/// Never signals every process in the cgroup: podman and conmon live there too, and
+/// signals such as SIGHUP kill conmon (leaving the container orphaned) or reach the
+/// container twice through podman's signal proxy.
+fn stop_container_service(
+    log: &dyn Fn(String),
+    cfg: &MasterConfig,
+    def: &AppDefinition,
+    name: &str,
+) -> anyhow::Result<StopResult> {
+    if !cgroup_running(cfg, name)? {
+        log("attempt=stop outcome=not_running".to_string());
+        // A crash may have left podman's record behind; clear it.
+        if let Err(e) = podman::remove_container(cfg, name) {
+            log(format!("attempt=container_rm outcome=error err={e:#}"));
+        }
+        return Ok(StopResult::AlreadyStopped);
+    }
+    let grace = Duration::from_millis(def.stop_grace_period_ms);
+    let t0 = Instant::now();
+    log(format!("attempt=podman_stop grace_ms={}", def.stop_grace_period_ms));
+    // Right after a start, `podman run` may still be creating the container: `podman
+    // stop --ignore` then finds nothing and returns at once. Keep asking until the
+    // cgroup empties or the grace period is used up, so a fresh container still gets
+    // its graceful stop rather than an immediate kill.
+    let deadline = t0 + grace;
+    let mut stopped = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now()).max(Duration::from_secs(1));
+        match podman::stop_container(cfg, name, remaining) {
+            // A failure is retried: the container may still be being set up.
+            Ok(_) => {}
+            Err(e) => {
+                log(format!("outcome=podman_stop_error err={e:#} decision=kill-all"));
+                break;
+            }
+        }
+        // podman stop returns once the container is gone; the launcher and conmon
+        // follow within moments.
+        if wait_until_empty(cfg, name, Duration::from_secs(2)) {
+            stopped = true;
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if stopped {
+        log(format!("outcome=podman_stop_ok elapsed_ms={}", t0.elapsed().as_millis()));
+    }
+    let mut result = Ok(StopResult::Stopped);
+    if !stopped && !wait_until_empty(cfg, name, Duration::from_secs(3)) {
+        let pids = launcher_pids(cfg, name).unwrap_or_default();
+        log(format!("outcome=still_running remaining_pids={} decision=kill-all", pids.len()));
+        launcher_kill_all(cfg, name)?;
+        if !wait_until_empty(cfg, name, Duration::from_secs(3)) && cgroup_running(cfg, name)? {
+            log("outcome=kill-all_failed".to_string());
+            result = Err(anyhow::anyhow!("{name}: still running after kill-all"));
+        }
+    }
+    match podman::remove_container(cfg, name) {
+        Ok(()) => log("outcome=container_removed".to_string()),
+        Err(e) => log(format!("attempt=container_rm outcome=error err={e:#}")),
+    }
+    if result.is_ok() {
+        log("outcome=stopped".to_string());
+    }
+    result
 }
 
 pub(super) fn resources_for_app(def: &AppDefinition) -> anyhow::Result<cgroup::Resources> {

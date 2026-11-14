@@ -12,6 +12,37 @@ pub(super) fn do_server_version() -> anyhow::Result<Response> {
     Ok(Response::message(true, crate::pm::build_info::banner()))
 }
 
+pub(super) fn do_container_store(state: &Arc<Mutex<DaemonState>>) -> anyhow::Result<Response> {
+    let cfg = state.lock().unwrap_or_else(|p| p.into_inner()).cfg.clone();
+    podman::ensure_store(&cfg)?;
+    let (storage, run) = crate::pm::config::container_store(&cfg);
+    Ok(Response {
+        ok: true,
+        container_store: Some(crate::pm::rpc::ContainerStoreInfo {
+            storage_root: storage.display().to_string(),
+            tmp_dir: crate::pm::config::container_tmp_dir(&run).display().to_string(),
+            run_root: run.display().to_string(),
+        }),
+        ..Default::default()
+    })
+}
+
+/// Remove unused container images in the background (see `podman::gc_images`).
+pub(super) fn spawn_image_gc(state: &Arc<Mutex<DaemonState>>, reason: &'static str) {
+    let cfg = state.lock().unwrap_or_else(|p| p.into_inner()).cfg.clone();
+    if !crate::pm::config::container_store(&cfg).0.exists() {
+        return; // no store to look after
+    }
+    let st = Arc::clone(state);
+    // The definitions are read inside the cleanup's lock, not now.
+    let defs = move || st.lock().unwrap_or_else(|p| p.into_inner()).defs.values().cloned().collect::<Vec<_>>();
+    tasks().spawn_blocking(move || match podman::gc_images(&cfg, defs) {
+        Ok(0) => {}
+        Ok(n) => pm_event("container", None, format!("image_gc reason={reason} removed={n}")),
+        Err(e) => pm_event("container", None, format!("image_gc reason={reason} outcome=error err={e:#}")),
+    });
+}
+
 pub(super) fn do_perf_metrics(state: &Arc<Mutex<DaemonState>>, name: &str) -> anyhow::Result<Response> {
     let (cfg, app) = {
         let st = state.lock().unwrap_or_else(|p| p.into_inner());
@@ -259,7 +290,21 @@ pub(super) async fn do_update_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::
         // If the app was removed, there is no controller (and no stop_command) anymore.
         // Best-effort: kill the cgroup.
         let removed = !new_defs.contains_key(&name);
-        if removed {
+        let removed_container = if removed { old_defs.get(&name).filter(|d| d.container.is_some()).cloned() } else { None };
+        if let Some(old_def) = removed_container {
+            // A container needs podman stop / rm: a bare cgroup kill would leave its
+            // record, network namespace and port rules behind.
+            let cfg2 = cfg.clone();
+            let name2 = name.clone();
+            let r = tasks()
+                .spawn_blocking(move || stop_common(None, &cfg2, &old_def, &name2))
+                .await
+                .map_err(|e| anyhow::anyhow!("join error: {e}"))?;
+            match r {
+                Ok(_) => pm_event_state(state, "reconcile", Some(&name), "outcome=stopped (removed container)"),
+                Err(e) => pm_event_state(state, "reconcile", Some(&name), format!("outcome=error err={e:#}")),
+            }
+        } else if removed {
             let cfg2 = cfg.clone();
             let name2 = name.clone();
             let st2 = Arc::clone(state);
@@ -371,6 +416,7 @@ pub(super) async fn do_update_async(state: &Arc<Mutex<DaemonState>>) -> anyhow::
 
     // Emit a reconcile snapshot after update so operators can see observed state.
     emit_reconcile_snapshot(state, "update");
+    spawn_image_gc(state, "update");
 
     if !warnings.is_empty() {
         pm_event_state(
@@ -1002,7 +1048,9 @@ pub(super) fn do_status(state: &Arc<Mutex<DaemonState>>, name: Option<&str>) -> 
                     Phase::Running.to_string()
                 }
             } else {
-                if !def.enabled || sysflag_has(&info.system_flags, SYSFLAG_USER_STOP) {
+                if info.last_emitted_phase == Some(Phase::Pulling) {
+                    Phase::Pulling.to_string()
+                } else if !def.enabled || sysflag_has(&info.system_flags, SYSFLAG_USER_STOP) {
                     Phase::Stopped.to_string()
                 } else if sysflag_has(&info.system_flags, SystemFlag::Backoff) {
                     Phase::Backoff.to_string()
@@ -1039,6 +1087,7 @@ pub(super) fn do_status(state: &Arc<Mutex<DaemonState>>, name: Option<&str>) -> 
                 .map(|p| p.display().to_string()),
             last_run_at_ms,
             last_exit_code,
+            image: def.container.as_ref().map(|c| c.image.clone()),
             schedule: def.schedule.clone(),
             schedule_not_before_ms: def.schedule_not_before_ms,
             schedule_not_after_ms: def.schedule_not_after_ms,

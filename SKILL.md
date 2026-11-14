@@ -27,7 +27,7 @@ Two config layers (strict parsing — unknown fields are rejected):
 
 ## Deploying an app into processmaster
 
-There are two ways to define an app. Both end with `pmctl update` to load it — the daemon does not watch files.
+There are three ways to define an app (the third, a podman container, is a variant of the second). Both end with `pmctl update` to load it — the daemon does not watch files.
 
 ### Way 1: auto-service (fastest — just a directory with run.sh)
 
@@ -43,6 +43,7 @@ pmctl start myapp
 
 Defaults: working_directory = that dir, start_command = `./run.sh`, run as root (or `global.default_service_user/group`), stop = SIGTERM, logs under `./logs/`. The generated `service.yml` in the app dir is yours to edit (edit → `pmctl update` → `pmctl restart myapp`). Notes:
 - `%app_dir%` (auto services only) expands to the app dir in working_directory, start/stop_command, environment values, logs paths and provisioning paths — quote it, since YAML can't start an unquoted value with `%`: `start_command: ["%app_dir%/bin/run"]`. working_directory may be omitted (= `%app_dir%`) or relative to it; no `..`. In config_directory definitions the token is an error and working_directory must be absolute.
+- A directory with neither `service.yml`/`service.yaml` nor `run.sh` is skipped (warning `auto_service_skipped ... reason=no_service_yml_or_run_sh`); nothing is generated for it. So you can create the dir, write your own `service.yml` (e.g. a `container:` service), then `pmctl update`, and no `run.sh` default appears in between. Generation never overwrites an existing `service.yml`.
 - Rename a directory to `<name>.disabled` to have it ignored entirely.
 - Same app name in both `config_directory` and `auto_service_directory` is a hard error.
 - After a processmaster upgrade, drop an empty `.regen_pm_config` file in the app dir + `pmctl update` to regenerate a fresh `service.yml` (the old one is kept as `service.yml.bak`).
@@ -112,6 +113,34 @@ process:
 ```
 
 Runs never overlap: if the previous run is still going at the next tick, that tick is skipped (no queueing).
+
+### Way 3: container service (podman)
+
+Use `container:` instead of `process:`. A file with both is refused. Full example: `examples/service.container.yaml`. Put it in config_directory (e.g. `conf.d/redis.yaml`). Auto services never generate a container definition (the default is always `./run.sh`). A hand-written `service.yml` with `container:` in an auto-service folder does work, with working_directory defaulting to that folder.
+
+```yaml
+application: web
+container:
+  image: docker.io/library/nginx:1.27-alpine   # pull: missing (default) | always | never
+  ports: ["127.0.0.1:8080:80"]
+  volumes: ["./html:/usr/share/nginx/html:ro,Z"]   # relative to working_directory; Z = SELinux relabel
+  env: { TZ: Asia/Singapore }                       # map or list; @file:// etc. supported
+  # user: "999:999"            # user INSIDE the container (podman itself runs as root)
+  # image_archive: ./img.tar   # load a `podman save` archive instead of pulling (root-owned path)
+  # extra_args: [--init]       # -d/--rm/--name/--restart/-t/-i/--cgroups/-v/... are refused
+  working_directory: /srv/web   # host side: relative volumes/logs/image_archive resolve here
+  stop_signal: SIGTERM          # sent by `podman stop`; SIGKILL after stop_grace_period_ms
+  # schedule / not_before / not_after / max_time_per_run: cron, as under process:
+resources:
+  max_memory: 256MiB            # ≥ 64MiB and max_pids ≥ 64 when set (podman runs in the cgroup)
+```
+
+- It is supervised like any other service: it runs in its own cgroup, restart_policy/schedule work, logs go to the usual files, and a stop is definite (podman stop → cgroup.kill → podman rm).
+- Status **PULLING** means an image pull or load is in progress. A stop cancels it.
+- Images live in processmaster's own store, so a plain `podman ps` won't show them. Use `pmctl podman ps|images|image prune|load -i x.tar`.
+- Non-root image user plus a bind mount: add `U` (`./data:/data:Z,U`), or the app gets EACCES.
+- Mounts are host folders only: no podman named volumes, and no `-v`/`--mount` in extra_args. Data outside the mounts is lost on stop.
+- Images that no loaded definition uses are removed automatically (boot, update, hourly), including old versions after a re-pull. Images of stopped or disabled services are kept. An image pulled by hand before its definition exists is removed, so write the definition first. A `<name>.disabled` auto folder counts as removed (use `pmctl disable` to keep the image). Opt out with `containers.prune_unused_images: false`.
 
 ### Provisioning (setup at load, re-applied on change)
 
@@ -200,6 +229,7 @@ pmctl flag <app> <f1,f2> [--ttl 10m]        # set user flags; unflag to remove
 pmctl perf-metrics <app> [--interval-ms N|--once]  # cgroup mem/swap/cpu/io + PSI + throttling
 pmctl version | server-version              # local vs daemon build info (co-build check)
 pmctl admin-list | admin-run <id> | admin-ps | admin-kill
+pmctl podman <args...>                      # podman against processmaster's container store (ps, images, prune, load)
 pmctl password generate --user u --password p      # bcrypt htpasswd entry for web_console auth
 pmctl password verify --secure "u:$2b$..." --user u --password   # no value after --password = read stdin
 ```

@@ -54,6 +54,7 @@ mod flags;
 mod handlers;
 mod host_setup;
 mod logs;
+mod podman;
 mod process;
 mod provision;
 mod reaper;
@@ -130,6 +131,8 @@ enum Phase {
     Stopped,
     Backoff,
     Failed,
+    /// A container image is being pulled or loaded before the start.
+    Pulling,
 }
 
 impl Phase {
@@ -142,6 +145,7 @@ impl Phase {
             Phase::Stopped => "STOPPED",
             Phase::Backoff => "BACKOFF",
             Phase::Failed => "FAILED",
+            Phase::Pulling => "PULLING",
         }
     }
 }
@@ -307,6 +311,21 @@ pub async fn run_daemon_async(cfg: MasterConfig) -> anyhow::Result<()> {
     start_scheduler_thread(Arc::clone(&state));
     // Periodically stop scheduled jobs that exceed their configured max_time_per_run.
     start_overtime_scheduler_thread(Arc::clone(&state));
+    // Hourly: remove container images no service definition uses any more.
+    {
+        let st = Arc::clone(&state);
+        tasks().spawn(async move {
+            let mut tick = tokio_time::interval(Duration::from_secs(3600));
+            tick.tick().await; // boot already runs one
+            loop {
+                tick.tick().await;
+                if st.lock().unwrap_or_else(|p| p.into_inner()).shutting_down.load(Ordering::Relaxed) {
+                    break;
+                }
+                spawn_image_gc(&st, "hourly");
+            }
+        });
+    }
 
     // Periodically prune expired user flags (in-memory) and emit expiry events.
     start_flag_maintenance_thread(Arc::clone(&state));
@@ -320,6 +339,16 @@ pub async fn run_daemon_async(cfg: MasterConfig) -> anyhow::Result<()> {
     crate::pm::web_console::start_web_console(Arc::clone(&state));
 
     // Supervisor-like behavior: start all enabled services on daemon boot.
+    // Boot only: containers a crash left behind (their service cgroup is empty, so
+    // nothing of them runs) block the next `podman run --name`. Cleared before anything
+    // starts, so no fresh container can be mistaken for one. Then the image cleanup.
+    {
+        let cfg = state.lock().unwrap_or_else(|p| p.into_inner()).cfg.clone();
+        if crate::pm::config::container_store(&cfg).0.exists() {
+            let _ = tasks().spawn_blocking(move || podman::sweep_stale_containers(&cfg)).await;
+        }
+        spawn_image_gc(&state, "boot");
+    }
     if let Err(e) = start_enabled_services_async(&state).await {
         eprintln!("autostart error: {e}");
     }
