@@ -43,9 +43,14 @@ process:
   # - "@file:///path/to/secret"
   # - "@base64://..."
   # - "@hex://..."
+  # Map form. Integers and booleans are taken as text; quote decimals ("1.10").
   environment:
-    - name: FOO
-      value: bar
+    FOO: bar
+    PORT: 8080
+  # The original list form is still accepted:
+  # environment:
+  #   - name: FOO
+  #     value: bar
 
   # Cron schedule (mutually exclusive with restart_policy).
   # schedule: "0 * * * *"        # 5-field cron (min hour dom mon dow), minute-resolution only (no seconds field)

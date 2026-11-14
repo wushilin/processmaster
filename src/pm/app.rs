@@ -456,6 +456,69 @@ pub struct EnvironmentVar {
     pub value: String,
 }
 
+/// `process.environment` accepts two forms:
+///
+/// ```yaml
+/// environment:                # map form
+///   FOO: bar
+///   PORT: 8080                # numbers and booleans are taken as their YAML text
+///   TOKEN: "@file:///etc/secret"
+/// environment:                # list form (original)
+///   - name: FOO
+///     value: bar
+/// ```
+///
+/// The map form keeps file order. Duplicate keys are rejected by the YAML parser.
+fn deserialize_environment<'de, D>(deserializer: D) -> Result<Vec<EnvironmentVar>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let v = serde_yaml::Value::deserialize(deserializer)?;
+    match v {
+        serde_yaml::Value::Null => Ok(vec![]),
+        serde_yaml::Value::Sequence(_) => serde_yaml::from_value(v).map_err(D::Error::custom),
+        serde_yaml::Value::Mapping(m) => m
+            .into_iter()
+            .map(|(k, val)| {
+                let name = match k {
+                    serde_yaml::Value::String(s) => s,
+                    other => {
+                        return Err(D::Error::custom(format!(
+                            "environment: variable names must be strings, got {other:?}"
+                        )))
+                    }
+                };
+                let value = match val {
+                    serde_yaml::Value::String(s) => s,
+                    // Floats are refused: YAML would turn `VERSION: 1.10` into "1.1".
+                    serde_yaml::Value::Number(n) if !n.is_f64() => n.to_string(),
+                    serde_yaml::Value::Number(_) => {
+                        return Err(D::Error::custom(format!(
+                            "environment.{name}: quote decimal values so they keep their exact text"
+                        )))
+                    }
+                    serde_yaml::Value::Bool(b) => b.to_string(),
+                    serde_yaml::Value::Null => {
+                        return Err(D::Error::custom(format!(
+                            "environment.{name}: value is missing (use \"\" for an empty value)"
+                        )))
+                    }
+                    _ => {
+                        return Err(D::Error::custom(format!(
+                            "environment.{name}: value must be a string, number or boolean"
+                        )))
+                    }
+                };
+                Ok(EnvironmentVar { name, value })
+            })
+            .collect(),
+        _ => Err(D::Error::custom(
+            "environment must be a map (NAME: value) or a list of {name, value}",
+        )),
+    }
+}
+
 fn default_enabled() -> bool {
     true
 }
@@ -535,7 +598,7 @@ pub(crate) struct ProcessSection {
     user: Option<String>,
     #[serde(default)]
     group: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_environment")]
     environment: Vec<EnvironmentVar>,
     /// See `AppDefinition::inherit_environment`.
     #[serde(default)]
@@ -1404,6 +1467,70 @@ provisioning:
         assert_eq!(def.alt_log_file_hint, [PathBuf::from("/srv/apps/web/logs/extra.log")]);
         assert_eq!(def.environment[0].value, "@file:///srv/apps/web/secret");
         assert_eq!(def.provisioning[0].path, Path::new("/srv/apps/web/bin/run"));
+    }
+
+    #[test]
+    fn environment_map_form() {
+        let def = parse_auto(
+            r#"
+application: web
+process:
+  environment:
+    ZED: last-alpha-first-in-file
+    PORT: 8080
+    DEBUG: true
+    EMPTY: ""
+    SECRET: "@file://%app_dir%/secret"
+"#,
+        )
+        .unwrap();
+        let got: Vec<(&str, &str)> = def
+            .environment
+            .iter()
+            .map(|e| (e.name.as_str(), e.value.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("ZED", "last-alpha-first-in-file"),
+                ("PORT", "8080"),
+                ("DEBUG", "true"),
+                ("EMPTY", ""),
+                ("SECRET", "@file:///srv/apps/web/secret"),
+            ]
+        );
+    }
+
+    #[test]
+    fn environment_list_form_still_works_and_empty_forms_are_empty() {
+        let def = parse_auto(
+            "application: web\nprocess:\n  environment:\n    - name: FOO\n      value: bar\n",
+        )
+        .unwrap();
+        assert_eq!(def.environment[0].name, "FOO");
+        assert_eq!(def.environment[0].value, "bar");
+        for empty in ["environment:", "environment: {}", "environment: []"] {
+            let def = parse_auto(&format!("application: web\nprocess:\n  {empty}\n")).unwrap();
+            assert!(def.environment.is_empty(), "{empty}");
+        }
+    }
+
+    #[test]
+    fn environment_map_form_rejects_bad_values() {
+        for (bad, why) in [
+            ("VERSION: 1.10", "quote decimal"),
+            ("FOO:", "value is missing"),
+            ("FOO: [a, b]", "string, number or boolean"),
+            ("FOO: a\n    FOO: b", "duplicate"),
+            ("1: a", "must be strings"),
+        ] {
+            let err = parse_auto(&format!("application: web\nprocess:\n  environment:\n    {bad}\n"))
+                .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains(why), "{bad:?}: {msg}");
+        }
+        let err = parse_auto("application: web\nprocess:\n  environment: FOO=bar\n").unwrap_err();
+        assert!(format!("{err:#}").contains("must be a map"), "{err:#}");
     }
 
     #[test]

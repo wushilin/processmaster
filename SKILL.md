@@ -67,9 +67,9 @@ process:
   stop_grace_period_ms: 5000        # then escalates to cgroup.kill
   user: appuser                     # optional; daemon (root) setuids the child
   group: appgroup
-  environment:
-    - name: DB_PASSWORD
-      value: "@file:///etc/myapp/db_password"   # also @base64://..., @hex://..., or literal
+  environment:                      # map form; list form [{name, value}] also accepted
+    DB_PASSWORD: "@file:///etc/myapp/db_password"   # also @base64://..., @hex://..., or literal
+    PORT: 8080                      # ints/bools taken as text; quote decimals ("1.10")
 logs:
   stdout: ./logs/stdout.log         # relative paths resolve under working_directory
   stderr: ./logs/stderr.log

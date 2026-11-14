@@ -348,11 +348,16 @@ process:
   # Default: 5000.
   stop_grace_period_ms: 5000
 
-  # Environment variables passed to the service.
+  # Environment variables passed to the service (names must not contain '=').
   # Values can be literal strings or indirections like @file://..., @base64://..., @hex://...
+  # Map form; integers and booleans are taken as text, decimals must be quoted ("1.10").
   environment:
-    - name: FOO                                            # must not contain '='
-      value: bar
+    FOO: bar
+    PORT: 8080
+  # The list form is also accepted:
+  # environment:
+  #   - name: FOO
+  #     value: bar
 
 logs:
   # Where processmaster writes captured stdout/stderr.
